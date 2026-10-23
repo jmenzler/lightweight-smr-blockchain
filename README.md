@@ -22,7 +22,9 @@ Servers agree on a shared log of client commands with the (6,3)-median rule. Eac
 
 - **Protocol as pure state machines.** The paper's Algorithms 1-6 and §5 certificates, with no I/O, and a map from each paper step to its function.
 - **Deterministic simulator.** One seeded RNG stream: same scenario and seed, same bytes out. The Algorithm 1 consensus rule runs up to n = 1,000,000 simulated nodes.
-- **Memory-lean at scale.** Allocator-measured peak memory of the SMR simulator fell 21x (1,253 to 58 MiB at n = 4,096) in my optimisation work.
+- **Fast and memory-lean at scale.** A multi-round optimisation campaign (interning, copy-on-write shared state, chunked log-prefix sharing, sorted-array indexes) made the full SMR simulator 81x faster and 33x leaner than the pre-campaign code on the same recovery scenario, with identical outputs; 10,000-node full-protocol runs now fit on one machine. Peak memory at n = 4,096 fell 21x (1,253 to 58 MiB, allocator-measured).
+- **Beyond the paper's fault bound.** Agreement survives blocking of 14% of nodes per round when the blocked set is re-drawn each round, above the 10% the paper proves; against the paper's own one-round-late adaptive attacker the 10% bound holds (12.4% at the lowest useful fraction tested).
+- **Simulator validated against real TCP.** At 1,000 nodes, the simulator's results match the TCP node run under Shadow network emulation (same metrics in every cell, distribution distance within the pre-registered 0.2).
 - **Read-only observers.** Safety, commit order and metrics are measured without touching the RNG or the nodes, and a regression test enforces that.
 - **Real TCP node.** The same rules over Tokio sockets with a round coordinator and a retrying client driver.
 - **Browser lab.** The simulator compiled to WebAssembly in a Web Worker, deployed by GitHub Actions.
