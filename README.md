@@ -1,6 +1,20 @@
+<div align="center">
+
 # Lightweight state machine replication
 
-**Thousands of servers agreeing on one log, with each server talking to only a few random peers per round.** A Rust implementation of the protocol from "A Lightweight Approach for State Machine Replication" by Cachin, Dou, Scheideler and Schneider ([arXiv:2509.17771](https://arxiv.org/abs/2509.17771v2)), written for my bachelor thesis.
+**Thousands of servers agreeing on one log, with each server talking to only a few random peers per round.**
+
+![Bachelor: thesis](https://img.shields.io/badge/Bachelor-thesis-6e7781)
+[![demo: browser lab](https://img.shields.io/badge/demo-browser%20lab-2ea44f)](https://jmenzler.github.io/lightweight-smr-blockchain/)
+![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
+![Tokio](https://img.shields.io/badge/Tokio-463f3f)
+![WebAssembly](https://img.shields.io/badge/WebAssembly-654FF0?logo=webassembly&logoColor=white)
+
+[Architecture](#architecture) · [Run it locally](#run-it-locally)
+
+</div>
+
+A Rust implementation of the protocol from "A Lightweight Approach for State Machine Replication" by Cachin, Dou, Scheideler and Schneider ([arXiv:2509.17771](https://arxiv.org/abs/2509.17771v2)), written for my bachelor thesis.
 
 **[Try the browser lab](https://jmenzler.github.io/lightweight-smr-blockchain/)** to step through the protocol round by round. The simulator runs in your tab as WebAssembly, no setup.
 
@@ -15,8 +29,6 @@ Servers agree on a shared log of client commands with the (6,3)-median rule. Eac
 
 > [!NOTE]
 > The protocol is the paper's; implementation, experiments and analysis are mine. Thesis data, plots and the emulation setup for the TCP node are not part of this repo. The 1,000,000-node figure covers Algorithm 1 consensus only, not the full SMR log engine.
-
-**Stack:** Rust (pinned in `rust-toolchain.toml`) · Tokio · Rayon · WebAssembly · JavaScript (Web Workers) · GitHub Actions/Pages
 
 ## Architecture
 
