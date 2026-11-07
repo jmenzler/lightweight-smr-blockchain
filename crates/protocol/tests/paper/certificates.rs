@@ -1,5 +1,6 @@
 use protocol::certificates::{
     Certificate, ClientChains, Hash, MmrForest, Notification, ServerCertState, leaf_hash,
+    subtree_levels,
 };
 use protocol::compact::{ClientCommand, Entry};
 use sha2::{Digest, Sha256};
@@ -816,4 +817,30 @@ fn no_mutated_certificate_verifies_unless_it_names_the_committed_entry_at_its_po
         accepted_mutants > 0,
         "no mutant verified, so the oracle never compared anything"
     );
+}
+
+#[test]
+fn subtree_levels_rebuild_every_peak_root_from_its_leaves() {
+    let leaves: Vec<Hash> = (0..13).map(|i| leaf_hash(&cmd(i, 1, 7))).collect();
+    let mut forest = MmrForest::new();
+    for &leaf in &leaves {
+        forest.append(leaf);
+    }
+    for (height, root, start) in forest.peaks() {
+        let span = &leaves[start as usize..start as usize + (1 << height)];
+        let levels = subtree_levels(span);
+        assert_eq!(levels.len(), height as usize + 1);
+        assert_eq!(levels[0], span);
+        for (lvl, nodes) in levels.iter().enumerate() {
+            assert_eq!(nodes.len(), 1 << (height as usize - lvl));
+        }
+        assert_eq!(levels[height as usize], vec![root]);
+    }
+}
+
+#[test]
+#[should_panic(expected = "power of two")]
+fn subtree_levels_refuse_a_non_power_of_two_leaf_count() {
+    let leaves: Vec<Hash> = (0..3).map(|i| leaf_hash(&cmd(i, 1, 7))).collect();
+    subtree_levels(&leaves);
 }

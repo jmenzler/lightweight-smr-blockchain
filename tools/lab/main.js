@@ -8,6 +8,7 @@ import './tooltip.js';
 import './chrome.js';
 import { onSmrDone, onSmrReady, onSmrRound, onSmrInjected, onSmrScenario, onSmrReport, onSmrFeeds, onSmrTrafficSet, onSmrCaptured, onSmrVerify, onSmrNodeDetail, onSmrBlocked, onSmrFailed, onSmrAbort } from './smr.js';
 import { onSpillReady, onSpillChain } from './spill.js';
+import { onMerkleTree } from './smr-drawer.js';
 
 onMessage(m => {
   if (m.type === 'ready') { S.engine = 'wasm'; $('engineChip').textContent = 'engine: Rust WASM — canonical seeds'; $('engineChip').className = 'chip chip-ok engineChip'; }
@@ -30,6 +31,7 @@ onMessage(m => {
   else if (m.type === 'smr-verify') { onSmrVerify(m); }
   else if (m.type === 'smr-node-detail') { onSmrNodeDetail(m); }
   else if (m.type === 'smr-blocked') { onSmrBlocked(m); }
+  else if (m.type === 'smr-merkle-tree') { onMerkleTree(m); }
   else if (m.type === 'spill-ready') { onSpillReady(m); }
   else if (m.type === 'spill-chain') { onSpillChain(m); }
   else if (m.type === 'error') {

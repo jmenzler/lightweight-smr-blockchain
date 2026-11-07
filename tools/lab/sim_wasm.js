@@ -212,6 +212,26 @@ let wasm_bindgen = (function(exports) {
             }
         }
         /**
+         * Every node hash of the forest tree covering positions [start, start + 2^height), recomputed
+         * from the same committed sequence the drawer's forest is built over (certs: the drawer's best
+         * server; otherwise the committed chain). The caller checks the top against the peak root.
+         * @param {bigint} start
+         * @param {number} height
+         * @returns {string}
+         */
+        merkle_tree_json(start, height) {
+            let deferred1_0;
+            let deferred1_1;
+            try {
+                const ret = wasm.livesmr_merkle_tree_json(this.__wbg_ptr, start, height);
+                deferred1_0 = ret[0];
+                deferred1_1 = ret[1];
+                return getStringFromWasm0(ret[0], ret[1]);
+            } finally {
+                wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+            }
+        }
+        /**
          * Spec's `schedule` is ignored: no up-front mask draw may touch the RNG stream.
          * @param {string} spec_json
          */

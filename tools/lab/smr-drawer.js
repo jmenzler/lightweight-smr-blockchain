@@ -10,9 +10,15 @@ import { forestView, certsLoading, entryLabel, tallyFor, cmdIndexFor } from './s
 import { chainBlocks, spreadStats } from './smr-derive.js';
 import { useViewportHandlers, viewRange } from './smr-viewport.js';
 import { escapeHtml } from './tooltip.js';
+import { post } from './engine.js';
 
 const MAX_CHIPS = 400;
 const WHOLE_TREE_LEAVES = 32;
+// beyond this an SVG of every node stops being readable or cheap to draw
+const FULL_TREE_MAX_LEAVES = 4096;
+// engine-recomputed node hashes per tree, keyed by start:height; a perfect subtree never changes
+const trees = new Map();
+const treeKey = peak => `${peak.start}:${peak.height}`;
 const TEAL = '#3dd6c4', AMBER = '#e0af68';
 const d = { open: null, block: null, view: 'this', tab: 'dist', entry: null };
 
@@ -57,12 +63,26 @@ export function closeDrawer() {
 }
 export function resetDrawer() {
   d.open = null; d.block = null; d.entry = null; d.title = null;
+  trees.clear();
   $('smrDrawer').classList.add('hidden');
 }
 $('drawerClose').addEventListener('click', closeDrawer);
 export const drawerIsOpen = () => d.open !== null;
 window.addEventListener('keydown', e => { if (e.key === 'Escape' && d.open) closeDrawer(); });
 $('drMeasure').addEventListener('change', render);
+$('bdProofViz').addEventListener('click', e => {
+  const btn = e.target.closest('[data-tree]');
+  if (!btn) return;
+  const [start, height] = btn.dataset.tree.split(':').map(Number);
+  trees.set(btn.dataset.tree, { loading: true });
+  post({ type: 'smr-merkle-tree', start, height });
+  render();
+});
+export function onMerkleTree(m) {
+  const out = JSON.parse(m.json);
+  trees.set(`${m.start}:${m.height}`, out.error ? { error: out.error } : { levels: out.levels });
+  render();
+}
 
 export function renderDrawer() { render(); }
 
@@ -215,6 +235,10 @@ function renderProof(rep, c, fv) {
   if (!proof) { viz.innerHTML = '<div class="bdDim">this entry is not covered by the forest yet</div>'; steps.innerHTML = ''; return; }
   const ent = fv.entries ? fv.entries[d.entry - 1] : null;
   viz.innerHTML = proofSvg(d.entry, proof, fv.peaks);
+  if (trees.get(treeKey(proof.peak))?.levels) {
+    const leaf = viz.querySelector(`circle[data-tip^="${range([d.entry, d.entry])} "]`);
+    if (leaf) viz.scrollLeft = Math.max(0, +leaf.getAttribute('cx') - viz.clientWidth / 2);
+  }
   const root = String(proof.peak.root_hex).slice(0, 8);
   let html = `<li>hash the entry at position ${d.entry}${ent ? ` (${escapeHtml(entryLabel(ent).title)})` : ''}</li>`;
   proof.levels.forEach(l => {
@@ -223,7 +247,9 @@ function renderProof(rep, c, fv) {
   html += proof.peak.height === 0
     ? `<li>this entry is its own tree: its leaf is the root <span class="mono">${root}</span></li>`
     : `<li>the result is this tree's root <span class="mono">${root}</span> (root as reported by the engine)</li>`;
-  html += '<li class="bdDim">hash values of the intermediate nodes are not exposed by the engine, so only the structure is shown</li>';
+  const tree = trees.get(treeKey(proof.peak));
+  if (tree?.levels) html = hashSteps(d.entry, proof, tree.levels, ent);
+  else html += '<li class="bdDim">intermediate hashes are recomputed by the engine on request: render full tree</li>';
   if (ent && ent.kind === 'cmd' && fv.mode !== 'none') {
     const t = tallyFor(ent.client, ent.sn);
     html += `<li>certificate: ${t === null ? 'press verify everywhere to check it against every server' : t.tally ? `accepted by ${t.tally.accepted} of ${t.tally.covered} covering servers (verified @r${t.round})` : `none constructible at r${t.round}`}</li>`;
@@ -231,18 +257,50 @@ function renderProof(rep, c, fv) {
   steps.innerHTML = html;
 }
 
-function proofSvg(pos, proof, peaks) {
-  const { peak, levels } = proof;
-  const leaves = 2 ** peak.height;
-  const skyline = `<div class="bdSky">${peaks.map(pk => `<span class="bdSkyBar${pk === peak ? ' on' : ''}" style="width:${Math.max(8, Math.min(120, 2 ** pk.height * 2))}px" data-tip="tree of ${2 ** pk.height} leaves, positions ${range([pk.start + 1, pk.start + 2 ** pk.height])}">${pk.height}</span>`).join('')}</div>`;
-  if (leaves <= WHOLE_TREE_LEAVES) return skyline + wholeTree(pos, proof);
-  return skyline + pathOnly(proof);
+const short = h => String(h).slice(0, 8);
+
+// The same steps with the engine's hashes: leaf, each sibling, each result.
+function hashSteps(pos, proof, levels, ent) {
+  let idx = pos - proof.peak.start - 1;
+  let html = `<li>hash the entry at position ${pos}${ent ? ` (${escapeHtml(entryLabel(ent).title)})` : ''} → <span class="mono">${short(levels[0][idx])}</span></li>`;
+  proof.levels.forEach((l, i) => {
+    const sib = levels[i][idx ^ 1];
+    idx >>= 1;
+    html += `<li>combine with the sibling on the ${l.siblingOnRight ? 'right' : 'left'} covering ${range(l.sibling)}, <span class="mono">${short(sib)}</span> → <span class="mono">${short(levels[i + 1][idx])}</span></li>`;
+  });
+  const top = levels[levels.length - 1][0];
+  html += top === proof.peak.root_hex
+    ? `<li>equals this tree's root <span class="mono">${short(top)}</span> in the forest</li>`
+    : `<li class="bdBad">⚠ recomputed root ${short(top)} ≠ forest root ${short(proof.peak.root_hex)}</li>`;
+  return html;
 }
 
-function wholeTree(pos, proof) {
+function fullTreeControl(peak) {
+  const leaves = 2 ** peak.height;
+  const tree = trees.get(treeKey(peak));
+  if (!(S.smr.live || S.smr.handle)) return '';
+  if (leaves > FULL_TREE_MAX_LEAVES) return `<div class="bdDim">tree of ${leaves} entries: too large to draw in full (limit ${FULL_TREE_MAX_LEAVES})</div>`;
+  if (tree?.loading) return '<div class="bdDim">recomputing the tree…</div>';
+  if (tree?.error) return `<div class="bdDim">full tree unavailable: ${escapeHtml(tree.error)}</div>`;
+  if (tree?.levels) return '';
+  return `<button class="btn" data-tree="${treeKey(peak)}" data-tip="the engine recomputes every node hash of this tree from the committed sequence">render full tree</button>`;
+}
+
+function proofSvg(pos, proof, peaks) {
   const { peak } = proof;
   const leaves = 2 ** peak.height;
-  const DX = 24, DY = 30, W = leaves * DX + 24, H = (peak.height + 1) * DY + 24;
+  const levels = trees.get(treeKey(peak))?.levels ?? null;
+  const skyline = `<div class="bdSky">${peaks.map(pk => `<span class="bdSkyBar${pk === peak ? ' on' : ''}" style="width:${Math.max(8, Math.min(120, 2 ** pk.height * 2))}px" data-tip="tree of ${2 ** pk.height} leaves, positions ${range([pk.start + 1, pk.start + 2 ** pk.height])}">${pk.height}</span>`).join('')}</div>`;
+  if (levels) return skyline + wholeTree(pos, proof, levels);
+  if (leaves <= WHOLE_TREE_LEAVES) return skyline + wholeTree(pos, proof, null) + fullTreeControl(peak);
+  return skyline + pathOnly(proof) + fullTreeControl(peak);
+}
+
+function wholeTree(pos, proof, levels) {
+  const { peak } = proof;
+  const leaves = 2 ** peak.height;
+  const DX = leaves <= 64 ? 24 : leaves <= 512 ? 10 : 5, DY = 30, W = leaves * DX + 24, H = (peak.height + 1) * DY + 24;
+  const R = Math.min(6, DX / 2 - 0.5);
   const onPath = new Set(proof.levels.map((l, i) => `${i}:${l.path[0]}`).concat([`${peak.height}:${peak.start + 1}`]));
   const sib = new Set(proof.levels.map((l, i) => `${i}:${l.sibling[0]}`));
   const xAt = (lo, hi) => 12 + ((lo + hi - 2 * peak.start - 2) / 2) * DX + DX / 2;
@@ -252,7 +310,8 @@ function wholeTree(pos, proof) {
     const x = xAt(lo, hi), y = yAt(lvl);
     const path = onPath.has(`${lvl}:${lo}`) && lo <= pos && pos <= hi;
     const isSib = sib.has(`${lvl}:${lo}`) && !(lo <= pos && pos <= hi);
-    nodes += `<circle cx="${x}" cy="${y}" r="${lvl === 0 ? 6 : 5}" fill="${path ? '#0f1216' : '#1c222a'}" stroke="${path ? TEAL : isSib ? AMBER : '#3a4450'}" stroke-width="${path || isSib ? 2 : 1.2}"/>`;
+    const tip = levels ? ` data-tip="${range([lo, hi])} · ${levels[lvl][(lo - peak.start - 1) >> lvl]}"` : '';
+    nodes += `<circle${tip} cx="${x}" cy="${y}" r="${lvl === 0 ? R : Math.min(5, R)}" fill="${path ? '#0f1216' : '#1c222a'}" stroke="${path ? TEAL : isSib ? AMBER : '#3a4450'}" stroke-width="${path || isSib ? 2 : 1.2}"/>`;
     if (lvl > 0) {
       const half = (hi - lo + 1) / 2;
       for (const [a, b] of [[lo, lo + half - 1], [lo + half, hi]]) {
@@ -264,7 +323,8 @@ function wholeTree(pos, proof) {
     }
   };
   walk(peak.start + 1, peak.start + leaves, peak.height);
-  return `<svg width="${W}" height="${H}">${edges}${nodes}</svg>`;
+  const note = levels ? `<div class="bdDim">tree of ${leaves} entries, every node hash recomputed by the engine · hover a node for its hash</div>` : '';
+  return `<svg width="${W}" height="${H}">${edges}${nodes}</svg>${note}`;
 }
 
 function pathOnly(proof) {
@@ -282,7 +342,7 @@ function pathOnly(proof) {
   const ry = H - 18 - levels.length * DY;
   out += `<circle cx="60" cy="${ry}" r="6" fill="#0f1216" stroke="${TEAL}" stroke-width="2"/>` +
     `<text x="74" y="${ry + 4}" fill="${TEAL}" font-size="11" font-family="ui-monospace, Menlo, monospace">root ${String(peak.root_hex).slice(0, 8)} · ${2 ** peak.height} leaves</text>`;
-  return `<svg width="${W}" height="${H}">${out}</svg><div class="bdDim">tree of ${2 ** peak.height} entries: path only (a whole tree is drawn up to ${WHOLE_TREE_LEAVES} leaves)</div>`;
+  return `<svg width="${W}" height="${H}">${out}</svg><div class="bdDim">tree of ${2 ** peak.height} entries: path only</div>`;
 }
 
 /* ---------- spread drawer ---------- */

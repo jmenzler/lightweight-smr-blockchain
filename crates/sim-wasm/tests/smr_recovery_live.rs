@@ -91,6 +91,7 @@ fn typed_failure_is_a_replayable_absorbing_live_result() {
         live.node_detail(0),
         live.certs_json(),
         live.chain_json(0),
+        live.merkle_tree_json(0, 0),
         live.capture_stale(1),
         live.verify_json(),
     ] {
@@ -348,4 +349,51 @@ fn a_clean_release_recovers_exactly_two_windows_past_the_next_boundary() {
 
     let value = serde_json::to_value(&report).expect("report serializes");
     assert_eq!(js_r_star(&value, 64, T), Some(predicted), "law card inputs");
+}
+
+#[test]
+fn merkle_tree_tops_equal_the_drawer_peak_roots_with_and_without_certificates() {
+    let compact = recovery_spec(20).replace(
+        r#""kind":"recovery","t_window_rounds":20,"resend_until_acked":false"#,
+        r#""kind":"compact","t_commit_rounds":20"#,
+    );
+    let rec = |certs: bool| {
+        recovery_spec(20).replace(
+            r#""resend_until_acked":false"#,
+            &format!(r#""resend_until_acked":{certs}"#),
+        )
+    };
+    for (spec, certs) in [(rec(false), false), (rec(true), true), (compact, true)] {
+        let mut live = LiveSmr::new(&spec).expect("live session");
+        for _ in 0..200 {
+            live.step(0.1);
+        }
+        let peaks = if certs {
+            let snap: serde_json::Value = serde_json::from_str(&live.certs_json()).unwrap();
+            let best = snap["committed_server"].as_u64().unwrap() as usize;
+            snap["servers"][best]["peaks"].clone()
+        } else {
+            let snap: serde_json::Value = serde_json::from_str(&live.chain_json(0)).unwrap();
+            snap["peaks"].clone()
+        };
+        let peaks = peaks.as_array().expect("peaks");
+        assert!(
+            peaks.len() > 1,
+            "certs={certs}: want several trees, got {}",
+            peaks.len()
+        );
+        for peak in peaks {
+            let height = peak["height"].as_u64().unwrap() as u32;
+            let tree: serde_json::Value = serde_json::from_str(
+                &live.merkle_tree_json(peak["start"].as_u64().unwrap(), height),
+            )
+            .unwrap();
+            let levels = tree["levels"].as_array().expect("levels");
+            assert_eq!(levels.len(), height as usize + 1);
+            assert_eq!(
+                levels[height as usize][0], peak["root_hex"],
+                "certs={certs}"
+            );
+        }
+    }
 }

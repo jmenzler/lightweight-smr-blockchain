@@ -41,6 +41,10 @@ function endText(end) {
 }
 const END_LABEL = { max: 'finished', agreement: 'finished', bot: 'all ⊥', ended: 'ended', file: 'trace' };
 
+// the form's own round limit: the lab keeps every round in page memory
+const ROUND_CAP = 5000;
+const continueTarget = ctx => Math.min(ROUND_CAP, ctx.maxRounds + ctx.spec.max_rounds);
+
 function sessionCtx(spec, kind, sticky, program, st) {
   return { spec, kind, sticky, program, strategy: st, n: spec.n, maxRounds: spec.max_rounds };
 }
@@ -126,6 +130,7 @@ export function onBatchDone(m) {
   S.report = out.report;
   S.live = null;
   sv.handle = false;
+  sv.resume = null;
   loadTrace(out.trace);
   S.t = total();
   const ctx = sv.pending;
@@ -139,6 +144,7 @@ export function onLiveReady(m) {
   loadTrace(JSON.parse(m.json));
   S.live = { playing: false, awaiting: false, bg: S.pendingLiveBg || 0 };
   sv.handle = false;
+  sv.resume = null;
   sv.end = null;
   const ctx = sv.pending;
   sv.program = ctx.program;
@@ -154,6 +160,7 @@ export function openTrace(tr) {
   stopReplay();
   S.live = null;
   sv.handle = false;
+  sv.resume = null;
   loadTrace(tr);
   S.t = total();
   const ctx = { spec: null, kind: 'file', sticky: false, program: null, strategy: 'file', n: tr.n, maxRounds: total() };
@@ -231,6 +238,8 @@ function setEnd(end) {
 // still works on the frozen run.
 function finishLive(end) {
   if (!S.live) return;
+  // Only a reached round target can go on: the engine itself has no round cap.
+  sv.resume = end.kind === 'max' && sv.ctx.maxRounds < ROUND_CAP ? S.live : null;
   S.live = null;
   sv.handle = true;
   setEnd(end);
@@ -289,6 +298,8 @@ export function updateToolbar() {
   $('svBackBtn').disabled = !!lv;
   $('svEndBtn').classList.toggle('hidden', !lv);
   $('svNewBtn').classList.toggle('hidden', !!lv || !has);
+  $('svContinueBtn').classList.toggle('hidden', !!lv || !sv.resume);
+  if (sv.resume) $('svContinueBtn').dataset.tip = `keep going to round ${continueTarget(sv.ctx)}`;
   for (const b of document.querySelectorAll('#svSpeed button')) b.classList.toggle('on', b.dataset.speed === String(sv.speed));
   $('svStrat').textContent = has ? (sv.ctx.program ? 'program' : sv.ctx.strategy) : '';
   $('svRoundLbl').textContent = end ? `round ${S.t}/${total()} · ${END_LABEL[end.kind]}`
@@ -332,10 +343,26 @@ $('liveSlider').addEventListener('input', () => {
   sv.program = null;
 });
 $('svEndBtn').addEventListener('click', () => finishLive({ kind: 'ended', round: total(), max: sv.ctx.maxRounds }));
+$('svContinueBtn').addEventListener('click', () => {
+  const lv = sv.resume;
+  if (!lv) return;
+  stopReplay();
+  sv.resume = null;
+  sv.ctx.maxRounds = continueTarget(sv.ctx);
+  sv.end = null;
+  S.live = lv;
+  S.t = total();
+  lv.playing = true;
+  $('runStatus').textContent = `continuing to round ${sv.ctx.maxRounds}`;
+  update();
+  updateToolbar();
+  liveStep();
+});
 $('svNewBtn').addEventListener('click', () => {
   stopReplay();
   S.live = null;
   sv.handle = false;
+  sv.resume = null;
   sv.ctx = null;
   sv.end = null;
   S.trace = null; S.series = null; S.t = 0; S.sel = null;

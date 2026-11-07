@@ -76,6 +76,7 @@
                 </div>
               </div>
               <button class="btn" id="svEndBtn" data-tip="stop the session; the run stays on screen as a finished run">End</button>
+              <button class="btn hidden" id="svContinueBtn" data-tip="keep the session going for another round target">Continue</button>
               <button class="btn hidden" id="svNewBtn" data-tip="discard this run and return to the setup form">New run</button>
             </div>
           </div>
@@ -93,29 +94,27 @@
               <button class="btn" id="presetB" title="Lemma 2.2: ⊥-start u₀=5/9, 10% fresh blocking">B converge-hold</button>
               <button class="btn" id="presetC" title="Lemma 2.3: all hold, 30% permanent blocking">C death spiral</button>
             </div>
-            <div class="sHint">pre-registered thesis regimes (Lemmas 2.1 / 2.2 / 2.3) — fills the form below, then press Start</div>
-          </div>
+                      </div>
           <div class="fSect">
             <div class="fSectTitle">network</div>
             <div class="fPair">
               <div class="fCol"><span class="fMini">nodes n</span><input class="fInput" id="runN" type="number" min="10" max="200000" value="1000" /></div>
-              <div class="fCol"><span class="fMini">seed — same seed, same run</span><input class="fInput" id="runSeed" type="number" min="0" value="1" /></div>
+              <div class="fCol"><span class="fMini">seed<span class="qHint" title="Same seed, same run.">?</span></span><input class="fInput" id="runSeed" type="number" min="0" value="1" /></div>
             </div>
           </div>
           <div class="fSect">
-            <div class="fSectTitle">protocol — (k,ℓ)-median rule</div>
+            <div class="fSectTitle">protocol — (k,ℓ)-median rule<span class="qHint" title="Each round a node adopts the median of at least ℓ replies; with fewer it becomes ⊥ (undecided).">?</span></div>
             <div class="fPair">
               <div class="fCol"><span class="fMini">ask k random peers</span><input class="fInput" id="runK" type="number" min="2" value="6" /></div>
               <div class="fCol"><span class="fMini">need ℓ replies (odd)</span><input class="fInput" id="runEll" type="number" min="3" step="2" value="3" /></div>
             </div>
-            <div class="sHint">each round a node adopts the median of ≥ ℓ replies — with fewer it becomes ⊥ (undecided)</div>
           </div>
           <div class="fSect">
             <div class="fSectTitle">initial values</div>
             <div class="fPair">
-              <div class="fCol"><span class="fMini">useful fraction u₀ — the rest start ⊥ (as after a blocking partition)</span><input class="fInput" id="runUseful" type="number" min="0" max="1" step="any" value="1" /></div>
+              <div class="fCol"><span class="fMini">useful fraction u₀<span class="qHint" title="The rest start ⊥, as after a blocking partition.">?</span></span><input class="fInput" id="runUseful" type="number" min="0" max="1" step="any" value="1" /></div>
             </div>
-            <div class="fCol"><span class="fMini">value distribution of the useful nodes</span>
+            <div class="fCol"><span class="fMini">values of the useful nodes</span>
             <select class="fInput" id="runInit">
               <option value="split">value split (worst case)</option>
               <option value="even">even m-split (worst case, m colours)</option>
@@ -130,11 +129,11 @@
             <span class="fLabel">pmf</span>
             <div style="flex:1;display:flex;flex-direction:column;gap:8px">
               <div style="display:flex;flex-direction:column;gap:4px">
-                <span class="fMini">values R — how many distinct values the curve is spread over; small R = few shared colours, huge R = sparse ordered universe</span>
+                <span class="fMini">values R<span class="qHint" title="How many distinct values the curve is spread over: small R = few shared colours, huge R = a sparse ordered universe.">?</span></span>
                 <input class="fInput" id="pmfRange" type="number" min="2" value="32" placeholder="e.g. 32, or 4294967296 for a sparse 2^32 space" />
               </div>
               <canvas id="pmfCanvas" style="display:block;width:100%;height:150px;border:1px solid #232932;border-radius:8px;background:#14181e;cursor:crosshair"></canvas>
-              <div class="hint" style="margin-left:0">drag points · double-click to add · right-click to remove · bars = normalized pmf</div>
+              <div class="hint" style="margin-left:0">edit curve<span class="qHint" title="Drag points, double-click to add, right-click to remove. Bars are the normalized pmf.">?</span></div>
               <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                 <button class="btn" id="pmfUniform">uniform</button>
                 <button class="btn" id="pmfZipf">zipf</button>
@@ -142,7 +141,7 @@
                 <button class="btn" id="pmfBimodal">bimodal</button>
               </div>
               <div style="display:flex;flex-direction:column;gap:4px">
-                <span class="fMini">custom w(i) formula — overrides curve &amp; presets while set</span>
+                <span class="fMini">custom w(i) formula<span class="qHint" title="Overrides the curve and presets while set.">?</span></span>
                 <input class="fInput" id="pmfFormula" type="text" placeholder="1/(i+1)^2 · exp(-x*4) · i<3?1:0   (vars: i, m, x=i/(m-1))" />
               </div>
               <div style="display:flex;gap:6px;align-items:center">
@@ -157,7 +156,7 @@
           </div>
           <div class="fSect">
             <div class="fSectTitle">blocking adversary</div>
-            <div class="fCol"><span class="fMini">strategy</span>
+            <div class="fCol"><span class="fMini">strategy<span class="qHint" id="svStrategyTip">?</span></span>
               <select class="fInput" id="svStrategy">
                 <option value="fresh">Fresh per round</option>
                 <option value="sticky">Sticky + background</option>
@@ -170,13 +169,12 @@
               </select>
             </div>
             <div class="fCol" id="svRowBeta"><span class="fMini" id="svBetaLabel">blocked % of n</span><input class="fInput" id="runBeta" type="number" min="0" max="60" step="1" value="10" /></div>
-            <div class="fCol hidden" id="svRowAlpha"><span class="fMini">α — rounds the adversary reads behind (α = 1 is the paper’s 1-late adversary)</span><input class="fInput" id="runAlpha" type="number" min="1" step="1" value="1" /></div>
+            <div class="fCol hidden" id="svRowAlpha"><span class="fMini">α<span class="qHint" title="Rounds the adversary reads behind; α = 1 is the paper’s 1-late adversary.">?</span></span><input class="fInput" id="runAlpha" type="number" min="1" step="1" value="1" /></div>
             <div class="fCol hidden" id="svRowProgram">
               <div class="progHeadRow"><span>from round</span><span>to round</span><span>blocked %</span><span></span></div>
               <div id="svProgRows"></div>
               <div class="fBtns"><button class="btn" id="svProgAdd">+ add segment</button></div>
             </div>
-            <div class="sHint" id="svStrategyHint"></div>
           </div>
           <div class="fSect">
             <div class="fSectTitle">run</div>
@@ -309,6 +307,7 @@
                 </div>
               </div>
               <button class="btn" id="smrEndBtn" data-tip="stop the session; the run stays on screen as a finished run">End</button>
+              <button class="btn hidden" id="smrContinueBtn" data-tip="keep the session going for another round target">Continue</button>
               <button class="btn hidden" id="smrNewBtn" data-tip="discard this run and return to the setup form">New run</button>
             </div>
           </div>
@@ -321,29 +320,29 @@
               <div class="smrForm">
                 <div class="ptitle">Start an SMR run</div>
                 <div class="fSect">
-                  <div class="fSectTitle">protocol — Algorithm 3 / 5 / 6</div>
+                  <div class="fSectTitle">protocol — Algorithm 3 / 5 / 6<span class="qHint" title="Extended keeps the full per-node log. Compact executes committed commands on a shared state and forgets them. Recovery adds checkpoints and rollback so a collapsed system can come back.">?</span></div>
                   <div class="protoToggle" id="smrProtoToggle">
-                    <button class="vt on" data-proto="extended">extended</button>
+                    <button class="vt" data-proto="extended">extended</button>
                     <button class="vt" data-proto="compact">compact</button>
-                    <button class="vt" data-proto="recovery">recovery</button>
+                    <button class="vt on" data-proto="recovery">recovery</button>
                   </div>
                   <div class="fCol compactOnly hidden" id="rowSmrT">
-                    <span class="fMini">commit T (rounds) — a command executes once aged T rounds</span>
-                    <input class="fInput" id="smrT" type="number" min="1" value="24" />
+                    <span class="fMini">commit T (rounds)<span class="qHint" title="A command executes once aged T rounds. Default 48 ≈ 8·T_B (T_B ≈ 0.64·log₂n ≈ 5.8 at n = 512), the ratio the recovery experiments ran safely, and above the measured commit-safety threshold T* ≈ 38–46 at 10% blocking for n = 256–1024.">?</span></span>
+                    <input class="fInput" id="smrT" type="number" min="1" value="48" />
                   </div>
-                  <div class="fCol recoveryOnly hidden" id="rowSmrTw">
-                    <span class="fMini">window T (rounds) — every T rounds the aged prefix is executed and a checkpoint minted, or a reset-armed server rolls back<span class="qHint" title="Length of one checkpoint window: commit clock and rollback granularity in one.">?</span></span>
-                    <input class="fInput" id="smrTw" type="number" min="1" value="40" />
+                  <div class="fCol recoveryOnly" id="rowSmrTw">
+                    <span class="fMini">window T (rounds)<span class="qHint" title="Every T rounds the aged prefix is executed and a checkpoint minted, or a reset-armed server rolls back: commit clock and rollback granularity in one. Default 48 ≈ 8·T_B (T_B ≈ 0.64·log₂n ≈ 5.8 at n = 512), the ratio the recovery experiments ran safely, and above the measured commit-safety threshold T* ≈ 38–46 at 10% blocking for n = 256–1024.">?</span></span>
+                    <input class="fInput" id="smrTw" type="number" min="1" value="48" />
                   </div>
-                  <div class="fCol recoveryOnly hidden" id="rowSmrAck">
-                    <span class="fMini">§5 certificates (RQ11) — clients resend past commitment until a server acks<span class="qHint" title="The thesis’s own construction (RQ11), not the paper’s: the paper asserts that §5 certificates carry over to Alg 6 and proves Theorem 6 for compact only.">?</span></span>
+                  <div class="fCol recoveryOnly" id="rowSmrAck">
+                    <span class="fMini">§5 certificates<span class="qHint" title="Clients resend past commitment until a server acks. The thesis’s own construction (RQ11), not the paper’s: the paper asserts that §5 certificates carry over to Alg 6 and proves Theorem 6 for compact only.">?</span></span>
                     <div class="protoToggle" id="smrAckToggle">
-                      <button class="vt on" data-ack="off">off</button>
-                      <button class="vt" data-ack="on">certificates on</button>
+                      <button class="vt" data-ack="off">off</button>
+                      <button class="vt on" data-ack="on">certificates on</button>
                     </div>
                   </div>
-                  <div class="fCol recoveryOnly hidden" id="rowSmrPreset">
-                    <span class="fMini">scenario preset — prefills the form and the scheduled program; edit anything before starting<span class="qHint" title="Fills the form and the scheduled program; the run records its actual per-round fractions, so the export replays exactly what happened.">?</span></span>
+                  <div class="fCol recoveryOnly" id="rowSmrPreset">
+                    <span class="fMini">scenario preset<span class="qHint" title="Prefills the form and the scheduled program; the run records its actual per-round fractions, so the export replays exactly what happened.">?</span></span>
                     <div class="protoToggle" id="smrPresetToggle">
                       <button class="vt on" data-preset="custom">custom</button>
                       <button class="vt" data-preset="surge">surge → release</button>
@@ -351,22 +350,21 @@
                       <button class="vt" data-preset="cliff">cliff (T &lt; T_B)</button>
                     </div>
                   </div>
-                  <div class="sHint">extended keeps the full per-node log · compact executes committed commands on a shared state and forgets them · recovery adds checkpoints and rollback so a collapsed system can come back</div>
                 </div>
                 <div class="fSect">
                   <div class="fSectTitle">network</div>
                   <div class="fPair">
-                    <div class="fCol"><span class="fMini">nodes n</span><input class="fInput" id="smrN" type="number" min="4" max="200000" value="64" /></div>
-                    <div class="fCol"><span class="fMini">seed — same seed, same run</span><input class="fInput" id="smrSeed" type="number" min="0" value="1" /></div>
+                    <div class="fCol"><span class="fMini">nodes n</span><input class="fInput" id="smrN" type="number" min="4" max="200000" value="512" /></div>
+                    <div class="fCol"><span class="fMini">seed<span class="qHint" title="Same seed, same run.">?</span></span><input class="fInput" id="smrSeed" type="number" min="0" value="1" /></div>
                   </div>
                   <div class="fPair">
-                    <div class="fCol"><span class="fMini">σ — amp = ⌈σ·log₂n⌉ appends</span><input class="fInput" id="smrSigma" type="number" min="1" step="0.1" value="1" /></div>
-                    <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="smrMax" type="number" min="1" max="5000" value="200" /></div>
+                    <div class="fCol"><span class="fMini">σ<span class="qHint" title="Amplification: a command is appended ⌈σ·log₂n⌉ times.">?</span></span><input class="fInput" id="smrSigma" type="number" min="1" step="0.1" value="1" /></div>
+                    <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="smrMax" type="number" min="1" max="5000" value="500" /></div>
                   </div>
                 </div>
                 <div class="fSect">
                   <div class="fSectTitle">blocking adversary</div>
-                  <div class="fCol"><span class="fMini">strategy</span>
+                  <div class="fCol"><span class="fMini">strategy<span class="qHint" id="smrStrategyTip">?</span></span>
                     <select class="fInput" id="smrStrategy">
                       <option value="fresh">Fresh per round</option>
                       <option value="sticky">Sticky + background</option>
@@ -383,21 +381,19 @@
                     <div id="smrProgRows"></div>
                     <div class="fBtns"><button class="btn" id="smrProgAdd">+ add segment</button></div>
                   </div>
-                  <div class="sHint" id="smrStrategyHint"></div>
                 </div>
                 <div class="fSect">
-                  <div class="fSectTitle">injections — one per client</div>
+                  <div class="fSectTitle">injections<span class="qHint" title="One command per client, delivered from a fixed round. Target empty = a random server per attempt (the paper’s client); a pinned id is a lab deviation, and the audit shows what it hit.">?</span></div>
                   <div class="injHeadRow"><span>round</span><span>client</span><span>op</span><span>target</span><span></span></div>
                   <div id="smrInjRows"></div>
                   <div class="fBtns">
                     <button class="btn" id="smrInjAdd">+ add injection</button>
                   </div>
-                  <div class="sHint">pre-registered commands delivered from fixed rounds · target empty = random server per attempt (paper client) · a pinned id is a lab deviation — the audit shows what it hit</div>
                   <input type="hidden" id="smrRound" value="2" />
                 </div>
                 <div class="fSect">
-                  <div class="fSectTitle">arrival traffic — engine pmf</div>
-                  <div class="fCol"><span class="fMini">commands arriving per round, drawn inside the seeded run — replayable from the exported spec</span>
+                  <div class="fSectTitle">arrival traffic</div>
+                  <div class="fCol"><span class="fMini">commands per round<span class="qHint" title="Drawn inside the seeded run, so the exported spec replays it. Default: zipf over 0–8 arrivals, mean ≈ 2.2 per round.">?</span></span>
                     <select class="fInput" id="smrArrRate">
                       <option value="">off</option>
                       <option value="0.25">1 command / 4 rounds (mixture)</option>
@@ -405,18 +401,18 @@
                       <option value="1">1 command / round</option>
                       <option value="2">2 commands / round</option>
                       <option value="4">4 commands / round</option>
-                      <option value="custom">custom curve…</option>
+                      <option value="custom" selected>custom curve…</option>
                     </select>
                   </div>
-                  <div class="fRow hidden" id="rowArr" style="align-items:flex-start">
+                  <div class="fRow" id="rowArr" style="align-items:flex-start">
                     <span class="fLabel">arrivals</span>
                     <div style="flex:1;display:flex;flex-direction:column;gap:8px">
                       <div style="display:flex;flex-direction:column;gap:4px">
-                        <span class="fMini">max arrivals+1 — curve index i = probability of exactly i arrivals that round</span>
+                        <span class="fMini">max arrivals + 1<span class="qHint" title="Curve index i = probability of exactly i arrivals that round.">?</span></span>
                         <input class="fInput" id="arrRange" type="number" min="2" max="4096" value="9" />
                       </div>
                       <canvas id="arrCanvas" style="display:block;width:100%;height:150px;border:1px solid #232932;border-radius:8px;background:#14181e;cursor:crosshair"></canvas>
-                      <div class="hint" style="margin-left:0">drag points · double-click to add · right-click to remove · bars = normalized pmf over counts 0..R−1</div>
+                      <div class="hint" style="margin-left:0">edit curve<span class="qHint" title="Drag points, double-click to add, right-click to remove. Bars are the normalized pmf over counts 0..R−1.">?</span></div>
                       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                         <button class="btn" id="arrUniform">uniform</button>
                         <button class="btn" id="arrZipf">zipf</button>
@@ -424,7 +420,7 @@
                         <button class="btn" id="arrBimodal">bimodal</button>
                       </div>
                       <div style="display:flex;flex-direction:column;gap:4px">
-                        <span class="fMini">custom w(i) formula — overrides curve &amp; presets while set</span>
+                        <span class="fMini">custom w(i) formula<span class="qHint" title="Overrides the curve and presets while set.">?</span></span>
                         <input class="fInput" id="arrFormula" type="text" placeholder="i==2?1:0 for a fixed rate 2   (vars: i, m, x=i/(m-1))" />
                       </div>
                       <div style="display:flex;gap:6px;align-items:center">

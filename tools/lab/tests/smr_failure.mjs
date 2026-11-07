@@ -177,6 +177,7 @@ async function setup() {
     document,
     window: { devicePixelRatio: 1, addEventListener: (type, fn) => (windowListeners[type] ??= []).push(fn) },
     Event: class { constructor(type) { this.type = type; } },
+    ResizeObserver: class { observe() {} },
     setTimeout: fn => { const id = ++timerId; timers.set(id, fn); return id; },
     clearTimeout: id => timers.delete(id),
   });
@@ -235,7 +236,7 @@ async function setup() {
     },
     'smr-viewport.js': { renderViewport() {}, resetViewport() {} },
     'smr-drawer.js': {
-      renderDrawer() {}, resetDrawer() {}, useBlockDrawerOpen() {}, blockDrawerOpen: () => drawer.open,
+      renderDrawer() {}, resetDrawer() {}, useBlockDrawerOpen() {}, blockDrawerOpen: () => drawer.open, onMerkleTree() {},
     },
     'render.js': { update() {}, draw() {}, setView() {} },
     'trace.js': { loadTrace() {} },

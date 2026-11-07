@@ -68,9 +68,8 @@ export function syncStrategy() {
   $('svRowBeta').classList.toggle('hidden', st === 'program');
   $('svRowAlpha').classList.toggle('hidden', st !== 'adaptiveAlpha');
   $('svRowProgram').classList.toggle('hidden', st !== 'program');
-  $('svBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n'
-    : LIVE_STRATEGIES.includes(st) ? 'blocked % of n (the live slider starts here)' : 'blocked % of n';
-  $('svStrategyHint').textContent = STRATEGY_HINT[st] ?? '';
+  $('svBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n' : 'blocked % of n';
+  $('svStrategyTip').dataset.tip = STRATEGY_HINT[st] ?? '';
 }
 $('svStrategy').addEventListener('change', syncStrategy);
 

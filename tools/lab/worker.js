@@ -200,6 +200,11 @@ onmessage = ev => {
           postMessage({ type: 'smr-report', json: smrLive.report_json() });
           break;
         }
+        case 'smr-merkle-tree': {
+          if (!smrLive) throw new Error('no smr live session');
+          postMessage({ type: 'smr-merkle-tree', start: m.start, height: m.height, json: smrLive.merkle_tree_json(BigInt(m.start), m.height) });
+          break;
+        }
         case 'smr-node-detail': {
           if (!smrLive) throw new Error('no smr live session');
           postMessage({ type: 'smr-node-detail', node: m.node, pinned: !!m.pinned, json: smrLive.node_detail(m.node) });

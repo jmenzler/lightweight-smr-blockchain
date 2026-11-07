@@ -11,11 +11,14 @@ import { recRows, rStarScan, releaseRound, lastLatched, lawText, programBeta, sm
 import { renderViewport, resetViewport } from './smr-viewport.js';
 import { renderDrawer, resetDrawer, blockDrawerOpen, useBlockDrawerOpen } from './smr-drawer.js';
 
-S.smr = { report: null, live: null, scenario: null, ctx: null, pending: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'extended', speed: 1, handle: false, srvOpen: false, chart: 'spread', program: null, detail: null, pin: null, manualBlocks: new Set(), gridMode: null, gridSort: false, chain: null, ack: false, end: null };
+S.smr = { report: null, live: null, scenario: null, ctx: null, pending: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'recovery', speed: 1, handle: false, srvOpen: false, chart: 'spread', program: null, detail: null, pin: null, manualBlocks: new Set(), gridMode: null, gridSort: false, chain: null, ack: true, end: null };
 
 /* ---------- arrival traffic (engine pmf) ---------- */
 
 const ARR = createPmfEditor('arr', 'rowArr');
+ARR.analytic = 'zipf';
+// The form is laid out hidden until the SMR tab opens; redraw once it has a size.
+new ResizeObserver(() => ARR.draw()).observe($('arrCanvas'));
 
 // fixed rate r = point mass at index r; fractional = two-point mixture
 function rateToPmf(rate) {
@@ -279,8 +282,8 @@ function syncStrategy() {
   const st = strategy();
   $('rowBeta').classList.toggle('hidden', st === 'program');
   $('rowProgram').classList.toggle('hidden', st !== 'program');
-  $('smrBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n' : 'blocked % of n (the live slider starts here)';
-  $('smrStrategyHint').textContent = STRATEGY_HINT[st] ?? '';
+  $('smrBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n' : 'blocked % of n';
+  $('smrStrategyTip').dataset.tip = STRATEGY_HINT[st] ?? '';
 }
 $('smrStrategy').addEventListener('change', syncStrategy);
 
@@ -337,6 +340,7 @@ $('smrStartBtn').addEventListener('click', () => {
 });
 
 export function onSmrDone(m) {
+  S.smr.resume = null;
   S.smr.report = JSON.parse(m.json).report;
   S.smr.scenario = null;
   S.smr.lastStatus = null;
@@ -400,6 +404,7 @@ export function onSmrReady(m) {
     return;
   }
   S.smr.live = { playing: false, awaiting: false, runUntil: null };
+  S.smr.resume = null;
   S.smr.lastStatus = null;
   S.smr.end = null;
   const ctx = S.smr.pending;
@@ -466,6 +471,9 @@ useEntrySelect(ent => {
 // (End, max rounds, dead, failed) keeps its engine handle in the worker so its
 // export, verify and node-detail calls keep working on the frozen run.
 const MAX_CHUNK = 25;
+// the form's own round limit: the lab keeps every round in page memory
+const ROUND_CAP = 5000;
+const continueTarget = ctx => Math.min(ROUND_CAP, ctx.maxRounds + ctx.spec.max_rounds);
 const lastRound = () => (S.smr.lastStatus ? S.smr.lastStatus.round : 0);
 const speedDelay = () => (S.smr.speed === 'max' ? 0 : 720 / S.smr.speed);
 const speedChunk = () => (S.smr.speed === 'max' ? MAX_CHUNK : 1);
@@ -488,6 +496,8 @@ function updateToolbar() {
   $('smrStimulus').classList.toggle('off', !lv);
   $('smrEndBtn').classList.toggle('hidden', !lv);
   $('smrNewBtn').classList.toggle('hidden', !!lv || !hasSession);
+  $('smrContinueBtn').classList.toggle('hidden', !!lv || !S.smr.resume);
+  if (S.smr.resume) $('smrContinueBtn').dataset.tip = `keep going to round ${continueTarget(S.smr.ctx)}`;
   $('smrPlayBtn').textContent = lv && lv.playing ? '⏸ Pause' : '⏵ Play';
   for (const b of document.querySelectorAll('#smrSpeed button')) b.classList.toggle('on', b.dataset.speed === String(S.smr.speed));
   for (const b of document.querySelectorAll('.recoveryItem')) b.disabled = !isRec();
@@ -507,6 +517,8 @@ function finishLive(end) {
   lv.playing = false;
   lv.runUntil = null;
   S.smr.live = null;
+  // Only a reached round target can go on: the engine itself has no round cap.
+  S.smr.resume = end.kind === 'max' && S.smr.ctx.maxRounds < ROUND_CAP ? lv : null;
   S.smr.handle = true;
   setEnd(end);
   renderSmr();
@@ -634,7 +646,20 @@ $('smrAuditScope').addEventListener('change', () => {
   if (S.smr.report) renderAudit(S.smr.report);
 });
 $('smrEndBtn').addEventListener('click', () => finishLive({ kind: 'ended', round: lastRound(), max: S.smr.ctx.maxRounds }));
+$('smrContinueBtn').addEventListener('click', () => {
+  const lv = S.smr.resume;
+  if (!lv) return;
+  S.smr.resume = null;
+  S.smr.ctx.maxRounds = continueTarget(S.smr.ctx);
+  S.smr.end = null;
+  S.smr.live = lv;
+  lv.playing = true;
+  $('smrStatus').textContent = `continuing to round ${S.smr.ctx.maxRounds}`;
+  updateToolbar();
+  smrStep(speedChunk());
+});
 $('smrNewBtn').addEventListener('click', () => {
+  S.smr.resume = null;
   S.smr.handle = false;
   S.smr.end = null;
   S.smr.report = null;

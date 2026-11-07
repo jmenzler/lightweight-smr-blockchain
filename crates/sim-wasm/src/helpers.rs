@@ -27,7 +27,7 @@ pub(crate) fn recorded_schedule(sticky: bool, fractions: &[f64], background: f64
     }
 }
 
-fn hex(h: &protocol::certificates::Hash) -> String {
+pub(crate) fn hex(h: &protocol::certificates::Hash) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
 }
 

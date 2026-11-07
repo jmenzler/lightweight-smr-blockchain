@@ -16,7 +16,7 @@
 //! - Step fractions replay exactly because the replay parses floats with `float_roundtrip`.
 
 use crate::helpers::{
-    chain_snapshot, check_fraction, error_json, merge_json, peaks_json, recorded_schedule,
+    chain_snapshot, check_fraction, error_json, hex, merge_json, peaks_json, recorded_schedule,
 };
 use sim::smr::{
     CommandReport, ManualBlock, SmrReport, SmrScenario, SmrState, SmrStepStatus, SpreadCurve,
@@ -452,6 +452,56 @@ impl LiveSmr {
             .to_string();
         }
         chain_snapshot(&entries, from_len)
+    }
+
+    /// Every node hash of the forest tree covering positions [start, start + 2^height), recomputed
+    /// from the same committed sequence the drawer's forest is built over (certs: the drawer's best
+    /// server; otherwise the committed chain). The caller checks the top against the peak root.
+    pub fn merkle_tree_json(&self, start: u64, height: u32) -> String {
+        if let Some(error) = self.failed_action("read the Merkle tree") {
+            return error;
+        }
+        if !self.state.safety_ok() {
+            return serde_json::json!({ "error": "tree frozen: prefix consistency violated" })
+                .to_string();
+        }
+        let entries: Vec<protocol::compact::Entry> = match &self.certs {
+            Some(certs) => {
+                let best = certs
+                    .servers()
+                    .enumerate()
+                    .max_by_key(|(i, s)| (s.forest().len(), std::cmp::Reverse(*i)))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.state
+                    .executed_entries(best)
+                    .into_iter()
+                    .flat_map(protocol::shared_state::ExecSeq::iter)
+                    .cloned()
+                    .collect()
+            }
+            None => match self.state.committed_entries() {
+                Some(entries) => entries,
+                None => {
+                    return serde_json::json!({ "error": "no committed sequence for this rule" })
+                        .to_string();
+                }
+            },
+        };
+        let lo = start as usize;
+        let Some(span) = 1usize
+            .checked_shl(height)
+            .and_then(|n| entries.get(lo..lo + n))
+        else {
+            return serde_json::json!({ "error": "the tree is not covered by the committed sequence" })
+                .to_string();
+        };
+        let leaves: Vec<_> = span.iter().map(protocol::certificates::leaf_hash).collect();
+        let levels: Vec<Vec<String>> = protocol::certificates::subtree_levels(&leaves)
+            .iter()
+            .map(|level| level.iter().map(hex).collect())
+            .collect();
+        serde_json::json!({ "start": start, "height": height, "levels": levels }).to_string()
     }
 
     /// A prefix-inconsistent population must not have its attestations drawn as sound.

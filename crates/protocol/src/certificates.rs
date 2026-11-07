@@ -37,6 +37,26 @@ fn interior_hash(left: &Hash, right: &Hash) -> Hash {
     h.finalize().into()
 }
 
+/// Every node of the perfect tree over `leaves`, bottom level first; the last level is the root.
+/// The forest stores peaks only, so this recomputes a tree from its leaves for display.
+pub fn subtree_levels(leaves: &[Hash]) -> Vec<Vec<Hash>> {
+    assert!(
+        leaves.len().is_power_of_two(),
+        "a perfect tree needs a power of two leaves, got {}",
+        leaves.len()
+    );
+    let mut levels = vec![leaves.to_vec()];
+    while levels[levels.len() - 1].len() > 1 {
+        let below = &levels[levels.len() - 1];
+        let next = below
+            .chunks_exact(2)
+            .map(|pair| interior_hash(&pair[0], &pair[1]))
+            .collect();
+        levels.push(next);
+    }
+    levels
+}
+
 fn fold(leaf: Hash, pos: u64, chain: &[Hash]) -> Hash {
     let mut h = leaf;
     for (i, sib) in chain.iter().enumerate() {
