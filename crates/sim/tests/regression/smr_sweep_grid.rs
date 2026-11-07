@@ -220,7 +220,7 @@ fn typed_recovery_failure_is_a_prefix_abort_row_with_ledger_diagnostics() {
         "commands",
         "complete",
         "pending",
-        "mean_te",
+        "lat_mean",
         "safety",
         "recovered_round",
     ] {
@@ -246,7 +246,10 @@ fn typed_recovery_failure_is_a_prefix_abort_row_with_ledger_diagnostics() {
     assert_eq!(failure["violation"]["pre_len"], 39);
     assert_eq!(failure["violation"]["log_len"], 114);
     assert_eq!(failure["violation"]["first_mismatch"], 33);
-    assert_eq!(failure["violation"]["command_prefix_ok"], false);
+    assert_ne!(
+        failure["violation"]["expected"]["entry"],
+        failure["violation"]["actual"]["entry"]
+    );
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -290,19 +293,20 @@ fn csv_row_fields_match_report() {
     assert_eq!(col(&cols, "dead"), count(CommandStatus::Dead));
     assert_eq!(col(&cols, "safety"), report.safety_ok.to_string());
 
-    let tes: Vec<usize> = report
+    let paper: Vec<(usize, Option<usize>)> = report
         .commands
         .iter()
-        .filter(|c| c.status == CommandStatus::Complete)
-        .filter_map(|c| c.prefix_fixed_round.map(|r| r - c.injection_round))
+        .filter_map(|c| c.injected_round.map(|d| (d, c.prefix_fixed_round)))
         .collect();
-    assert!(!tes.is_empty(), "120 rounds must complete some commands");
-    let mean = tes.iter().sum::<usize>() as f64 / tes.len() as f64;
-    assert_eq!(col(&cols, "mean_te"), format!("{mean:.2}"));
+    let (ages, _) = windowed(&paper, 120);
+    assert!(!ages.is_empty(), "120 rounds must complete some commands");
+    let mean = ages.iter().sum::<usize>() as f64 / ages.len() as f64;
+    assert_eq!(col(&cols, "lat_mean"), format!("{mean:.2}"));
+    assert_eq!(col(&cols, "lat_end"), "prefix_fixed");
 }
 
 #[test]
-fn mean_te_blank_without_completions_and_two_decimal_otherwise() {
+fn lat_mean_blank_without_completions_and_two_decimal_otherwise() {
     let cols = grid_row_cols(&single_point_spec(2), "blank");
     assert_ne!(
         col(&cols, "commands"),
@@ -311,13 +315,13 @@ fn mean_te_blank_without_completions_and_two_decimal_otherwise() {
     );
     assert_eq!(col(&cols, "complete"), "0", "nothing completes in 2 rounds");
     assert_eq!(
-        col(&cols, "mean_te"),
+        col(&cols, "lat_mean"),
         "",
-        "no completions → empty mean_te cell"
+        "no completions → empty lat_mean cell"
     );
 
     let cols = grid_row_cols(&single_point_spec(120), "filled");
-    let (int_part, frac) = col(&cols, "mean_te")
+    let (int_part, frac) = col(&cols, "lat_mean")
         .split_once('.')
         .expect("decimal point");
     assert!(!int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit()));
@@ -325,71 +329,80 @@ fn mean_te_blank_without_completions_and_two_decimal_otherwise() {
     assert!(frac.chars().all(|c| c.is_ascii_digit()));
 }
 
-fn settled_round(c: &sim::smr::CommandReport) -> Option<usize> {
-    [
-        c.prefix_fixed_round,
-        c.committed_ack_round,
-        c.executed_round,
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+/// Nearest rank over the in-window population, the unsettled ranked last as `inf`.
+fn nearest_rank(sorted: &[usize], total: usize, p: f64) -> String {
+    let idx = (p * total as f64).ceil().max(1.0) as usize - 1;
+    sorted
+        .get(idx)
+        .map_or_else(|| "inf".to_string(), usize::to_string)
 }
 
-fn nearest_rank(sorted: &[usize], p: f64) -> usize {
-    let idx = (p * sorted.len() as f64).ceil().max(1.0) as usize - 1;
-    sorted[idx]
+/// Sorted latencies of the commands whose origin is at least the slowest observed latency before
+/// the horizon, and the number of those that never settled.
+fn windowed(samples: &[(usize, Option<usize>)], horizon: usize) -> (Vec<usize>, usize) {
+    let slowest = samples
+        .iter()
+        .filter_map(|&(o, e)| e.map(|e| e - o))
+        .max()
+        .unwrap_or(0);
+    let in_window: Vec<_> = samples
+        .iter()
+        .filter(|&&(o, _)| o + slowest <= horizon)
+        .collect();
+    let mut ages: Vec<usize> = in_window
+        .iter()
+        .filter_map(|&&(o, e)| e.map(|e| e - o))
+        .collect();
+    ages.sort_unstable();
+    let unsettled = in_window.len() - ages.len();
+    (ages, unsettled)
+}
+
+fn assert_latency_block(
+    cols: &[String],
+    prefix: &str,
+    samples: &[(usize, Option<usize>)],
+    horizon: usize,
+) {
+    let (ages, unsettled) = windowed(samples, horizon);
+    assert!(!ages.is_empty());
+    let name = |s: &str| format!("{prefix}{s}");
+    assert_eq!(col(cols, &name("n")), ages.len().to_string(), "{prefix}n");
+    assert_eq!(col(cols, &name("unsettled")), unsettled.to_string());
+    let total = ages.len() + unsettled;
+    for (suffix, p) in [("p50", 0.50), ("p90", 0.90), ("p99", 0.99), ("max", 1.0)] {
+        assert_eq!(
+            col(cols, &name(suffix)),
+            nearest_rank(&ages, total, p),
+            "{prefix}{suffix}"
+        );
+    }
 }
 
 #[test]
-fn settlement_quantile_cols_match_report_without_cutoff() {
-    use sim::smr::{CommandStatus, run_smr};
+fn latency_quantile_cols_match_report_over_the_windowed_population() {
+    use sim::smr::run_smr;
     let spec = single_point_spec(120);
     let (_, scenario) = expand_smr(&spec).expect("valid spec").remove(0);
     let report = run_smr(&scenario);
     let cols = grid_row_cols(&spec, "quant");
-
-    let mut tes: Vec<usize> = report
+    let paper: Vec<_> = report
         .commands
         .iter()
-        .filter(|c| c.status == CommandStatus::Complete)
-        .filter_map(|c| settled_round(c).map(|r| r - c.injection_round))
+        .filter_map(|c| c.injected_round.map(|d| (d, c.prefix_fixed_round)))
         .collect();
-    tes.sort_unstable();
-    assert!(!tes.is_empty());
-    let unsettled = report.commands.len() - tes.len();
-
-    assert_eq!(col(&cols, "te_n"), tes.len().to_string(), "te_n");
-    assert_eq!(
-        col(&cols, "te_unsettled"),
-        unsettled.to_string(),
-        "te_unsettled"
-    );
-    assert_eq!(
-        col(&cols, "te_p50"),
-        nearest_rank(&tes, 0.50).to_string(),
-        "te_p50"
-    );
-    assert_eq!(
-        col(&cols, "te_p90"),
-        nearest_rank(&tes, 0.90).to_string(),
-        "te_p90"
-    );
-    assert_eq!(
-        col(&cols, "te_p99"),
-        nearest_rank(&tes, 0.99).to_string(),
-        "te_p99"
-    );
-    assert_eq!(
-        col(&cols, "te_max"),
-        tes[tes.len() - 1].to_string(),
-        "te_max"
-    );
+    let client: Vec<_> = report
+        .commands
+        .iter()
+        .map(|c| (c.injection_round, c.prefix_fixed_round))
+        .collect();
+    assert_latency_block(&cols, "lat_", &paper, 120);
+    assert_latency_block(&cols, "client_lat_", &client, 120);
 }
 
 #[test]
-fn settlement_window_drops_arrivals_within_five_t_commit_of_the_horizon() {
-    use sim::smr::{CommandStatus, run_smr};
+fn latency_window_drops_arrivals_within_the_slowest_latency_of_the_horizon() {
+    use sim::smr::run_smr;
     let mut b = base(
         ProtoSpec::Compact {
             t_commit_rounds: 20,
@@ -416,27 +429,23 @@ fn settlement_window_drops_arrivals_within_five_t_commit_of_the_horizon() {
     let (_, scenario) = expand_smr(&spec).expect("valid spec").remove(0);
     let report = run_smr(&scenario);
     let cols = grid_row_cols(&spec, "window");
-
-    let cutoff = 300 - 5 * 20;
-    let in_window = report
+    let paper: Vec<_> = report
         .commands
         .iter()
-        .filter(|c| c.injection_round <= cutoff);
-    let n_complete = in_window
-        .clone()
-        .filter(|c| c.status == CommandStatus::Complete && settled_round(c).is_some())
-        .count();
-    assert!(n_complete > 0 && n_complete < report.commands.len());
-    assert_eq!(
-        col(&cols, "te_n"),
-        n_complete.to_string(),
-        "te_n honours the cutoff"
+        .filter_map(|c| c.injected_round.map(|d| (d, c.committed_round)))
+        .collect();
+    let client: Vec<_> = report
+        .commands
+        .iter()
+        .map(|c| (c.injection_round, c.committed_ack_round))
+        .collect();
+    assert!(
+        windowed(&paper, 300).0.len() < paper.len(),
+        "the window must drop late arrivals"
     );
-    assert_eq!(
-        col(&cols, "te_unsettled"),
-        (in_window.count() - n_complete).to_string(),
-        "te_unsettled counts only in-window commands"
-    );
+    assert_latency_block(&cols, "lat_", &paper, 300);
+    assert_latency_block(&cols, "client_lat_", &client, 300);
+    assert_eq!(col(&cols, "lat_end"), "committed");
 }
 
 #[test]
@@ -491,7 +500,7 @@ fn smr_grid_writes_summary_rows_and_ledger() {
     let header_cols = rows[0].split(',').count();
     assert_eq!(
         rows[0].split(',').next_back(),
-        Some("abort_kind"),
+        Some("halt_kind"),
         "outcome columns extend append-only"
     );
     for row in &rows[1..] {
@@ -652,7 +661,7 @@ fn recovery_rows_fill_the_outcome_columns_and_other_protos_leave_them_empty() {
     .expect("grid runs");
     let header = csv.lines().next().unwrap().to_string();
     assert!(
-        header.ends_with("safety,recovered_round,fork_ok,rollbacks_total,te_n,te_unsettled,te_p50,te_p90,te_p99,te_max,abort_kind"),
+        header.ends_with("safety,recovered_round,fork_ok,rollbacks_total,lat_end,lat_n,lat_unsettled,lat_p50,lat_p90,lat_p99,lat_max,client_lat_mean,client_lat_n,client_lat_unsettled,client_lat_p50,client_lat_p90,client_lat_p99,client_lat_max,abort_kind,strong_safety_violation_rounds,strong_safety_first_violation,strong_safety_boundary_violations,strong_safety_boundary_first_violation,retractions,retraction_rewrites,first_retraction_round,commit_fork_round,min_useful,useful_ge_n4,halt_round,halt_kind"),
         "append-only columns: {header}"
     );
     let cell = |row: &str, name: &str| -> String {
@@ -739,4 +748,288 @@ fn the_smr_split_column_sits_between_horizon_and_seed() {
         .position(|&c| c == "split")
         .expect("split column");
     assert_eq!((cols[at - 1], cols[at + 1]), ("horizon", "seed"));
+}
+
+// Seed 98 commits a pool client's sn out of order under the execute-once state machine; seed 97 does not.
+#[test]
+fn an_out_of_sn_order_commit_is_an_sn_order_abort_row_and_the_grid_continues() {
+    let mut b = base(
+        ProtoSpec::Compact { t_commit_rounds: 2 },
+        Some(TrafficSpec::Pmf {
+            arrivals_pmf: vec![0.0, 0.0, 1.0],
+        }),
+    );
+    b.n = 16;
+    b.max_rounds = 300;
+    b.schedule = Some(sim::spec::ScheduleSpec::FreshPerRound { fraction: 0.2 });
+    b.client_model = ClientModel::Pool { clients: 24 };
+    b.repeated_commit = sim::smr::RepeatedCommit::Skip;
+    let spec = SmrGridSpec {
+        exp: "sn-order".into(),
+        base: b,
+        pairs: None,
+        betas: None,
+        sigmas: None,
+        rates: None,
+        t_commits: None,
+        horizons: None,
+        splits: None,
+        ladder: vec![LadderRung {
+            n: 16,
+            seed_base: 97,
+            seed_count: 2,
+        }],
+    };
+    let dir = std::env::temp_dir().join(format!("smr-grid-sn-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let ledger = dir.join("ledger.jsonl");
+    let csv = run_smr_grid_streaming(&spec, Some(&ledger), None).expect("grid continues");
+    let rows: Vec<Vec<&str>> = csv
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect())
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per point");
+    let failed = rows
+        .iter()
+        .find(|r| col(r, "seed") == "98")
+        .expect("seed 98 row");
+    assert_eq!(col(failed, "terminal"), "abort");
+    assert_eq!(col(failed, "abort_kind"), "sn_order");
+    let other = rows
+        .iter()
+        .find(|r| col(r, "seed") == "97")
+        .expect("seed 97 row");
+    assert_ne!(col(other, "terminal"), "abort");
+    let failure = std::fs::read_to_string(&ledger)
+        .expect("ledger")
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("json"))
+        .find(|row| row["scenario"]["seed"] == 98)
+        .expect("seed 98 ledger row")["outcome"]["failure"]
+        .clone();
+    assert_eq!(failure["phase"], "OutOfSnOrderCommit");
+    assert!(failure["violation"]["committed_sn"].is_u64());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+// Def 1.4 / Def 1.5 columns: appended after abort_kind, filled per executing tier, blank otherwise.
+#[test]
+fn committed_sequence_columns_follow_the_report_and_stay_blank_where_unmeasured() {
+    let mut b = base(
+        ProtoSpec::Compact {
+            t_commit_rounds: 10,
+        },
+        Some(TrafficSpec::Pmf {
+            arrivals_pmf: vec![0.0, 0.0, 1.0],
+        }),
+    );
+    b.n = 100;
+    b.max_rounds = 60;
+    let spec = SmrGridSpec {
+        exp: "committed-cols".into(),
+        base: b,
+        ladder: vec![LadderRung {
+            n: 100,
+            seed_base: 7001,
+            seed_count: 1,
+        }],
+        ..single_point_spec(60)
+    };
+    let spec = SmrGridSpec {
+        rates: None,
+        ..spec
+    };
+    let (_, scenario) = expand_smr(&spec).expect("valid").remove(0);
+    let report = sim::smr::run_smr_grid(&scenario);
+    assert!(report.strong_safety_violation_rounds > 0, "precondition");
+    let cols = grid_row_cols(&spec, "committed-cols");
+    let opt = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_default();
+    assert_eq!(
+        [
+            col(&cols, "strong_safety_violation_rounds"),
+            col(&cols, "strong_safety_first_violation"),
+            col(&cols, "strong_safety_boundary_violations"),
+            col(&cols, "retractions"),
+            col(&cols, "retraction_rewrites"),
+            col(&cols, "first_retraction_round"),
+            col(&cols, "commit_fork_round"),
+        ],
+        [
+            report.strong_safety_violation_rounds.to_string().as_str(),
+            opt(report.strong_safety_first_violation).as_str(),
+            "",
+            report.retractions.to_string().as_str(),
+            report.retraction_rewrites.to_string().as_str(),
+            opt(report.first_retraction_round).as_str(),
+            "",
+        ]
+    );
+    let ext = grid_row_cols(&single_point_spec(40), "committed-cols-ext");
+    assert_eq!(ext.len(), sim::sweep::SMR_CSV_HEADER.split(',').count());
+    assert_eq!(col(&ext, "retractions"), "");
+    assert_eq!(col(&ext, "strong_safety_violation_rounds"), "");
+}
+
+// One pool client and an arrival every round: the second arrival finds the pool empty.
+#[test]
+fn an_exhausted_client_pool_is_a_pool_abort_row_and_the_grid_continues() {
+    let mut b = base(
+        ProtoSpec::Compact { t_commit_rounds: 5 },
+        Some(TrafficSpec::Pmf {
+            arrivals_pmf: vec![0.0, 1.0],
+        }),
+    );
+    b.n = 16;
+    b.client_model = ClientModel::Pool { clients: 1 };
+    let spec = SmrGridSpec {
+        exp: "pool".into(),
+        base: b,
+        pairs: None,
+        betas: None,
+        sigmas: None,
+        rates: None,
+        t_commits: None,
+        horizons: Some(vec![1, 40]),
+        splits: None,
+        ladder: vec![LadderRung {
+            n: 16,
+            seed_base: 1,
+            seed_count: 1,
+        }],
+    };
+    let dir = std::env::temp_dir().join(format!("smr-grid-pool-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let ledger = dir.join("ledger.jsonl");
+    let csv = run_smr_grid_streaming(&spec, Some(&ledger), None).expect("grid continues");
+    let rows: Vec<Vec<&str>> = csv
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect())
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per point");
+    let survived = rows.iter().find(|r| col(r, "horizon") == "1").expect("row");
+    assert_eq!(col(survived, "terminal"), "ran");
+    let exhausted = rows
+        .iter()
+        .find(|r| col(r, "horizon") == "40")
+        .expect("row");
+    assert_eq!(col(exhausted, "terminal"), "abort");
+    assert_eq!(col(exhausted, "abort_kind"), "pool");
+    assert_eq!(
+        col(exhausted, "rounds"),
+        "2",
+        "the second arrival is in round 2"
+    );
+    let ledger_rows: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+        .expect("ledger")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json"))
+        .collect();
+    let aborted = ledger_rows
+        .iter()
+        .find(|r| r["outcome"]["terminal"] == "abort")
+        .expect("abort ledger row");
+    assert_eq!(aborted["extra"]["abort_kind"], "pool");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn rows_flag_whether_n_over_4_servers_were_useful_in_every_round() {
+    let surge = |fraction: f64, tag: &str| {
+        let mut spec = single_point_spec(30);
+        spec.base.schedule = Some(sim::spec::ScheduleSpec::Windows {
+            windows: vec![sim::spec::WindowSpec {
+                start_round: 5,
+                rounds: 3,
+                target: sim::spec::TargetSpec::SampleFraction { fraction },
+            }],
+        });
+        grid_row_cols(&spec, tag)
+    };
+    let calm = surge(0.0, "calm");
+    assert_eq!(col(&calm, "min_useful"), "64");
+    assert_eq!(col(&calm, "useful_ge_n4"), "true");
+    let hit = surge(0.9, "surge");
+    assert!(col(&hit, "min_useful").parse::<u32>().expect("count") < 16);
+    assert_eq!(col(&hit, "useful_ge_n4"), "false");
+}
+
+// A halt is its own terminal: the row, its appended columns and the ledger row all name it.
+#[test]
+fn a_halted_run_is_a_halted_row_and_ledger_outcome() {
+    let dir = std::env::temp_dir().join(format!("smr-grid-halt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let ledger = dir.join("ledger.jsonl");
+    let _ = std::fs::remove_file(&ledger);
+    let mut b = base(
+        ProtoSpec::Compact {
+            t_commit_rounds: 21,
+        },
+        Some(TrafficSpec::Pmf {
+            arrivals_pmf: vec![0.0, 0.0, 0.0, 0.0, 1.0],
+        }),
+    );
+    b.max_rounds = 400;
+    let spec = |halt: bool| SmrGridSpec {
+        exp: format!("halt-{halt}"),
+        base: SmrScenarioSpec {
+            halt_on_violation: halt,
+            ..b.clone()
+        },
+        pairs: None,
+        betas: None,
+        sigmas: None,
+        rates: None,
+        t_commits: None,
+        horizons: None,
+        splits: None,
+        ladder: vec![LadderRung {
+            n: 64,
+            seed_base: 950_000,
+            seed_count: 1,
+        }],
+    };
+    let row = |halt: bool| -> Vec<String> {
+        let csv = run_smr_grid_streaming(&spec(halt), Some(&ledger), None).expect("grid runs");
+        csv.lines()
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect()
+    };
+    let (off, on) = (row(false), row(true));
+    assert_eq!(
+        col(&off, "safety"),
+        "false",
+        "precondition: the cell splits its brain"
+    );
+    assert_eq!(
+        (
+            col(&off, "terminal"),
+            col(&off, "halt_round"),
+            col(&off, "halt_kind")
+        ),
+        ("ran", "", "")
+    );
+    assert_eq!(col(&on, "terminal"), "halted");
+    assert_eq!(col(&on, "halt_kind"), "fork");
+    assert_eq!(col(&on, "halt_round"), col(&on, "rounds"));
+    assert!(col(&on, "rounds").parse::<usize>().unwrap() < 400);
+
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0]["scenario"].get("halt_on_violation").is_none());
+    assert_eq!(rows[1]["scenario"]["halt_on_violation"], true);
+    let halt_round: usize = col(&on, "halt_round").parse().unwrap();
+    assert_eq!(
+        rows[1]["outcome"]["terminal"],
+        serde_json::json!({"Halted": {"round": halt_round, "kind": "fork"}})
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

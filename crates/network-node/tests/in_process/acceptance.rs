@@ -1,5 +1,6 @@
 //! Feature acceptance tests — user-perspective behavior of the networked
-//! node crate, written before implementation from an edge-case outline.
+//! node crate, written before implementation (edge-case outline:
+//! .claude/plans/wip/2026-07-24-phase-6-shadow-node.edge-cases.md).
 //! Each drives the public API the way the shell / collector / operator will.
 
 use network_node::collect::aggregate;

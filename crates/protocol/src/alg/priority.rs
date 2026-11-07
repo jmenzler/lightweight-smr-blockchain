@@ -1,4 +1,7 @@
-//! Definition 3.5 (p. 23): the (k,ℓ)-priority rule, which is Algorithm 2 with f = largest.
+//! Definition 3.5 (p. 23), the (k,ℓ)-priority rule: with at least ℓ replies a server chooses a
+//! subset of ℓ of them and adopts the largest. The definition does not say how the subset is
+//! chosen or whether the own value competes; the node runs Algorithm 2 with f = largest, so the
+//! subset is uniform and the own value is excluded (README, "Gossip and priority readings").
 
 use crate::median::MedianNode;
 use crate::{Config, Value};

@@ -2,9 +2,11 @@
 
 use network_node::cli::arg;
 use network_node::engine::RoundEngine;
-use network_node::net::read_frame;
+use network_node::net::{read_frame, read_message};
 use network_node::spec::{NodeRunSpec, SyncMode};
 use network_node::wire::{Msg, decode, encode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -12,6 +14,52 @@ use tokio::sync::mpsc;
 
 fn die(msg: &str) -> ! {
     network_node::cli::die("node", msg)
+}
+
+/// Counts one transport failure for the round record; every failed send or receive lands here.
+fn lose(lost: &AtomicU32, what: &str, why: impl std::fmt::Display) {
+    eprintln!("node: {what}: {why}");
+    lost.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Feeds one message to the engine and routes what it emits: replies and acks go back on the
+/// message's own connection, appends open a fresh one.
+fn dispatch(
+    engine: &mut RoundEngine,
+    msg: Msg,
+    reply_tx: &mpsc::UnboundedSender<Msg>,
+    peers: &[String],
+    max_frame: u32,
+    pad: u32,
+    lost: &Arc<AtomicU32>,
+) {
+    for (to, reply) in engine.on_message(msg) {
+        match reply {
+            Msg::PullReply { .. } | Msg::ClientAck { .. } => {
+                let _ = reply_tx.send(reply);
+            }
+            _ => {
+                let addr = peers[to as usize].clone();
+                let frame = match encode(&reply, max_frame, pad) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        lose(lost, "append encode failed", e);
+                        continue;
+                    }
+                };
+                let lost = Arc::clone(lost);
+                tokio::spawn(async move {
+                    let mut stream = match TcpStream::connect(addr.as_str()).await {
+                        Ok(stream) => stream,
+                        Err(e) => return lose(&lost, "append connect failed", e),
+                    };
+                    if let Err(e) = stream.write_all(&frame).await {
+                        lose(&lost, "append write failed", e);
+                    }
+                });
+            }
+        }
+    }
 }
 
 fn main() {
@@ -70,8 +118,10 @@ async fn run() {
         .unwrap_or_else(|e| die(&format!("bind :{port}: {e}")));
 
     let pad = spec.payload_bytes;
+    let lost = Arc::new(AtomicU32::new(0));
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<(Msg, mpsc::UnboundedSender<Msg>)>();
     let accept_tx = in_tx.clone();
+    let accept_lost = Arc::clone(&lost);
     tokio::spawn(async move {
         let mut accept_failures = 0u32;
         loop {
@@ -82,7 +132,7 @@ async fn run() {
                 }
                 Err(e) => {
                     accept_failures += 1;
-                    eprintln!("node: accept failed ({accept_failures} consecutive): {e}");
+                    lose(&accept_lost, "accept failed", &e);
                     if accept_failures >= 100 {
                         eprintln!("node: accept loop wedged — dying");
                         std::process::exit(2);
@@ -92,26 +142,27 @@ async fn run() {
                 }
             };
             let tx = accept_tx.clone();
+            let lost = Arc::clone(&accept_lost);
             tokio::spawn(async move {
-                let Ok(frame) = read_frame(&mut stream, max_frame).await else {
-                    return;
-                };
-                let msg = match decode(&frame, max_frame) {
+                let msg = match read_message(&mut stream, max_frame, pad).await {
                     Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("node: inbound frame decoded FAILED (wire bug?): {e}");
-                        return;
-                    }
+                    Err(e) => return lose(&lost, "inbound read failed", e),
                 };
                 let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Msg>();
                 if tx.send((msg, reply_tx)).is_err() {
                     return;
                 }
                 while let Some(reply) = reply_rx.recv().await {
-                    let Ok(frame) = encode(&reply, max_frame, pad) else {
-                        continue;
+                    let frame = match encode(&reply, max_frame, pad) {
+                        Ok(frame) => frame,
+                        Err(e) => {
+                            lose(&lost, "reply encode failed", e);
+                            continue;
+                        }
                     };
-                    let _ = stream.write_all(&frame).await;
+                    if let Err(e) = stream.write_all(&frame).await {
+                        lose(&lost, "reply write failed", e);
+                    }
                 }
             });
         }
@@ -121,11 +172,30 @@ async fn run() {
         SyncMode::Barrier => {
             let addr = arg("--coordinator")
                 .unwrap_or_else(|| die("--coordinator required in barrier mode"));
-            Some(
-                TcpStream::connect(addr.as_str())
-                    .await
-                    .unwrap_or_else(|e| die(&format!("coordinator {addr}: {e}"))),
+            let mut stream = TcpStream::connect(addr.as_str())
+                .await
+                .unwrap_or_else(|e| die(&format!("coordinator {addr}: {e}")));
+            let hello = encode(
+                &Msg::RoundDone {
+                    round: 0,
+                    from: node_id,
+                },
+                max_frame,
+                0,
             )
+            .expect("control frame");
+            if let Err(e) = stream.write_all(&hello).await {
+                die(&format!("coordinator hello: {e}"));
+            }
+            // round 1 waits until every peer has bound its listener
+            match read_frame(&mut stream, max_frame)
+                .await
+                .map(|f| decode(&f, max_frame))
+            {
+                Ok(Ok(Msg::RoundGo { round: 0 })) => {}
+                other => die(&format!("barrier start: expected RoundGo 0, got {other:?}")),
+            }
+            Some(stream)
         }
         SyncMode::Timer => None,
     };
@@ -143,6 +213,13 @@ async fn run() {
         None => tokio::time::Instant::now() + Duration::from_millis(spec.start_offset_ms),
     };
 
+    // the offset is a bind grace period: round 1 starts at t0, so its requests find every listener up
+    if spec.sync == SyncMode::Timer {
+        tokio::time::sleep_until(t0).await;
+    }
+
+    // client commands tagged for the next round keep their connection until that round starts
+    let mut deferred: Vec<(Msg, mpsc::UnboundedSender<Msg>)> = Vec::new();
     for round in 1..=max_rounds {
         let mut t_last_reply = 0u64;
         let round_started = tokio::time::Instant::now();
@@ -154,27 +231,39 @@ async fn run() {
 
         for (target, msg) in engine.on_round_start() {
             let addr = peers[target as usize].clone();
-            let Ok(frame) = encode(&msg, max_frame, pad) else {
-                continue;
+            let frame = match encode(&msg, max_frame, pad) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    lose(&lost, "request encode failed", e);
+                    continue;
+                }
             };
             let tx = in_tx.clone();
+            let lost = Arc::clone(&lost);
             tokio::spawn(async move {
-                let Ok(mut stream) = TcpStream::connect(addr.as_str()).await else {
-                    return;
+                let mut stream = match TcpStream::connect(addr.as_str()).await {
+                    Ok(stream) => stream,
+                    Err(e) => return lose(&lost, "request connect failed", e),
                 };
-                if stream.write_all(&frame).await.is_err() {
-                    return;
+                if let Err(e) = stream.write_all(&frame).await {
+                    return lose(&lost, "request write failed", e);
                 }
+                // a blocked or silent peer closes without replying; the request/reply counters cover that
                 let Ok(reply_frame) = read_frame(&mut stream, max_frame).await else {
                     return;
                 };
-                if let Ok(reply) = decode(&reply_frame, max_frame)
-                    .inspect_err(|e| eprintln!("node: reply decode FAILED (wire bug?): {e}"))
-                {
-                    let (ignore_tx, _ignore_rx) = mpsc::unbounded_channel::<Msg>();
-                    let _ = tx.send((reply, ignore_tx));
+                match decode(&reply_frame, max_frame) {
+                    Ok(reply) => {
+                        let (ignore_tx, _ignore_rx) = mpsc::unbounded_channel::<Msg>();
+                        let _ = tx.send((reply, ignore_tx));
+                    }
+                    Err(e) => lose(&lost, "reply decode failed (wire bug?)", e),
                 }
             });
+        }
+
+        for (msg, reply_tx) in std::mem::take(&mut deferred) {
+            dispatch(&mut engine, msg, &reply_tx, &peers, max_frame, pad, &lost);
         }
 
         loop {
@@ -187,26 +276,11 @@ async fn run() {
                     if matches!(msg, Msg::PullReply { .. }) {
                         t_last_reply = round_started.elapsed().as_micros() as u64;
                     }
-                    for (to, reply) in engine.on_message(msg) {
-                        match reply {
-                            Msg::PullReply { .. } | Msg::ClientAck { .. } => {
-                                let _ = reply_tx.send(reply);
-                            }
-                            _ => {
-                                let addr = peers[to as usize].clone();
-                                let Ok(frame) = encode(&reply, max_frame, pad) else {
-                                    continue;
-                                };
-                                tokio::spawn(async move {
-                                    let Ok(mut stream) = TcpStream::connect(addr.as_str()).await
-                                    else {
-                                        return;
-                                    };
-                                    let _ = stream.write_all(&frame).await;
-                                });
-                            }
-                        }
+                    if engine.defers(&msg) {
+                        deferred.push((msg, reply_tx));
+                        continue;
                     }
+                    dispatch(&mut engine, msg, &reply_tx, &peers, max_frame, pad, &lost);
                 }
                 Ok(None) => break,
                 Err(_) => break,
@@ -214,6 +288,7 @@ async fn run() {
         }
 
         let compute_started = tokio::time::Instant::now();
+        engine.add_transport_err(lost.swap(0, Ordering::Relaxed));
         let mut record = engine.on_round_end();
         record.t_step_compute_us = compute_started.elapsed().as_micros() as u64;
         record.t_last_reply_us = t_last_reply;

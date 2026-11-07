@@ -2,7 +2,8 @@
 //! across nodes, and §4 forgetting.
 
 use super::{Checkpoint, RecoveryNode};
-use crate::compact::{ClientCommand, Timed};
+use crate::certificates::ServerCertState;
+use crate::compact::{ClientCommand, SharedState, Timed};
 use crate::log::Log;
 use crate::merge::{
     Chosen, StampTie, UnionStamp, common_prefix_len, is_sorted_perm, merge_onto_median,
@@ -48,6 +49,21 @@ impl RecoveryNode {
         assert!(
             self.c_i.p == cp.p,
             "share_checkpoint over unequal P: digest collision or a wrong key"
+        );
+        // A Null bumps sn(c) without extending S, so equal length does not pin the sn map.
+        assert!(
+            cp.s.sn_iter().eq(self.c_i.s.sn_iter()),
+            "share_checkpoint over unequal committed sequence numbers: digest collision or a \
+             wrong key"
+        );
+        assert!(
+            same_forest(self.c_i.certs.as_ref(), cp.certs.as_ref()),
+            "share_checkpoint over unequal §5 forests: digest collision or a wrong key"
+        );
+        debug_assert!(
+            retained_entries_agree(&self.c_i.s, &cp.s),
+            "share_checkpoint over states whose retained entries differ: digest collision or a \
+             wrong key"
         );
         self.c_i = Arc::clone(cp);
     }
@@ -102,6 +118,16 @@ impl RecoveryNode {
             "end_window_shared over unequal committed sequence numbers: the class key did not \
              prove what it claimed"
         );
+        debug_assert!(
+            retained_entries_agree(&self.s_i, &cp.s),
+            "end_window_shared over states whose retained entries differ: the class key did not \
+             prove what it claimed"
+        );
+        debug_assert!(
+            same_forest(self.c_i.attest_committed().as_ref(), cp.certs.as_ref()),
+            "end_window_shared over unequal §5 forests: the class key did not prove what it \
+             claimed"
+        );
         // Intern only on representation equality; `PartialEq` would panic on differing offsets.
         STATE_INTERN_TRIED.fetch_add(1, Ordering::Relaxed);
         if self.s_i.content_eq(&cp.s) {
@@ -110,6 +136,25 @@ impl RecoveryNode {
         }
         Arc::clone(cp)
     }
+}
+
+/// Both layers absent, or both present over the same committed leaves.
+fn same_forest(a: Option<&ServerCertState>, b: Option<&ServerCertState>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.forest().len() == b.forest().len() && a.forest().roots() == b.forest().roots()
+        }
+        _ => false,
+    }
+}
+
+/// The entries both states still retain are the same; equal-length states differ in what they forgot.
+fn retained_entries_agree(a: &SharedState, b: &SharedState) -> bool {
+    let from = a.executed_offset().max(b.executed_offset());
+    a.executed()
+        .iter_from(from)
+        .eq(b.executed().iter_from(from))
 }
 
 /// L_i := L'_i ∘ L̄ over the drawn logs M (Alg 3 step 4). When L̄ adds nothing, the median's

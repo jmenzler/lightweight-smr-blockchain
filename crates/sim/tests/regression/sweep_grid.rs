@@ -236,6 +236,27 @@ fn spec_json_parses_single_and_array_of_same_kind() {
 }
 
 #[test]
+fn a_spec_parse_error_names_the_missing_field() {
+    use sim::sweep::parse_specs;
+    let smr = r#"{"exp":"e","base":{"n":16,"seed":1,"k":6,"ell":3,"sigma":1.0,
+        "proto":{"kind":"recovery","t_window_rounds":8},"injections":[],"max_rounds":10},
+        "ladder":[{"n":16,"seed_base":0,"seed_count":1}]}"#;
+    let err = parse_specs(smr).expect_err("resend_until_acked is required");
+    assert!(err.contains("resend_until_acked"), "{err}");
+    let err = parse_specs(&format!("[{smr}]")).expect_err("also inside an array");
+    assert!(err.contains("resend_until_acked"), "{err}");
+
+    let mut grid = serde_json::to_value(smoke_spec()).unwrap();
+    grid["base"].as_object_mut().unwrap().remove("max_rounds");
+    let err = parse_specs(&grid.to_string()).expect_err("max_rounds is required");
+    assert!(err.contains("max_rounds"), "{err}");
+
+    let err =
+        parse_specs(r#"{"exp":"e","base":{},"ladder":[]}"#).expect_err("neither kind of spec");
+    assert!(err.contains("init") && err.contains("proto"), "{err}");
+}
+
+#[test]
 fn streaming_partial_file_holds_rows_and_final_csv_is_byte_identical() {
     use sim::sweep::run_grid_streaming;
     let dir = std::env::temp_dir().join(format!("sweep-grid-stream-{}", std::process::id()));
@@ -279,7 +300,7 @@ fn betas_axis_drives_adaptive_schedule() {
         exp: "t".into(),
         base: base(
             InitSpec::Split { fraction: 0.5 },
-            Some(ScheduleSpec::Adaptive1Late {
+            Some(ScheduleSpec::Adaptive0Late {
                 fraction: 0.0,
                 policy: AdaptivePolicy::BlockHolders,
             }),
@@ -298,7 +319,7 @@ fn betas_axis_drives_adaptive_schedule() {
     let points = expand(&spec).expect("adaptive base must accept a betas axis");
     assert_eq!(
         points[0].1.schedule,
-        BlockSchedule::Adaptive1Late {
+        BlockSchedule::Adaptive0Late {
             fraction: 0.11,
             policy: AdaptivePolicy::BlockHolders,
         },
@@ -422,4 +443,32 @@ fn the_split_column_sits_between_horizon_and_seed() {
         .position(|&c| c == "split")
         .expect("split column");
     assert_eq!((cols[at - 1], cols[at + 1]), ("horizon", "seed"));
+}
+
+#[test]
+fn grid_points_finer_than_three_decimals_stay_separate_cells() {
+    let spec = GridSpec {
+        betas: Some(vec![0.142, 0.1425]),
+        ladder: vec![LadderRung {
+            n: 50,
+            seed_base: 1,
+            seed_count: 1,
+        }],
+        ..smoke_spec()
+    };
+    let csv = run_grid_streaming(&spec, None, None).expect("grid runs");
+    assert_eq!(sim::sweep::grid_summary(&csv).len(), 2);
+}
+
+#[test]
+fn a_ladder_whose_seeds_overflow_u64_is_rejected() {
+    let spec = GridSpec {
+        ladder: vec![LadderRung {
+            n: 50,
+            seed_base: u64::MAX - 1,
+            seed_count: 3,
+        }],
+        ..smoke_spec()
+    };
+    assert!(expand(&spec).is_err());
 }

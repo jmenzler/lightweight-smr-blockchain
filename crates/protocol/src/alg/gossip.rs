@@ -1,5 +1,6 @@
-//! Algorithm 4, the (k,ℓ)-gossip rule (p. 21). Each bullet is marked
-//! `// Alg 4: "<its opening words>"`, in the order of the box.
+//! Algorithm 4, the (k,ℓ)-gossip rule (p. 21). Each bullet that runs here is marked
+//! `// Alg 4: "<its opening words>"`, in the order of the box; the bullet that sends the k value
+//! requests is the driver's.
 
 use crate::{Config, Value};
 use rand::Rng;
@@ -18,6 +19,12 @@ pub struct GossipNode {
 impl GossipNode {
     /// "a subset of servers ... start with x_i = x, all others with x_i = x₀"
     pub fn new(x_i: Value, x: Value, x0: Value, cfg: Config) -> Self {
+        cfg.assert_valid();
+        assert!(x != x0, "gossip needs x ≠ x₀, got {x} twice");
+        assert!(
+            x_i == x || x_i == x0,
+            "x_i must be x or x₀: got {x_i} with x = {x}, x₀ = {x0}"
+        );
         GossipNode {
             x_i: Some(x_i),
             x,

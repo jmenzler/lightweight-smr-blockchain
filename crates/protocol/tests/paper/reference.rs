@@ -5,9 +5,12 @@
 //! Where a box leaves a choice open, the reference makes the production code's
 //! choice and says so with a `DETERMINIZED:` tag; the differential tests in
 //! `differential.rs` then demand exact equality with the production nodes after
-//! every round.
+//! every round. Because those choices (and `Entry`/`Timed` ordering, `sample`) are shared,
+//! agreement guards refactorings of the production code, not the readings themselves; the
+//! readings are pinned by the hand-derived tests next to each box.
 
 use protocol::compact::{ClientCommand, ClientId, Entry, Timed, Triage};
+use protocol::merge::{StampTie, UnionStamp};
 use protocol::recovery::RState;
 use rand::Rng;
 use rand::seq::index::sample;
@@ -54,6 +57,11 @@ fn xd(round: u64) -> Timed {
 }
 
 /// Length of the largest prefix whose commands all have age ≥ `t`.
+/// Alg 6 (p. 31): P is a "sequence of pre-committed commands", so it prefixes L_i by command.
+pub fn is_command_prefix(p: &[Timed], log: &[Timed]) -> bool {
+    log.len() >= p.len() && p.iter().zip(log).all(|(p, l)| p.entry == l.entry)
+}
+
 fn aged_prefix(log: &[Timed], round: u64, t: u64) -> usize {
     log.iter()
         .take_while(|x| round.saturating_sub(x.round) >= t)
@@ -66,14 +74,37 @@ pub fn choose_m<R: Rng + ?Sized>(replies: usize, ell: usize, rng: &mut R) -> Opt
     (replies >= ell).then(|| sample(rng, replies, ell).into_vec())
 }
 
+/// How the merge reads a log's round stamps: the comparator key and which sighting's stamp L̄ keeps.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MergePolicy {
+    pub stamp: StampTie,
+    pub union: UnionStamp,
+}
+
 /// The extended median rule's merge `L'_i ∘ L̄` over the logs in M (Alg 3, used by Alg 5 step 4 and Alg 6).
 pub fn median_merge(m: &[Vec<Timed>], appends: &[(ClientCommand, u64)]) -> Vec<Timed> {
-    // DETERMINIZED: median-stamp — logs compare lexicographically as sequences of (command, round).
+    median_merge_with(m, appends, MergePolicy::default())
+}
+
+pub fn median_merge_with(
+    m: &[Vec<Timed>],
+    appends: &[(ClientCommand, u64)],
+    policy: MergePolicy,
+) -> Vec<Timed> {
+    // DETERMINIZED: median-stamp — logs compare lexicographically as sequences of (command, round),
+    // or of commands only with exact ties in draw order.
     let mut sorted: Vec<&Vec<Timed>> = m.iter().collect();
-    sorted.sort();
+    match policy.stamp {
+        StampTie::IncludeRound => sorted.sort(),
+        StampTie::CommandsOnly => {
+            sorted.sort_by(|a, b| a.iter().map(|t| &t.entry).cmp(b.iter().map(|t| &t.entry)))
+        }
+    }
     let mut log = sorted[m.len() / 2].clone();
+    let median_len = log.len();
     // DETERMINIZED: union-order — L̄ walks the logs in sorted order, then the append requests;
-    // containment is keyed on the command, so the first sighting's stamp survives.
+    // containment is keyed on the command, so the first sighting's stamp survives unless the policy
+    // re-stamps with the last one. The median L'_i is taken whole, stamps included.
     let requests = appends.iter().map(|(x, round)| Timed {
         entry: Entry::Cmd(*x),
         round: *round,
@@ -83,8 +114,12 @@ pub fn median_merge(m: &[Vec<Timed>], appends: &[(ClientCommand, u64)]) -> Vec<T
         .flat_map(|l| l.iter().cloned())
         .chain(requests)
     {
-        if !log.iter().any(|have| have.entry == t.entry) {
-            log.push(t);
+        match log.iter().position(|have| have.entry == t.entry) {
+            None => log.push(t),
+            Some(at) if policy.union == UnionStamp::LastSighting && at >= median_len => {
+                log[at].round = t.round;
+            }
+            Some(_) => {}
         }
     }
     log
@@ -139,6 +174,7 @@ pub struct CompactServer {
     pub s_i: State,
     pub l_i: Option<Vec<Timed>>,
     t: u64,
+    policy: MergePolicy,
 }
 
 impl CompactServer {
@@ -147,7 +183,13 @@ impl CompactServer {
             s_i: State::default(),
             l_i: Some(vec![x0()]),
             t,
+            policy: MergePolicy::default(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: MergePolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     fn sn(&self, c: ClientId) -> u64 {
@@ -213,7 +255,7 @@ impl CompactServer {
         let m: Vec<&CompactReply> = m.iter().map(|&j| &replies[j]).collect();
         // Alg 5: "i sets L_i := L'_i ∘ L̄"
         let logs: Vec<Vec<Timed>> = m.iter().map(|r| r.l_j.clone()).collect();
-        let mut l_i = median_merge(&logs, appends);
+        let mut l_i = median_merge_with(&logs, appends, self.policy);
         // Alg 5: "if the logs in L_i contain different commands from the same client with the same sequence number"
         replace_duplicates_with_bot(&mut l_i);
         // Alg 5: "if b_i = 1 then i picks any reply S_j"
@@ -396,7 +438,7 @@ impl RecoveryServer {
             // Alg 6: "for current checkpoint C_i = (S, P, W), commit all commands in P on S_i and remove the prefix P from L_i"
             // P = ⊥ (the genesis checkpoint) commits nothing.
             let p = self.c_i.p.clone().unwrap_or_default();
-            assert!(l_i.starts_with(&p), "P must be a prefix of L_i");
+            assert!(is_command_prefix(&p, l_i), "P must be a prefix of L_i");
             for x in l_i.drain(..p.len()) {
                 self.s_i.execute(&x.entry);
             }

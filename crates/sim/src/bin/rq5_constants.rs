@@ -10,8 +10,7 @@ const SEEDS: u64 = 20;
 const C_WIN: f64 = 1.0;
 const NS: [usize; 5] = [250, 1000, 4000, 16000, 64000];
 const CONCURRENT: u32 = 8;
-const OUT_DIR: &str = "out/rq5-constants";
-const CSV_PATH: &str = "out/rq5-constants/rq5_smr.csv";
+const CSV_PATH: &str = "experiments/rq5-constants/evidence/rq5_smr.csv";
 const CSV_HEADER: &str =
     "subexp,beta,sigma,n,seed,status,delivered,all_logs,prefix_fixed,tb,tm,g,last_holders";
 
@@ -164,7 +163,7 @@ fn main() {
         println!("tm beta={beta}: T_M ~ {a:.3}*log2(n) + {b:.3}, R^2 = {r2:.4}");
     }
 
-    std::fs::create_dir_all(OUT_DIR).expect("output dir");
+    std::fs::create_dir_all("experiments/rq5-constants/evidence").expect("evidence dir");
     std::fs::write(CSV_PATH, csv).expect("write csv");
     println!("per-seed rows -> {CSV_PATH}");
 }

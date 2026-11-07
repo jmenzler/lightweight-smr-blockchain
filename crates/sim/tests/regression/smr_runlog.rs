@@ -121,3 +121,76 @@ fn smr_record_carries_provenance_and_returns_paths() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn identical_smr_runs_get_distinct_artifacts_and_keep_the_first() {
+    let dir = std::env::temp_dir().join(format!("smr-runlog-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ledger = dir.join("ledger.jsonl");
+    let scenario = scenario();
+    let report = sim::smr::run_smr(&scenario);
+    let (m1, c1) = sim::runlog::record_smr_report(&scenario, &report, &ledger, None);
+    let first_metrics = std::fs::read_to_string(&m1).unwrap();
+    let (m2, c2) = sim::runlog::record_smr_report(&scenario, &report, &ledger, None);
+    assert_ne!(m1, m2);
+    assert_ne!(c1, c2);
+    assert_eq!(std::fs::read_to_string(&m1).unwrap(), first_metrics);
+    let stem = |p: &str| {
+        std::path::Path::new(p)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(stem(&m2), stem(&c2), "a run's files share one name");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Def 1.4 / Def 1.5 counters ride the ledger for every executing tier, zeros included.
+#[test]
+fn ledger_records_the_committed_sequence_oracles_beside_the_no_fork_latch() {
+    let dir = std::env::temp_dir().join(format!("smr-runlog-committed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ledger = dir.join("ledger.jsonl");
+    let extended = scenario();
+    let mut compact = scenario();
+    compact.proto = Proto::Compact {
+        t_commit_rounds: 10,
+    };
+    compact.n = 100;
+    compact.seed = 7001;
+    compact.max_rounds = 60;
+    compact.sigma = 1.0;
+    compact.injections = Vec::new();
+    compact.traffic = Some(vec![sim::smr::TrafficPhase {
+        from_round: 1,
+        arrivals_pmf: vec![0.0, 0.0, 1.0],
+    }]);
+    for sc in [&extended, &compact] {
+        let report = sim::smr::run_smr(sc);
+        sim::runlog::log_smr_run_to(&ledger, sc, &report, None).unwrap();
+    }
+    let text = std::fs::read_to_string(&ledger).unwrap();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        rows[0]["outcome"].get("committed").is_none(),
+        "extended executes nothing"
+    );
+    let committed = &rows[1]["outcome"]["committed"];
+    assert_eq!(committed["retractions"], 0);
+    assert!(
+        committed["strong_safety_violation_rounds"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(committed["strong_safety_first_violation"].is_u64());
+    assert!(
+        committed.get("strong_safety_boundary_violations").is_none(),
+        "recovery only"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

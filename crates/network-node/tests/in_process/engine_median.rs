@@ -80,8 +80,9 @@ fn blocked_node_sends_nothing_serves_nothing_ends_undecided() {
 
 #[test]
 fn blocked_round_still_consumes_the_target_draws() {
-    // Stream parity with the sim: the k draws happen even when blocked, so
-    // round 2's targets are identical whether or not round 1 was blocked.
+    // The k target draws happen even when blocked. With no replies in either arm the step takes no
+    // ℓ-subset draw, so round 2's targets match; an open node that receives >= ℓ replies draws
+    // more, and its stream then differs from a blocked node's.
     let blocked = NodeRunSpec::from_json(&median_json(4, 9, 3, window_block_node0())).expect("s");
     let free = NodeRunSpec::from_json(&median_json(4, 9, 3, "")).expect("s");
     let mut eb = RoundEngine::new(&blocked, 0).expect("engine");
@@ -105,7 +106,7 @@ fn craft_replies(e: &mut RoundEngine, round: u64, values: &[u64]) {
     for (slot, v) in values.iter().enumerate() {
         e.on_message(Msg::PullReply {
             round,
-            from: 99,
+            from: 1,
             slot: slot as u16,
             payload: ReplyPayload::Value(*v),
         });
@@ -130,9 +131,92 @@ fn fewer_than_ell_replies_forces_bot_more_than_ell_adopts() {
     let got = e.on_round_end();
     let v = post_value(&got).expect("≥ℓ replies re-decide the node");
     assert!(
-        [5, 9, 7, 1].contains(&v),
-        "validity: adopted ∈ replies, got {v}"
+        [5, 9, 7].contains(&v),
+        "adopted ∈ replies, and 1 cannot be the median of any 3 of them, got {v}"
     );
+}
+
+const TRIALS: u64 = 4000;
+
+/// The value `mode_json(seed)`'s node 0 adopts from crafted round-1 `replies`, for each seed.
+fn adopted_over_seeds(mode_json: impl Fn(u64) -> String, replies: &[u64]) -> Vec<u64> {
+    (0..TRIALS)
+        .map(|seed| {
+            let mut e = one_engine(&mode_json(seed));
+            craft_replies(&mut e, 1, replies);
+            post_value(&e.on_round_end()).expect("at least ℓ replies")
+        })
+        .collect()
+}
+
+/// `law = [(value, probability)]`: a probability-0 value must never occur; every other
+/// frequency must lie within 5 binomial standard deviations.
+fn assert_follows_law(outcomes: &[u64], law: &[(u64, f64)]) {
+    let n = outcomes.len() as f64;
+    for &v in outcomes {
+        assert!(
+            law.iter().any(|&(w, p)| w == v && p > 0.0),
+            "value {v} has probability 0 under the law"
+        );
+    }
+    for &(v, p) in law.iter().filter(|&&(_, p)| p > 0.0) {
+        let observed = outcomes.iter().filter(|&&o| o == v).count() as f64 / n;
+        let tolerance = 5.0 * (p * (1.0 - p) / n).sqrt();
+        assert!(
+            (observed - p).abs() <= tolerance,
+            "value {v}: observed {observed:.4}, law {p:.4} (tolerance {tolerance:.4})"
+        );
+    }
+}
+
+#[test]
+fn median_engine_adopts_the_median_of_a_uniform_ell_subset() {
+    // Alg 1: of the C(6,3) = 20 subsets of [5,9,9,7,5,1] the median is 5 in 10, 7 in 6, 9 in 4
+    // and never 1. A min rule, a max rule or a median over all replies (always 7) fail.
+    let adopted = adopted_over_seeds(|seed| median_json(8, seed, 9, ""), &[5, 9, 9, 7, 5, 1]);
+    assert_follows_law(&adopted, &[(1, 0.0), (5, 0.5), (7, 0.3), (9, 0.2)]);
+}
+
+#[test]
+fn priority_engine_adopts_the_largest_of_a_uniform_ell_subset() {
+    // Def 3.5: of the 20 subsets of [11,5,42,7,23,5] the maximum is 42 in 10, 23 in 6, 11 in 3,
+    // 7 in 1. A max over all replies, or over the ℓ largest, always gives 42.
+    let adopted = adopted_over_seeds(
+        |seed| {
+            format!(
+                r#"{{"scenario":{{"priority":{{"n":8,"seed":{seed},"k":6,"ell":3,
+                "init":{{"kind":"distinct"}},"max_rounds":9}}}},"sync":"timer"}}"#
+            )
+        },
+        &[11, 5, 42, 7, 23, 5],
+    );
+    assert_follows_law(
+        &adopted,
+        &[(5, 0.0), (7, 0.05), (11, 0.15), (23, 0.3), (42, 0.5)],
+    );
+}
+
+#[test]
+fn gossip_engine_adopts_x_when_any_of_six_replies_carries_it() {
+    // Alg 4 takes no ℓ-subset: a single reply carrying x among six x0 replies suffices, at
+    // every position of the reply slots.
+    for position in 0..6 {
+        let mut replies = [0u64; 6];
+        replies[position] = 5;
+        let adopted = adopted_over_seeds(
+            |seed| {
+                format!(
+                    r#"{{"scenario":{{"gossip":{{"n":8,"seed":{seed},"k":6,"ell":3,
+                    "holders":2,"x":5,"x0":0,"max_rounds":9}}}},"sync":"timer"}}"#
+                )
+            },
+            &replies,
+        );
+        assert!(
+            adopted.iter().all(|&v| v == 5),
+            "x at slot {position} must always be adopted"
+        );
+    }
 }
 
 #[test]
@@ -153,7 +237,7 @@ fn exactly_ell_replies_are_deterministic_per_mode() {
     assert_eq!(
         post_value(&gos.on_round_end()),
         Some(5),
-        "any reply carrying x adopts x"
+        "the only reply carrying x adopts x"
     );
     gos.on_round_start();
     craft_replies(&mut gos, 2, &[9, 9, 7]);
@@ -216,4 +300,34 @@ fn priority_arm_rejects_undecided_starts() {
         "init":{"kind":"with_undecided","useful_fraction":0.5,"inner":{"kind":"distinct"}},
         "max_rounds":9}},"sync":"timer"}"#;
     assert!(NodeRunSpec::from_json(json).is_err());
+}
+
+#[test]
+fn the_recorded_reply_count_is_not_truncated_for_large_k() {
+    let json = r#"{"scenario":{"median":{"n":8,"seed":1,"k":300,"ell":3,
+        "init":{"kind":"distinct"},"max_rounds":2}},"sync":"timer"}"#;
+    let mut e = one_engine(json);
+    craft_replies(&mut e, 1, &[4; 300]);
+    assert_eq!(u32::from(e.on_round_end().replies), 300);
+}
+
+#[test]
+fn a_frame_naming_a_nonexistent_sender_is_counted_and_dropped() {
+    let mut e = one_engine(&median_json(8, 2, 9, ""));
+    for round in [1, 2] {
+        let out = e.on_message(Msg::PullRequest {
+            round,
+            from: 10_000,
+            slot: 0,
+            needs_state: false,
+        });
+        assert!(out.is_empty(), "no reply routed to a node id outside 0..n");
+    }
+    let rec = e.on_round_end();
+    assert_eq!(rec.transport_err, 2, "malformed senders fail the gates");
+    assert_eq!(rec.req_recv, 0);
+    assert!(
+        e.on_round_start().iter().all(|(to, _)| *to < 8),
+        "the queue holds nothing addressed outside the run"
+    );
 }

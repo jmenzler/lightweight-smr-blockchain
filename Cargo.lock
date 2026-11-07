@@ -524,6 +524,7 @@ name = "sim-wasm"
 version = "0.1.0"
 dependencies = [
  "protocol",
+ "serde",
  "serde_json",
  "sim",
  "wasm-bindgen",

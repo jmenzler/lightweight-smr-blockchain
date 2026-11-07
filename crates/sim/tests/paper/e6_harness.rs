@@ -95,10 +95,7 @@ fn roots_consistent_flags_divergence_and_rebuild_recovers() {
         "rebuild-by-replay restores consistency"
     );
     assert!(
-        harness
-            .server_states()
-            .iter()
-            .all(|s| s.forest().roots().is_empty()),
+        harness.servers().all(|s| s.forest().roots().is_empty()),
         "rebuild starts from empty forests"
     );
 }
@@ -191,5 +188,152 @@ fn certificates_verify_across_a_live_run_and_staleness_behaves() {
     assert_eq!(
         tally.accepted, 0,
         "stale newest cert must be rejected everywhere"
+    );
+}
+
+/// Replays every ack of `round` on a reference client fed from `pre`, the servers' cert
+/// state at the start of the round; returns the acks whose chains differ from the harness's.
+fn reply_time_mismatches(
+    state: &SmrState,
+    harness: &CertHarness,
+    reference: &mut std::collections::BTreeMap<u32, protocol::certificates::ClientChains>,
+    pre: &[protocol::certificates::ServerCertState],
+) -> (usize, usize) {
+    let round = state.round();
+    let (mut acks, mut bad) = (0, 0);
+    for cmd in &state.report().commands {
+        if cmd.committed_ack_round != Some(round) {
+            continue;
+        }
+        let Some(chains) = reference.get_mut(&cmd.client) else {
+            continue;
+        };
+        let acker = cmd
+            .attempts
+            .iter()
+            .find(|a| a.round == round && a.outcome == sim::smr::AttemptOutcome::AckCommitted)
+            .map(|a| a.target as usize)
+            .expect("ack round implies an AckCommitted attempt");
+        let sn = harness.acked_sn(cmd.client);
+        chains.on_commit_ack(sn, pre[acker].notification(cmd.client));
+        acks += 1;
+        let differs = (1..=sn).any(|k| {
+            chains.chain_for(k).map(|(p, c)| (p, c.to_vec()))
+                != harness
+                    .client(cmd.client)
+                    .chain_for(k)
+                    .map(|(p, c)| (p, c.to_vec()))
+        });
+        bad += usize::from(differs);
+    }
+    (acks, bad)
+}
+
+// §5 p. 28: the reply carrying hc(x_1), p(x_1) precedes the round's commit (Alg 5 L1b), so its
+// chain is the acker's start-of-round chain, not one lengthened by the same round's merges.
+#[test]
+fn the_ack_payload_is_the_ackers_reply_time_chain() {
+    let clients = [10u32, 11, 12, 13];
+    let (mut acks, mut bad) = (0, 0);
+    for seed in 980_000..980_006u64 {
+        let mut state = compact_state(seed, 1);
+        let mut harness = CertHarness::new(N);
+        let mut actors: Vec<Actor> = clients
+            .iter()
+            .map(|&client| Actor {
+                client,
+                next_op: u64::from(client) * 1000,
+                issued: 0,
+            })
+            .collect();
+        let mut reference = std::collections::BTreeMap::new();
+        for a in &actors {
+            harness.register_client(a.client);
+            reference.insert(
+                a.client,
+                protocol::certificates::ClientChains::new(a.client),
+            );
+        }
+        let no_block = vec![false; N];
+        for _ in 0..150 {
+            for a in &mut actors {
+                a.pump(&mut state, &mut harness);
+            }
+            let pre = harness.servers().cloned().collect::<Vec<_>>();
+            state.step_masked(&no_block);
+            harness.observe_round(&state);
+            let (a, b) = reply_time_mismatches(&state, &harness, &mut reference, &pre);
+            acks += a;
+            bad += b;
+        }
+    }
+    assert!(acks > 50, "too few acks: {acks}");
+    assert_eq!(
+        bad, 0,
+        "{bad} of {acks} acks carried a chain other than the reply-time one"
+    );
+}
+
+// The recovery ack-mode client is acked on the start-of-round checkpoint, so its payload is that
+// checkpoint's chain even in a boundary round that installs a newer one.
+#[test]
+fn the_recovery_ack_payload_is_the_start_of_round_checkpoint_chain() {
+    let clients = [10u32, 11, 12, 13];
+    let (mut acks, mut bad) = (0, 0);
+    for seed in 980_000..980_040u64 {
+        let mut state = SmrState::new_with_certs(
+            N,
+            Config::default(),
+            Proto::Recovery {
+                t_window_rounds: 10,
+                resend_until_acked: true,
+                prefix_mismatch: sim::smr::PrefixMismatch::Abort,
+            },
+            5.0,
+            seed,
+            &[],
+            &[],
+            ClientModel::Unique,
+            None,
+            true,
+            Default::default(),
+            Default::default(),
+        );
+        let mut harness = CertHarness::new(N);
+        let mut actors: Vec<Actor> = clients
+            .iter()
+            .map(|&client| Actor {
+                client,
+                next_op: u64::from(client) * 1000,
+                issued: 0,
+            })
+            .collect();
+        let mut reference = std::collections::BTreeMap::new();
+        for a in &actors {
+            harness.register_client(a.client);
+            reference.insert(
+                a.client,
+                protocol::certificates::ClientChains::new(a.client),
+            );
+        }
+        let no_block = vec![false; N];
+        for _ in 0..150 {
+            for a in &mut actors {
+                a.pump(&mut state, &mut harness);
+            }
+            let pre = harness.servers().cloned().collect::<Vec<_>>();
+            if state.step_masked(&no_block).failed() {
+                break;
+            }
+            harness.observe_round_rec(&state);
+            let (a, b) = reply_time_mismatches(&state, &harness, &mut reference, &pre);
+            acks += a;
+            bad += b;
+        }
+    }
+    assert!(acks > 20, "too few acks: {acks}");
+    assert_eq!(
+        bad, 0,
+        "{bad} of {acks} acks carried a chain other than the reply-time one"
     );
 }

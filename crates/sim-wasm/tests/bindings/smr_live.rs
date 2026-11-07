@@ -52,7 +52,7 @@ fn mid_session_injections_replay_as_batch() {
     for proto in [
         r#"{"kind":"extended"}"#,
         r#"{"kind":"compact","t_commit_rounds":6}"#,
-        r#"{"kind":"recovery","t_window_rounds":10}"#,
+        r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#,
     ] {
         let mut live = LiveSmr::new(&spec(proto)).unwrap();
         for _ in 0..3 {
@@ -130,8 +130,14 @@ fn traffic_session_with_midrun_edit_and_inject_replays_as_batch() {
         (r#"{"kind":"extended"}"#, false),
         (r#"{"kind":"extended"}"#, true),
         (r#"{"kind":"compact","t_commit_rounds":8}"#, false),
-        (r#"{"kind":"recovery","t_window_rounds":10}"#, false),
-        (r#"{"kind":"recovery","t_window_rounds":10}"#, true),
+        (
+            r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#,
+            false,
+        ),
+        (
+            r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#,
+            true,
+        ),
     ] {
         let mut live = LiveSmr::new_with_mode(&traffic_spec(proto), sticky).unwrap();
         for _ in 0..5 {
@@ -549,7 +555,7 @@ fn certs_json_committed_maps_positions_to_commands() {
 // --- recovery drilldown: node_detail is recovery-gated and read-only ---
 
 fn recovery_spec() -> String {
-    spec(r#"{"kind":"recovery","t_window_rounds":10}"#)
+    spec(r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#)
 }
 
 #[test]
@@ -701,4 +707,75 @@ fn targeted_blocking_replays_as_batch_in_both_arms() {
             "sticky={sticky}"
         );
     }
+}
+
+#[test]
+fn verify_json_covers_no_server_blocked_in_the_last_round() {
+    let recovery = compact_spec().replace(
+        r#"{"kind":"compact","t_commit_rounds":20}"#,
+        r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":true}"#,
+    );
+    for spec in [compact_spec(), recovery] {
+        covered_excludes_the_blocked(&spec);
+    }
+}
+
+fn covered_excludes_the_blocked(spec: &str) {
+    let mut live = LiveSmr::new(spec).unwrap();
+    live.inject(5, 100, None);
+    step_until_committed(&mut live, 5, 1);
+    live.set_block(3, true);
+    let status: serde_json::Value = serde_json::from_str(&live.step(0.25)).unwrap();
+    let blocked = status["blocked"].as_array().unwrap().len() as u64;
+    assert!(blocked >= 4, "node 3 plus the sampled quarter");
+
+    let v: serde_json::Value = serde_json::from_str(&live.verify_json()).unwrap();
+    let row = &v["clients"][0]["rows"][0];
+    let covered = row["tally"]["covered"].as_u64().unwrap();
+    assert!(covered <= 16 - blocked, "row {row}, blocked {blocked}");
+}
+
+#[test]
+fn certificate_reads_refuse_after_a_prefix_violation() {
+    let violating = r#"{"n":32,"seed":3,"k":6,"ell":3,"sigma":1.0,
+        "proto":{"kind":"compact","t_commit_rounds":1},
+        "injections":[{"round":1,"client":1,"op":7}],
+        "traffic":{"kind":"pmf","arrivals_pmf":[0.0,0.0,1.0]},
+        "max_rounds":40,
+        "schedule":{"kind":"fresh_per_round","fraction":0.0}}"#;
+    let mut live = LiveSmr::new(violating).unwrap();
+    for _ in 0..3 {
+        live.step(0.0);
+    }
+    let report: serde_json::Value = serde_json::from_str(&live.report_json()).unwrap();
+    assert_eq!(report["safety_ok"], false, "the probe must violate safety");
+    for out in [live.verify_json(), live.capture_stale(1)] {
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            out["error"].as_str().is_some_and(|e| e.contains("prefix")),
+            "{out}"
+        );
+    }
+}
+
+// The lab mounts §5 after the spec is parsed, so a spec the batch tier accepts can still be
+// refused by the layer it gets: that must reach the page as an error, never as a trap.
+const RECOVERY_SKIP: &str = r#"{"n":16,"seed":3,"k":6,"ell":3,"sigma":1.0,
+    "proto":{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false},
+    "repeated_commit":"skip","injections":[],"max_rounds":20,
+    "schedule":{"kind":"fresh_per_round","fraction":0.0}}"#;
+
+#[test]
+fn recovery_with_repeated_commit_skip_is_an_error_in_the_batch_entry() {
+    let out: serde_json::Value = serde_json::from_str(&run_smr_json(RECOVERY_SKIP)).expect("json");
+    let error = out["error"].as_str().expect("an error object");
+    assert!(error.contains("certificate"), "{error}");
+}
+
+#[test]
+fn recovery_with_repeated_commit_skip_is_an_error_in_the_live_session() {
+    let Err(error) = LiveSmr::new(RECOVERY_SKIP) else {
+        panic!("the live session must refuse the spec");
+    };
+    assert!(error.contains("certificate"), "{error}");
 }

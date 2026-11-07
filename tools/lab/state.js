@@ -6,7 +6,9 @@ export const BLOCKED = '#f7768e';
 // traffic arrivals carry reserved high client ids (engine AUTO_CLIENT_BASE)
 export const AUTO_CLIENT_BASE = 2147483648;
 
-export const S = { trace: null, t: 0, playing: false, speed: 1, sel: null, edgeMode: 'selected', view: 'replay', series: null, rowOrder: null, layout: null, heatStep: 1, engine: 'loading' };
+export const S = { trace: null, t: 0, playing: false, speed: 1, sel: null, edgeMode: 'selected', view: 'single', series: null, rowOrder: null, layout: null, heatStep: 1, engine: 'loading', live: null,
+  // single-value session: captured config, strategy program, speed, whether the worker still holds a stopped live session
+  sv: { ctx: null, pending: null, handle: false, speed: 1, program: null, srvOpen: true, end: null } };
 export const $ = id => document.getElementById(id);
 export const clamp01 = x => Math.min(Math.max(x, 0), 1);
 

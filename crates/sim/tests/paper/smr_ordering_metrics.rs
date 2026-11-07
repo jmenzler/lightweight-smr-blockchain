@@ -61,7 +61,7 @@ fn extended_lcp_bounded_and_converges() {
         last.lcp_len, last.max_log_len,
         "beta = 0: logs converge, lcp reaches full length"
     );
-    assert_eq!(last.lcp_len, 2, "seed + the committed command");
+    assert_eq!(last.lcp_len, 2, "seed + the injected command");
 }
 
 #[test]
@@ -133,4 +133,39 @@ fn compact_positions_follow_executed_prefix() {
     assert_eq!(last.pos_min, Some(pos), "band collapsed after commit");
     assert_eq!(last.pos_max, Some(pos), "band collapsed after commit");
     assert_eq!(pos, 0, "first executed command sits at position 0");
+}
+
+// Def 1.3, p. 6 vs Lemma 3.8, p. 24: one index in every log is agreement; one identical prefix
+// through x is the stronger T_E landmark, so it is never earlier and under traffic sometimes later.
+#[test]
+fn extended_index_agreement_is_never_later_than_the_fixed_prefix() {
+    let mut later = 0;
+    for seed in [1u64, 2, 3] {
+        let mut sc = scenario(Proto::Extended, 128, seed, Vec::new());
+        sc.sigma = 1.0;
+        sc.max_rounds = 60;
+        sc.traffic = Some(vec![sim::smr::TrafficPhase {
+            from_round: 1,
+            arrivals_pmf: sim::smr::point_mass_pmf(4),
+        }]);
+        for cmd in run_smr(&sc).commands {
+            if let Some(fixed) = cmd.prefix_fixed_round {
+                let agreed = cmd
+                    .index_agreed_round
+                    .expect("a fixed prefix fixes the index");
+                assert!(agreed <= fixed, "op {}: {agreed} > {fixed}", cmd.op);
+                later += usize::from(agreed < fixed);
+            }
+        }
+    }
+    assert!(
+        later > 0,
+        "no command agreed on its index before its prefix fixed"
+    );
+    let single = run_smr(&scenario(Proto::Extended, 32, 11, vec![inj(2, 1, 7)]));
+    let cmd = &single.commands[0];
+    assert_eq!(
+        cmd.index_agreed_round, cmd.prefix_fixed_round,
+        "one command: the notions coincide"
+    );
 }

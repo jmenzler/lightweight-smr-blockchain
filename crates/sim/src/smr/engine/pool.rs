@@ -4,6 +4,9 @@ use crate::smr::AUTO_CLIENT_BASE;
 use rand::Rng;
 use rand_chacha::ChaCha12Rng;
 
+/// Start of the exhaustion panic message; the grid runner matches on it to record an abort row.
+pub(crate) const EXHAUSTED_MARKER: &str = "client pool exhausted";
+
 pub(in crate::smr) struct ClientPool {
     // Sorted: the uniform draw indexes this list, so its order is part of the RNG contract.
     idle: Vec<u32>,
@@ -24,8 +27,8 @@ impl ClientPool {
     pub(in crate::smr) fn take(&mut self, rng: &mut ChaCha12Rng, round: usize) -> (u32, u64) {
         assert!(
             !self.idle.is_empty(),
-            "client pool exhausted in round {round}: all {} clients are in flight — \
-             the registered pool size is undersized for this arrival rate",
+            "{EXHAUSTED_MARKER} in round {round}: all {} clients are in flight — \
+             the pool is undersized for this arrival rate",
             self.next_sn.len()
         );
         let index = self.idle.remove(rng.random_range(0..self.idle.len()));

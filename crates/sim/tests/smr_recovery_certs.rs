@@ -4,7 +4,7 @@
 //! boundary commit (Lemma 6.9), and delivery is ack-tied resend (§5 p. 25).
 
 use protocol::certificates::{Certificate, MmrForest, leaf_hash};
-use protocol::compact::Entry;
+use protocol::compact::{ClientCommand, Entry};
 use sim::Config;
 use sim::certs::CertHarness;
 use sim::smr::{AttemptOutcome, ClientModel, Proto, SmrState};
@@ -16,13 +16,21 @@ const T: u64 = 10;
 const SIGMA: f64 = 5.0;
 
 fn rec_state(seed: u64, resend_until_acked: bool) -> SmrState {
+    rec_state_with(seed, resend_until_acked, sim::smr::PrefixMismatch::Abort)
+}
+
+fn rec_state_with(
+    seed: u64,
+    resend_until_acked: bool,
+    prefix_mismatch: sim::smr::PrefixMismatch,
+) -> SmrState {
     SmrState::new_with_certs(
         N,
         Config::default(),
         Proto::Recovery {
             t_window_rounds: T,
             resend_until_acked,
-            prefix_mismatch: sim::smr::PrefixMismatch::Abort,
+            prefix_mismatch,
         },
         SIGMA,
         seed,
@@ -120,17 +128,68 @@ fn assert_carriage(state: &SmrState, label: &str) {
             executed.len() as u64,
             "{label}: server {i} forest lost its committed sequence"
         );
+        let mut rebuilt = MmrForest::new();
         for entry in executed.iter() {
+            rebuilt.append(leaf_hash(entry));
+        }
+        assert_eq!(
+            certs.forest().roots(),
+            rebuilt.roots(),
+            "{label}: server {i} forest roots differ from its own committed sequence"
+        );
+        let sequence: Vec<Entry> = executed.iter().cloned().collect();
+        for entry in &sequence {
             let Entry::Cmd(c) = entry else {
                 panic!("{label}: server {i} executed a non-command {entry:?}");
             };
-            assert!(
-                certs.last_two(c.client).is_some(),
-                "{label}: server {i} serves no last-two window for client {}",
-                c.client
-            );
+            let (prev, last) = certs.last_two(c.client).unwrap_or_else(|| {
+                panic!(
+                    "{label}: server {i} serves no last-two window for client {}",
+                    c.client
+                )
+            });
+            for stored in prev.into_iter().chain([last]) {
+                assert_stored_command_is_sound(certs, &sequence, c.client, stored, label, i);
+            }
         }
     }
+}
+
+/// A stored window entry points at the command the server itself executed at that position;
+/// a certificate assembled from it verifies on this server, and the same certificate with a
+/// different op does not.
+fn assert_stored_command_is_sound(
+    certs: &protocol::certificates::ServerCertState,
+    sequence: &[Entry],
+    client: u32,
+    stored: &protocol::certificates::StoredCommand,
+    label: &str,
+    server: usize,
+) {
+    let at = format!(
+        "{label}: server {server} client {client} sn {} pos {}",
+        stored.sn, stored.pos
+    );
+    let entry = sequence
+        .get(stored.pos as usize)
+        .unwrap_or_else(|| panic!("{at}: position beyond the committed sequence"));
+    let Entry::Cmd(c) = entry else {
+        panic!("{at}: position holds {entry:?}")
+    };
+    assert_eq!((c.client, c.sn), (client, stored.sn), "{at}: wrong command");
+    assert_eq!(stored.leaf, leaf_hash(entry), "{at}: wrong leaf");
+    let genuine = Certificate::Chained {
+        entry: entry.clone(),
+        pos: stored.pos,
+        chain: stored.chain.clone(),
+    };
+    assert!(certs.verify(client, &genuine), "{at}: genuine rejected");
+    let forged = Certificate::Chained {
+        entry: Entry::Cmd(ClientCommand { op: c.op + 1, ..*c }),
+        pos: stored.pos,
+        chain: stored.chain.clone(),
+    };
+    assert!(!certs.verify(client, &forged), "{at}: forged op accepted");
 }
 
 /// Thm 6 over every certificate the clients hold: covered somewhere, accepted
@@ -312,6 +371,8 @@ fn golden_recovery_cert_landmarks_are_stable() {
     assert_eq!(state.committed_entries().map(|c| c.len()), Some(12));
     let forest0 = state.checkpoint_certs(0).expect("certs").forest();
     assert_eq!(forest0.peak_heights(), vec![3, 2], "m = 12 is 8 + 4");
+    // Regression pin of the roots the current leaf encoding yields; the encoding itself is
+    // pinned byte for byte in the protocol crate's certificate tests.
     assert_eq!(
         hex(&forest0.roots()[0]),
         "e7ffc4c87040c9ecebf57bc8bf847f6a6d15c994b47d67533a8edf60a68d2de7"
@@ -575,6 +636,29 @@ fn arm3_useful_servers_agree_on_roots_at_every_happy_boundary() {
             .is_empty(),
         "anti-vacuity: the final root set must be non-empty"
     );
+}
+
+#[test]
+fn arm5_carriage_and_soundness_hold_every_round_under_skip_boundary_through_the_surge() {
+    // The surge forces the all-⊥ spiral and a rollback; under SkipBoundary a server whose
+    // pre-commit does not prefix its log skips boundaries and re-adopts later. Whatever it
+    // skips, every server's forest, windows and certificates must stay sound every round.
+    let mut harness = CertHarness::new(N);
+    let mut acts = actors(&[(10, 100), (11, 200)], &mut harness);
+    let mut state = rec_state_with(5150, true, sim::smr::PrefixMismatch::SkipBoundary);
+    let mut skip = vec![false; N];
+    for round in 1..=200usize {
+        skip = step_round(&mut state, &mut harness, &mut acts, &surge_mask(round));
+        assert_carriage(&state, "arm 5");
+    }
+    let report = state.report();
+    let rec = report.recovery.as_ref().expect("recovery block");
+    assert!(
+        rec.rounds.iter().map(|r| r.rollbacks).sum::<u32>() > 0,
+        "anti-vacuity: the surge must force a rollback"
+    );
+    assert!(rec.fork_ok && report.safety_ok);
+    assert_every_issued_verifies(&harness, &[10, 11], &skip, "arm 5");
 }
 
 #[test]

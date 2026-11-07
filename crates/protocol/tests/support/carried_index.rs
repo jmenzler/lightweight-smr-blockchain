@@ -488,3 +488,25 @@ fn the_recovery_index_survives_a_randomized_multi_round_drive() {
     assert!(saw_bot, "the drive never reached the ⊥ branch");
     assert!(saw_growth, "the drive never grew a log past the seed");
 }
+
+#[test]
+#[should_panic(expected = "carried index must name every position")]
+fn a_carried_index_shorter_than_its_log_is_refused() {
+    let log = ChunkSeq::from_vec(vec![timed(Entry::Nop(0), 0), timed(Entry::Nop(1), 1)]);
+    protocol::merge::PermIndex::from_carried(&log, &[0]);
+}
+
+#[test]
+#[should_panic(expected = "cannot remove 2 of 1 entries")]
+fn removing_more_entries_than_the_merge_holds_is_refused() {
+    use protocol::merge::{StampTie, UnionStamp, median_merge};
+    let log = protocol::log::Log::from_entries(vec![timed(Entry::Nop(0), 0)]);
+    let merged = median_merge(
+        std::iter::repeat_n(&log, 3),
+        3,
+        &[],
+        StampTie::default(),
+        UnionStamp::default(),
+    );
+    merged.remove_prefix(2, timed(Entry::Nop(5), 5));
+}

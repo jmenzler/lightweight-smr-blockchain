@@ -50,6 +50,7 @@ fn fold(leaf: Hash, pos: u64, chain: &[Hash]) -> Hash {
 }
 
 fn lca_child_level(a: u64, b: u64) -> usize {
+    assert_ne!(a, b, "the lca is defined for two distinct leaves");
     (63 - (a ^ b).leading_zeros()) as usize
 }
 
@@ -116,6 +117,16 @@ impl MmrForest {
         self.peaks.clone()
     }
 
+    /// Whether both forests can be prefixes of one sequence, judged on the leading peaks that
+    /// cover the same leaves; later peaks cannot be compared without the leaves.
+    pub fn consistent_with(&self, other: &MmrForest) -> bool {
+        self.peaks
+            .iter()
+            .zip(&other.peaks)
+            .take_while(|((lh, ..), (rh, ..))| lh == rh)
+            .all(|((_, left, _), (_, right, _))| left == right)
+    }
+
     fn covering_peak(&self, pos: u64) -> Option<(u32, Hash)> {
         self.peaks
             .iter()
@@ -157,7 +168,7 @@ impl StoredCommand {
         if self.pos >> span != event.start >> span {
             return;
         }
-        debug_assert_eq!(self.chain.len(), event.height as usize);
+        assert_eq!(self.chain.len(), event.height as usize);
         if (self.pos >> event.height) & 1 == 0 {
             self.chain.push(event.right);
         } else {
@@ -178,6 +189,7 @@ pub struct ServerCertState {
 pub struct Notification {
     pub prev_chain: Vec<Hash>,
     pub prev_pos: u64,
+    // DEVIATION: [DEV-4] the payload also names sn(x_1); the client files the chain under it
     pub prev_sn: u64,
 }
 
@@ -192,6 +204,7 @@ impl ServerCertState {
     pub fn append(&mut self, entry: &Entry) -> Vec<MergeEvent> {
         let leaf = leaf_hash(entry);
         let pos = self.forest.len();
+        // DETERMINIZED: [DET-19] every committed entry with a (client, sn), ⊥ included, rotates the window
         if let Some((client, sn)) = entry.client_sn() {
             let stored = StoredCommand {
                 leaf,
@@ -259,6 +272,7 @@ impl ServerCertState {
                 {
                     return true;
                 }
+                // DETERMINIZED: [DET-18] the certificate does not name x_{k+1}; both window records are tried
                 // Case (b): lca exists; x_{k+1} may sit in either window slot (p. 29).
                 let Some((prev, last)) = self.last_two(client) else {
                     return false;
@@ -360,6 +374,7 @@ impl ClientChains {
         if sn == self.acked_sn && !self.received.contains_key(&sn) {
             return Some(Certificate::Newest { entry });
         }
+        // DETERMINIZED: [DET-20] hc(x_j) is extended from later received chains only
         let (pos, base) = self.received.get(&sn)?;
         let mut chain = base.clone();
         for (later_sn, (later_pos, later_chain)) in self.received.range(sn + 1..) {

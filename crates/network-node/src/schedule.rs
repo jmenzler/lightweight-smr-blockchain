@@ -15,9 +15,12 @@ pub struct Meta {
     pub clients: u32,
     pub per_client: u32,
     pub n: u32,
+    pub pin_targets: bool,
 }
 
-/// Places `clients * per_client` commands; draw order per round: arrival count, then each pinned target.
+/// Places `clients * per_client` commands; draw order per round: arrival count, then one target draw per
+/// command. The draw is taken even when unpinned, so pinning never moves the arrivals; an unpinned command
+/// (the default) is sent to a fresh uniform server on every attempt.
 pub fn generate(
     seed: u64,
     rounds: u64,
@@ -25,6 +28,7 @@ pub fn generate(
     clients: u32,
     per_client: u32,
     n: u32,
+    pin_targets: bool,
 ) -> Result<Vec<InjectionSpec>, String> {
     if pmf.is_empty() {
         return Err("pmf needs at least one weight".into());
@@ -68,7 +72,7 @@ pub fn generate(
                 round: round as usize,
                 client,
                 op,
-                target: Some(target),
+                target: pin_targets.then_some(target),
             });
             op += 1;
         }

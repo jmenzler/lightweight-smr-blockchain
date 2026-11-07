@@ -6,6 +6,7 @@ let wasm_bindgen = (function(exports) {
 
     /**
      * Stepwise simulator session whose recorded history replays byte-identical via `run_scenario_json`.
+     * The blocking fraction is chosen interactively each round, so a session is not a 1-late adversary run.
      */
     class LiveSim {
         static __wrap(ptr) {
@@ -70,7 +71,7 @@ let wasm_bindgen = (function(exports) {
             return LiveSim.__wrap(ret[0]);
         }
         /**
-         * Advance one round at `fraction` blocking; no-op once absorbed so the replay length matches.
+         * Advance one round at `fraction` blocking (an error JSON outside [0, 1]); no-op once absorbed so the replay length matches.
          * @param {number} fraction
          * @returns {string}
          */
@@ -159,7 +160,8 @@ let wasm_bindgen = (function(exports) {
             }
         }
         /**
-         * The §6 committed sequence as a Merkle forest snapshot, delta-encoded from `from_len`.
+         * The longest executed sequence over the n servers (a display construct, not any one server's S_i)
+         * as a Merkle forest snapshot, delta-encoded from `from_len`.
          * @param {bigint} from_len
          * @returns {string}
          */
@@ -256,6 +258,23 @@ let wasm_bindgen = (function(exports) {
             }
         }
         /**
+         * What changed in the report since the previous call (the first call: since nothing), so a
+         * per-step message does not grow with the run. The page rebuilds `report_json()` from it.
+         * @returns {string}
+         */
+        report_delta_json() {
+            let deferred1_0;
+            let deferred1_1;
+            try {
+                const ret = wasm.livesmr_report_delta_json(this.__wbg_ptr);
+                deferred1_0 = ret[0];
+                deferred1_1 = ret[1];
+                return getStringFromWasm0(ret[0], ret[1]);
+            } finally {
+                wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+            }
+        }
+        /**
          * The full report so far (metrics, per-command audit trails, terminal).
          * @returns {string}
          */
@@ -309,7 +328,7 @@ let wasm_bindgen = (function(exports) {
             }
         }
         /**
-         * Advance one round at `fraction` blocking; no-op once dead so the replay length matches.
+         * Advance one round at `fraction` blocking (an error JSON outside [0, 1]); no-op once dead so the replay length matches.
          * @param {number} fraction
          * @returns {string}
          */

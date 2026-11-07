@@ -1,10 +1,14 @@
-//! Shadow outdir to sim-schema CSVs + summary; exits 1 when any validity gate fails.
+//! Shadow outdir to sim-schema CSVs + summary; exits 1 when a network validity gate fails and 3
+//! when only the protocol safety check does.
 
 use network_node::cli::arg;
-use network_node::collect::{aggregate, aggregate_smr, summary_json};
+use network_node::collect::{ClientLog, aggregate, aggregate_smr, summary_json};
 use network_node::record::RoundRecord;
 use network_node::spec::{NodeRunSpec, ScenarioKind};
 use sim::smr_commands::{LandmarkRow, to_json};
+
+/// Distinct from the invalid-run exit 1, so a pipeline can count violating runs instead of dropping them.
+const SAFETY_VIOLATION_EXIT: i32 = 3;
 
 fn die(msg: &str) -> ! {
     network_node::cli::die("collect", msg)
@@ -49,36 +53,9 @@ fn main() {
 
     let smr = matches!(spec.scenario, ScenarioKind::Smr(_));
     let (out, commands_json) = if smr {
-        let client = host_stdout(&hosts, "client");
-        let mut arrivals: Vec<u32> = Vec::new();
-        let mut starved = 0u64;
-        let mut commands = String::from("{\"commands\":[]}");
-        for line in client.lines() {
-            let tail = |key: &str| -> Option<u32> {
-                line.contains(key)
-                    .then(|| line.rsplit(':').next())
-                    .flatten()
-                    .and_then(|s| s.trim_end_matches('}').parse::<u32>().ok())
-            };
-            if let Some(a) = tail("\"arrivals\"") {
-                arrivals.push(a);
-            } else if let Some(s) = tail("\"starved\"") {
-                starved += u64::from(s);
-            } else if line.starts_with("{\"commands\":") {
-                commands = line.to_string();
-            }
-        }
-        if starved > 0 {
-            eprintln!(
-                "collect: {starved} client attempts never left the driver — \
-                 the client stage was starved, run is NOT comparable"
-            );
-            std::process::exit(1);
-        }
-        (
-            aggregate_smr(&records, &spec, Some(&arrivals)).unwrap_or_else(|e| die(&e)),
-            Some(commands),
-        )
+        let client = ClientLog::parse(&host_stdout(&hosts, "client")).unwrap_or_else(|e| die(&e));
+        let out = aggregate_smr(&records, &spec, Some(&client)).unwrap_or_else(|e| die(&e));
+        (out, Some(client.commands))
     } else {
         (aggregate(&records, &spec).unwrap_or_else(|e| die(&e)), None)
     };
@@ -106,17 +83,19 @@ fn main() {
             .unwrap_or_else(|e| die(&e.to_string()));
     }
 
-    if !out.gates.clean() {
+    if !out.gates.network_clean() {
         eprintln!(
-            "collect: VALIDITY GATES FAILED — late_rep {} late_app {} dropped_past {} encode_err {} rounds_consistent {} safety_ok {} — run is NOT E7-comparable",
-            out.gates.late_rep,
-            out.gates.late_app,
-            out.gates.dropped_past,
-            out.gates.encode_err,
-            out.gates.rounds_consistent,
-            out.gates.safety_ok
+            "collect: VALIDITY GATES FAILED — {:?} — run is NOT comparable to the simulator",
+            out.gates
         );
         std::process::exit(1);
+    }
+    if !out.gates.safety_ok {
+        eprintln!(
+            "collect: SAFETY VIOLATION in a run whose network gates are clean; the run is valid and \
+             the violation is the result (summary.json safety_ok false)"
+        );
+        std::process::exit(SAFETY_VIOLATION_EXIT);
     }
     println!("gates clean; results in {}", results.display());
 }

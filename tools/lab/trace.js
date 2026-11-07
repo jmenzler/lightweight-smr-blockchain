@@ -27,6 +27,5 @@ export function loadTrace(tr) {
     return va - vb || a - b;
   });
   S.trace = tr; S.t = 0; S.sel = null; S.playing = false;
-  $('scrub').max = tr.rounds.length;
   update();
 }

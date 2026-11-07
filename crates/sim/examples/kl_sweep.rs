@@ -2,12 +2,15 @@
 // crates untouched (mirrors the horizon-arm discipline). For each (k,ℓ) pair it
 // locates the fresh-per-round survival boundary by bisection-free grid scan and
 // reports, per pair: the last-100%-survive and first-0%-survive β (grid step
-// 0.005), plus median agreement/death rounds at the edge. Init is the registered
+// 0.005), plus median agreement/death rounds at the edge. A run whose fate the horizon
+// cut off (still mixed, or agreed with fewer than n/3 holders) is neither: it is counted in
+// `censored` (`collapsing` names the latter) and kept out of death_median. Init is the registered
 // Split{0.5}, all-holding, max_rounds=2000 — identical to Arm A of the C2 sweep,
 // only (k,ℓ) varies. Deterministic: ChaCha12, disjoint seed base per (k,ℓ).
 //
 // Usage: kl_sweep <fresh|permanent> [out.csv] [n] [seeds]
-use sim::{BlockSchedule, Config, Init, Outcome, Scenario, run_logged};
+use sim::analysis::SurvivalTally;
+use sim::{BlockSchedule, Config, Init, Scenario, run_logged};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -72,16 +75,16 @@ fn main() {
         .unwrap_or(5);
     let betas: Vec<u32> = (lo..=hi).step_by(step).collect();
 
-    let mut csv = String::from("arm,k,ell,n,beta,seeds,survived,agree_median,death_median\n");
+    let mut csv = String::from(
+        "arm,k,ell,n,beta,seeds,survived,agree_median,death_median,censored,collapsing\n",
+    );
     for (&(k, ell, slot), &cfg) in pairs.iter().zip(&cfgs) {
         let seed_base = 900_000 + slot * 10_000;
         let mut last_100: Option<f64> = None;
         let mut first_0: Option<f64> = None;
         for &bk in &betas {
             let beta = bk as f64 / 1000.0;
-            let mut survived = 0u64;
-            let mut agree_rounds: Vec<usize> = Vec::new();
-            let mut death_rounds: Vec<usize> = Vec::new();
+            let mut tally = SurvivalTally::default();
             for i in 0..seeds {
                 let scenario = Scenario {
                     cfg,
@@ -95,14 +98,7 @@ fn main() {
                     },
                     partition: None,
                 };
-                match run_logged(&scenario, None).0 {
-                    Outcome::Agreement { rounds, .. } => {
-                        survived += 1;
-                        agree_rounds.push(rounds);
-                    }
-                    Outcome::AllUndecided { rounds } => death_rounds.push(rounds),
-                    Outcome::NoConvergence { rounds } => death_rounds.push(rounds),
-                }
+                tally.add(&run_logged(&scenario, None).0);
             }
             let med = |v: &mut Vec<usize>| {
                 if v.is_empty() {
@@ -112,20 +108,26 @@ fn main() {
                     v[v.len() / 2] as i64
                 }
             };
-            let am = med(&mut agree_rounds);
-            let dm = med(&mut death_rounds);
+            let am = med(&mut tally.agree_rounds);
+            let dm = med(&mut tally.death_rounds);
+            let SurvivalTally {
+                survived,
+                censored,
+                collapsing,
+                ..
+            } = tally;
             csv.push_str(&format!(
-                "{arm},{k},{ell},{n},{beta:.3},{seeds},{survived},{am},{dm}\n"
+                "{arm},{k},{ell},{n},{beta:.3},{seeds},{survived},{am},{dm},{censored},{collapsing}\n"
             ));
             if survived == seeds {
                 last_100 = Some(beta);
             }
-            if survived == 0 && first_0.is_none() && last_100.is_some() {
+            if tally.none_survive() && first_0.is_none() && last_100.is_some() {
                 first_0 = Some(beta);
             }
-            // early exit: survival is monotone non-increasing in β, so the first
-            // all-death β caps the useful grid for this pair.
-            if survived == 0 {
+            // Stops the scan at the first β where no seed survives and one died. Survival falls with
+            // β only in expectation, so a seed batch can hit zero survivors before a higher β shows some.
+            if tally.none_survive() {
                 break;
             }
         }

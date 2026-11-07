@@ -64,8 +64,8 @@ pub enum ScheduleSpec {
         #[serde(default)]
         background: f64,
     },
-    #[serde(rename = "adaptive_1late")]
-    Adaptive1Late {
+    #[serde(rename = "adaptive_0late")]
+    Adaptive0Late {
         fraction: f64,
         policy: AdaptivePolicy,
     },
@@ -73,6 +73,14 @@ pub enum ScheduleSpec {
         fraction: f64,
         alpha: u32,
         policy: AdaptivePolicy,
+    },
+    /// Exploratory worst-case 1-late availability adversary; fraction ≤ 1/2.
+    Disjoint {
+        fraction: f64,
+    },
+    /// Exploratory worst-case 1-late adversary against two-value agreement; needs a table for (n, ⌊βn⌋).
+    NoiseController {
+        fraction: f64,
     },
 }
 
@@ -100,7 +108,7 @@ impl TryFrom<ScenarioSpec> for Scenario {
             return Err("n must be at least 1".into());
         }
         crate::check_partition(spec.partition.as_deref(), spec.n)?;
-        Ok(Scenario {
+        let scenario = Scenario {
             n: spec.n,
             seed: spec.seed,
             cfg,
@@ -111,16 +119,19 @@ impl TryFrom<ScenarioSpec> for Scenario {
                 Some(schedule) => convert_schedule(schedule, spec.n)?,
             },
             partition: spec.partition,
-        })
+        };
+        crate::blocking::check_scenario_fit(
+            &scenario.schedule,
+            scenario.cfg,
+            &scenario.init,
+            scenario.partition.as_deref(),
+        )?;
+        Ok(scenario)
     }
 }
 
 fn fraction_in_range(name: &str, fraction: f64) -> Result<f64, String> {
-    if (0.0..=1.0).contains(&fraction) {
-        Ok(fraction)
-    } else {
-        Err(format!("{name} must be within [0, 1], got {fraction}"))
-    }
+    crate::consensus::blocking::fraction_in_range(name, fraction).map(|()| fraction)
 }
 
 fn convert_init(spec: &InitSpec) -> Result<Init, String> {
@@ -178,8 +189,8 @@ fn convert_schedule(spec: &ScheduleSpec, n: usize) -> Result<BlockSchedule, Stri
         ScheduleSpec::Permanent { fraction } => Ok(BlockSchedule::Permanent {
             fraction: fraction_in_range("permanent fraction", *fraction)?,
         }),
-        ScheduleSpec::Adaptive1Late { fraction, policy } => Ok(BlockSchedule::Adaptive1Late {
-            fraction: fraction_in_range("adaptive_1late fraction", *fraction)?,
+        ScheduleSpec::Adaptive0Late { fraction, policy } => Ok(BlockSchedule::Adaptive0Late {
+            fraction: fraction_in_range("adaptive_0late fraction", *fraction)?,
             policy: *policy,
         }),
         ScheduleSpec::AdaptiveAlphaLate {
@@ -189,7 +200,7 @@ fn convert_schedule(spec: &ScheduleSpec, n: usize) -> Result<BlockSchedule, Stri
         } => {
             if *alpha == 0 {
                 return Err(
-                    "adaptive_alpha_late alpha must be >= 1 (alpha = 0 is the adaptive_1late kind)"
+                    "adaptive_alpha_late alpha must be >= 1 (alpha = 0 is the adaptive_0late kind)"
                         .to_string(),
                 );
             }
@@ -216,6 +227,18 @@ fn convert_schedule(spec: &ScheduleSpec, n: usize) -> Result<BlockSchedule, Stri
                 background: fraction_in_range("sticky background fraction", *background)?,
                 targets: fractions.clone(),
             })
+        }
+        ScheduleSpec::Disjoint { fraction } => {
+            let fraction = fraction_in_range("disjoint fraction", *fraction)?;
+            crate::blocking::disjoint_precondition(fraction)?;
+            Ok(BlockSchedule::Disjoint { fraction })
+        }
+        ScheduleSpec::NoiseController { fraction } => {
+            let schedule = BlockSchedule::NoiseController {
+                fraction: fraction_in_range("noise_controller fraction", *fraction)?,
+            };
+            crate::blocking::check_schedule(&schedule, n)?;
+            Ok(schedule)
         }
         ScheduleSpec::Windows { windows } => Ok(BlockSchedule::Windows(
             windows
@@ -330,7 +353,7 @@ pub enum ProtoSpec {
     },
     Recovery {
         t_window_rounds: u64,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        /// Required: true is the paper's client (resend until a contacted server acks, p. 25).
         resend_until_acked: bool,
         #[serde(
             default,
@@ -368,16 +391,11 @@ impl TryFrom<SmrScenarioSpec> for SmrScenario {
                     t_window_rounds,
                     resend_until_acked,
                     prefix_mismatch,
-                } => {
-                    if t_window_rounds < 1 {
-                        return Err("recovery t_window_rounds must be at least 1".into());
-                    }
-                    Proto::Recovery {
-                        t_window_rounds,
-                        resend_until_acked,
-                        prefix_mismatch,
-                    }
-                }
+                } => Proto::Recovery {
+                    t_window_rounds,
+                    resend_until_acked,
+                    prefix_mismatch,
+                },
             },
             injections: spec
                 .injections

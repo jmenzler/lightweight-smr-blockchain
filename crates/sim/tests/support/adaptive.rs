@@ -10,7 +10,7 @@ fn scenario(n: usize, seed: u64, fraction: f64, max_rounds: usize) -> Scenario {
             inner: Box::new(Init::Split { fraction: 0.5 }),
         },
         max_rounds,
-        schedule: BlockSchedule::Adaptive1Late {
+        schedule: BlockSchedule::Adaptive0Late {
             fraction,
             policy: AdaptivePolicy::BlockHolders,
         },
@@ -18,9 +18,10 @@ fn scenario(n: usize, seed: u64, fraction: f64, max_rounds: usize) -> Scenario {
     }
 }
 
-/// The block_holders policy invariant (x3 design): from round 2 on, the budget
-/// lands on round-(t−1) holders first — a uniform sample of holders when they
-/// cover the budget, all holders plus a non-holder remainder when they don't.
+/// The block_holders policy invariant of the 0-late schedule: from round 2 on, the
+/// budget lands on the holders at the beginning of round t first — a uniform sample
+/// of holders when they cover the budget, all holders plus a non-holder remainder
+/// when they don't.
 #[test]
 fn adaptive_blocks_holders_first_after_round_one() {
     let (_, trace) = run_traced(&scenario(40, 7, 0.1, 6));
@@ -82,18 +83,17 @@ fn adaptive_same_seed_same_trace() {
     }
 }
 
-/// The wire form is the one the x3 design registered — `adaptive_1late`.
+/// The 0-late wire form; the former `adaptive_1late` spelling is rejected (see one_late_adversary).
 #[test]
-fn adaptive_schedule_parses_registered_wire_form() {
+fn zero_late_schedule_parses_its_wire_form() {
     let json = r#"{"n":100,"seed":0,"k":6,"ell":3,"max_rounds":10,
         "init":{"kind":"split","fraction":0.5},
-        "schedule":{"kind":"adaptive_1late","fraction":0.1,"policy":"block_holders"}}"#;
-    let spec: sim::spec::ScenarioSpec =
-        serde_json::from_str(json).expect("registered wire form parses");
+        "schedule":{"kind":"adaptive_0late","fraction":0.1,"policy":"block_holders"}}"#;
+    let spec: sim::spec::ScenarioSpec = serde_json::from_str(json).expect("wire form parses");
     let scenario = Scenario::try_from(spec).unwrap();
     assert_eq!(
         scenario.schedule,
-        BlockSchedule::Adaptive1Late {
+        BlockSchedule::Adaptive0Late {
             fraction: 0.1,
             policy: AdaptivePolicy::BlockHolders,
         }
@@ -183,7 +183,7 @@ fn alpha_late_same_seed_same_trace() {
     }
 }
 
-/// The wire form the x3 trial-3 design registers — `adaptive_alpha_late`.
+/// The wire form the x3 trial-3 prereg registers — `adaptive_alpha_late`.
 #[test]
 fn alpha_late_schedule_parses_wire_form() {
     let json = r#"{"n":100,"seed":0,"k":6,"ell":3,"max_rounds":10,
@@ -201,8 +201,8 @@ fn alpha_late_schedule_parses_wire_form() {
     );
 }
 
-/// α = 0 is the frozen `adaptive_1late` schedule (which is 0-late despite its
-/// wire name); the new kind refuses it instead of duplicating the RNG path.
+/// α = 0 is the `adaptive_0late` schedule; the alpha-late kind refuses it instead of
+/// duplicating the RNG path.
 #[test]
 fn alpha_late_rejects_alpha_zero() {
     let json = r#"{"n":100,"seed":0,"k":6,"ell":3,"max_rounds":10,
@@ -222,7 +222,7 @@ fn alpha_late_rejects_alpha_zero() {
 #[test]
 fn smr_path_rejects_adaptive_schedules() {
     for kind in [
-        r#"{"kind":"adaptive_1late","fraction":0.1,"policy":"block_holders"}"#,
+        r#"{"kind":"adaptive_0late","fraction":0.1,"policy":"block_holders"}"#,
         r#"{"kind":"adaptive_alpha_late","fraction":0.1,"alpha":1,"policy":"block_holders"}"#,
     ] {
         let json = format!(

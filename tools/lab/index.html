@@ -9,52 +9,83 @@
 <body>
 <div class="app" id="app">
   <div class="bar">
-    <div class="viewTabs">
-      <button class="vt on" data-view="replay">replay</button>
-      <button class="vt" data-view="charts">charts</button>
-      <button class="vt" data-view="run">run</button>
-      <button class="vt" data-view="smr">smr</button>
+    <span class="brand">Lightweight SMR lab</span>
+    <div class="modeTabs" id="modeTabs">
+      <button class="mt on" data-mode="single">Single-value consensus</button>
+      <button class="mt" data-mode="smr">Replicated log (SMR)</button>
     </div>
-    <button class="sumChip mono hidden" id="smrSumChip" title="session config — click to edit"></button>
-    <div class="meta mono" id="metaLine">no trace loaded</div>
-    <div class="chip chip-run" id="outcomeChip">–</div>
+    <div class="cfgWrap cfgSingle" id="svCfgWrap">
+      <button class="cfgLine mono hidden" id="svSumChip"></button>
+      <div class="cfgPop hidden" id="svCfgPop"></div>
+    </div>
+    <div class="cfgWrap cfgSmr" id="cfgWrap">
+      <button class="cfgLine mono hidden" id="smrSumChip"></button>
+      <div class="cfgPop hidden" id="smrCfgPop"></div>
+    </div>
     <div class="spacer"></div>
-    <a class="chip chip-run hostNote hidden" id="hostNote" href="https://github.com/jmenzler/lightweight-smr-blockchain#run-it-locally" target="_blank" rel="noopener" title="The hosted demo runs the simulator in this browser tab. Clone the repo and use the native sweep_grid binary for large parameter sweeps.">runs in your browser · clone the repo for large experiments</a>
-    <button class="btn" id="loadBtn">load trace.json</button>
+    <span class="warnIcon hidden" id="hostWarn" data-tip="Runs in your browser: this hosted demo simulates in this tab. Clone the repository and use the native sweep_grid binary for large parameter sweeps.">⚠</span>
+    <button class="btn" id="aboutBtn" data-tip="what each part of this page shows and where its numbers come from">?</button>
+    <button class="btn" id="loadBtn" data-tip="open a trace, scenario spec or spill file">open file…</button>
   </div>
   <div class="split">
-    <div class="view on" id="view-replay">
-      <div class="canvasWrap">
-        <canvas class="net" id="net"></canvas>
-        <div class="dropHint" id="dropHint">drop trace.json to load</div>
-      </div>
-      <div class="liveCol hidden" id="liveCol">
-        <div class="liveVal mono" id="liveSliderVal">β 0%</div>
-        <input class="sliderV" type="range" id="liveSlider" min="0" max="60" value="0" />
-        <button class="btn btn-ico" id="livePlayBtn" title="play / pause live stepping">▶️</button>
-        <button class="btn btn-ico" id="liveStepBtn" title="step one round">▶</button>
-        <button class="btn" id="liveExportSpec" title="download replayable scenario json">spec</button>
-        <button class="btn" id="liveExportTrace" title="download trace json">trace</button>
-        <button class="btn" id="liveEndBtn" title="end live session (trace stays loaded)">✕</button>
-        <div class="liveRound mono" id="liveRound">r 0</div>
-      </div>
-    </div>
-    <div class="view" id="view-charts">
-      <div class="chartsWrap">
-        <div class="chartBox grow2">
-          <div class="tlHead"><span class="tlTitle">Value composition over rounds</span><span class="tlNote">bands = share per value · gray top = ⊥ · red strip = blocked · click to jump</span></div>
-          <div class="chartBody"><canvas class="tlCanvas" id="stacked"></canvas></div>
+    <div class="view on" id="view-single">
+      <div class="smrCol">
+            <div class="ctl hidden" id="svCtl">
+          <div class="cgrp">
+            <span class="cgLabel">Playback</span>
+            <div class="cgRow">
+              <button class="btn btnPlay" id="svPlayBtn">⏵ Play</button>
+              <button class="btn" id="svBackBtn" data-tip="back one round (finished run)">−1</button>
+              <button class="btn" id="svStepBtn" data-tip="advance one round">+1</button>
+              <div class="pop" id="svJumpPop">
+                <button class="btn popBtn" id="svJumpBtn">Jump to</button>
+                <div class="popBody menu">
+                  <button class="menuItem" id="svToStart">first round</button>
+                  <button class="menuItem" id="svToEnd">last round</button>
+                </div>
+              </div>
+              <div class="seg" id="svSpeed">
+                <button data-speed="1" class="on">1×</button>
+                <button data-speed="2">2×</button>
+                <button data-speed="4">4×</button>
+                <button data-speed="8">8×</button>
+                <button data-speed="max">max</button>
+              </div>
+              <span class="roundLbl mono" id="svRoundLbl">round 0</span>
+            </div>
+          </div>
+          <div class="sep"></div>
+          <div class="cgrp" id="svStimulus">
+            <span class="cgLabel">Stimulus</span>
+            <div class="cgRow">
+              <span class="bv mono">Blocking</span>
+              <input type="range" class="betaH" id="liveSlider" min="0" max="60" value="0" data-tip="fraction of nodes blocked each round" />
+              <span class="bv mono" id="liveSliderVal">0%</span>
+              <span class="strat mono" id="svStrat">fresh</span>
+            </div>
+          </div>
+          <div class="spacer"></div>
+          <div class="cgrp">
+            <span class="cgLabel">Session</span>
+            <div class="cgRow">
+              <div class="pop" id="svExportPop">
+                <button class="btn popBtn" id="svExportBtn">Export</button>
+                <div class="popBody menu">
+                  <button class="menuItem" id="svExportSpec" data-tip="replayable scenario json of the exact session">scenario spec</button>
+                  <button class="menuItem" id="svExportTrace" data-tip="the trace json: every round’s node states">trace</button>
+                </div>
+              </div>
+              <button class="btn" id="svEndBtn" data-tip="stop the session; the run stays on screen as a finished run">End</button>
+              <button class="btn hidden" id="svNewBtn" data-tip="discard this run and return to the setup form">New run</button>
+            </div>
+          </div>
         </div>
-        <div class="chartBox grow3">
-          <div class="tlHead"><span class="tlTitle">Per-node timeline</span><span class="tlNote" id="heatNote">rows = nodes (grouped by initial value) · red notch = blocked</span></div>
-          <div class="chartBody"><canvas class="tlCanvas" id="heat"></canvas></div>
-        </div>
-      </div>
-    </div>
-    <div class="view" id="view-run">
-      <div class="runWrap">
-        <div class="runForm">
-          <div class="ptitle">Start a run</div>
+        <div class="statusLine mono" id="runStatus"></div>
+        <div class="smrStageWrap">
+          <div class="smrStage" id="svStage">
+            <div class="smrFormCard" id="svFormCard">
+              <div class="smrForm">
+          <div class="ptitle">Start a single-value run</div>
           <div class="fSect">
             <div class="fSectTitle">quick start — E2 acceptance regimes</div>
             <div class="fBtns">
@@ -62,7 +93,7 @@
               <button class="btn" id="presetB" title="Lemma 2.2: ⊥-start u₀=5/9, 10% fresh blocking">B converge-hold</button>
               <button class="btn" id="presetC" title="Lemma 2.3: all hold, 30% permanent blocking">C death spiral</button>
             </div>
-            <div class="sHint">pre-registered thesis regimes (Lemmas 2.1 / 2.2 / 2.3) — fills the form below, then press run</div>
+            <div class="sHint">pre-registered thesis regimes (Lemmas 2.1 / 2.2 / 2.3) — fills the form below, then press Start</div>
           </div>
           <div class="fSect">
             <div class="fSectTitle">network</div>
@@ -125,103 +156,165 @@
           </div>
           </div>
           <div class="fSect">
-            <div class="fSectTitle">blocking adversary β</div>
-            <div class="fPair">
-              <div class="fCol"><span class="fMini">schedule</span>
-                <select class="fInput" id="runSchedule">
-                  <option value="fresh_per_round">fresh — re-sampled every round</option>
-                  <option value="permanent">permanent — one fixed set</option>
-                </select>
-              </div>
-              <div class="fCol"><span class="fMini">blocked % of n</span><input class="fInput" id="runBeta" type="number" min="0" max="60" step="1" value="10" /></div>
+            <div class="fSectTitle">blocking adversary</div>
+            <div class="fCol"><span class="fMini">strategy</span>
+              <select class="fInput" id="svStrategy">
+                <option value="fresh">Fresh per round</option>
+                <option value="sticky">Sticky + background</option>
+                <option value="permanent">Permanent</option>
+                <option value="program">Scheduled program</option>
+                <option value="windows" disabled>Windows — coming</option>
+                <option value="adaptive0">Adaptive 0-late — outside the paper’s model</option>
+                <option value="adaptiveAlpha">Adaptive α-late (Definition 1.1)</option>
+                <option value="disjoint" disabled>Disjoint — coming</option>
+              </select>
             </div>
-            <div class="sHint">blocked nodes send and receive nothing that round · fresh ≈ Lemma 2.2's adversary, permanent ≈ Lemma 2.3's · in live sticky mode this becomes never-stopping background noise under your slider</div>
+            <div class="fCol" id="svRowBeta"><span class="fMini" id="svBetaLabel">blocked % of n</span><input class="fInput" id="runBeta" type="number" min="0" max="60" step="1" value="10" /></div>
+            <div class="fCol hidden" id="svRowAlpha"><span class="fMini">α — rounds the adversary reads behind (α = 1 is the paper’s 1-late adversary)</span><input class="fInput" id="runAlpha" type="number" min="1" step="1" value="1" /></div>
+            <div class="fCol hidden" id="svRowProgram">
+              <div class="progHeadRow"><span>from round</span><span>to round</span><span>blocked %</span><span></span></div>
+              <div id="svProgRows"></div>
+              <div class="fBtns"><button class="btn" id="svProgAdd">+ add segment</button></div>
+            </div>
+            <div class="sHint" id="svStrategyHint"></div>
           </div>
           <div class="fSect">
             <div class="fSectTitle">run</div>
-            <div class="fPair">
-              <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="runMax" type="number" min="1" max="5000" value="1000" /></div>
-              <div class="fCol"><span class="fMini">live slider mode</span>
-                <select class="fInput" id="liveMode" title="fresh: slider β re-sampled every round · sticky: slider drives a persistent targeted set, blocked % above adds background noise">
-                  <option value="fresh">β fresh / round</option>
-                  <option value="sticky">β sticky + background</option>
-                </select>
-              </div>
-            </div>
+            <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="runMax" type="number" min="1" max="5000" value="1000" /></div>
             <div class="fBtns">
-              <button class="btn btn-go" id="runBtn">run ▶</button>
-              <button class="btn" id="liveBtn" title="start a live session — the vertical slider injects blocking round by round">live ▷</button>
+              <button class="btn btn-go" id="svStartBtn" title="start a session: step it live, or press max for a run to the end. Strategies the live path cannot draw exactly run as a finished batch run.">Start ▶</button>
               <span style="flex:1"></span>
               <button class="btn" id="exportSpecBtn" title="download this form as replayable scenario json">export json</button>
               <button class="btn" id="importSpecBtn" title="load a scenario or trace json">import json</button>
             </div>
-            <div class="runStatus mono" id="runStatus"></div>
             <div class="chip chip-run engineChip" id="engineChip">engine: starting…</div>
           </div>
-          <div class="fHint" style="margin-left:0">Rust simulator compiled to WASM — identical engine, RNG, and trace schema as the CLI, so seeds are canonical and reproducible: <span class="mono">cargo run --example trace -- out.json n seed beta</span> gives byte-identical traces. Targets (sample edges) are recorded only for n ≤ 2000 to bound trace size.</div>
+              </div>
+            </div>
+            <div class="smrRun hidden" id="svRun">
+              <section class="stageSect" id="svNetBox">
+                <div class="srvHead">
+                  <button class="srvToggle" id="svNetToggle" data-tip="show or hide the node grid">▾</button>
+                  <span class="pTitle">Servers</span>
+                  <span class="pStat mono" id="svCounts"></span>
+                  <span class="spacer"></span>
+                  <select class="sel" id="edgeMode" data-tip="which sampling edges to draw on the grid">
+                    <option value="selected" selected>edges: selected</option>
+                    <option value="all">edges: all</option>
+                    <option value="none">edges: none</option>
+                  </select>
+                </div>
+                <div id="svNetBody">
+                  <div class="svNet"><canvas class="net" id="net"></canvas></div>
+                  <div class="drillPanel hidden" id="inspector">
+                    <div class="row"><span class="rk">node</span><span class="rv mono" id="selId"></span></div>
+                    <div class="row"><span class="rk">state</span><span class="rv mono" id="selState"></span></div>
+                    <div class="row"><span class="rk">blocked this round</span><span class="rv mono" id="selBlocked"></span></div>
+                    <div class="row"><span class="rk" style="color:#269c86">sampled →</span><span class="rv mono" id="selTargets"></span></div>
+                    <div class="row"><span class="rk" style="color:#c05a9e">sampled by ←</span><span class="rv mono" id="selSamplers"></span></div>
+                    <div class="hint">click empty space to deselect</div>
+                  </div>
+                </div>
+              </section>
+              <section class="stageSect" id="svViewport">
+                <div class="panelHead">
+                  <span class="pTitle">Timeline</span>
+                  <span class="pStat mono" id="svLegend"></span>
+                  <span class="spacer"></span>
+                  <button class="vBtn hidden" id="svLive" data-tip="snap back to the newest round and follow it">↦ back to live</button>
+                </div>
+                <div class="vpWrap">
+                  <canvas class="vpOverview" id="svOverview"></canvas>
+                  <canvas class="vpCanvas" id="svCanvas"></canvas>
+                </div>
+                <div class="readoutLine mono" id="svReadout"></div>
+              </section>
+            </div>
+          </div>
         </div>
       </div>
     </div>
     <div class="view" id="view-smr">
       <div class="smrCol">
         <div class="ctl hidden" id="smrCtl">
-          <div class="grp">
-            <button class="btn btn-ico" id="smrPlayBtn" title="play / pause stepping">▶️</button>
-            <button class="btn btn-ico" id="smrStepBtn" title="step one round">▶</button>
-            <select class="sel" id="smrSpeed" title="steps per second">
-              <option value="0.5">0.5×</option>
-              <option value="1" selected>1×</option>
-              <option value="2">2×</option>
-              <option value="4">4×</option>
-            </select>
-            <span class="roundLbl mono" id="smrLiveRound">r 0</span>
-            <button class="btn btn-ico recoveryOnly hidden" id="smrBoundaryBtn" title="run to the next window boundary — stops one row past it, where the boundary's effects land (rollbacks, forks, checkpoint latches). With T 40, single-round stepping is 39 dead clicks per event.">▶|</button>
-            <button class="btn btn-ico recoveryOnly hidden" id="smrEventBtn" title="run to the next event — rollback, first ⊥, checkpoint fork, or recovery confirmed — and stop there, naming what it found">⏭</button>
-          </div>
-          <div class="sep"></div>
-          <div class="betaWrap">
-            <span class="bv mono" id="smrSliderVal">β 0%</span>
-            <input type="range" class="betaH" id="smrSlider" min="0" max="60" value="0" title="β — fraction of servers blocked each round. In recovery mode this is the whole experiment: cranking it IS the surge, dropping it to 0 is the release — φ, r* and the law card all latch off that release." />
-          </div>
-          <div class="sep"></div>
-          <div class="pop" id="smrInjectPop">
-            <button class="btn popBtn" id="smrInjectPopBtn">inject</button>
-            <div class="popBody">
-              <span class="fMini">client</span><input class="fInput" id="smrInjClient" type="number" min="0" value="100" />
-              <span class="fMini">op</span><input class="fInput" id="smrInjOp" type="number" min="1" value="1000" />
-              <span class="fMini">target — empty = random (paper client)</span><input class="fInput" id="smrInjTarget" type="number" min="0" placeholder="random" />
-              <button class="btn btn-inject" id="smrInjectBtn">submit command ▷</button>
+          <div class="cgrp">
+            <span class="cgLabel">Playback</span>
+            <div class="cgRow">
+              <button class="btn btnPlay" id="smrPlayBtn">⏵ Play</button>
+              <button class="btn" id="smrStepBtn" data-tip="advance one round">+1</button>
+              <div class="pop" id="smrJumpPop">
+                <button class="btn popBtn" id="smrJumpBtn">Jump to</button>
+                <div class="popBody menu">
+                  <button class="menuItem recoveryItem" data-jump="boundary" data-tip="runs to one row past the next window boundary, where its effects land (rollbacks, forks, checkpoint latches)">next boundary</button>
+                  <button class="menuItem recoveryItem" data-jump="event">next event (any)</button>
+                  <button class="menuItem recoveryItem" data-jump="rollback">rollback</button>
+                  <button class="menuItem recoveryItem" data-jump="bot">first ⊥</button>
+                  <button class="menuItem recoveryItem" data-jump="fork">checkpoint fork</button>
+                  <button class="menuItem recoveryItem" data-jump="confirmed">recovery confirmed</button>
+                </div>
+              </div>
+              <div class="seg" id="smrSpeed">
+                <button data-speed="1" class="on">1×</button>
+                <button data-speed="2">2×</button>
+                <button data-speed="4">4×</button>
+                <button data-speed="8">8×</button>
+                <button data-speed="max" data-tip="steps many rounds per worker message and draws once per batch">max</button>
+              </div>
+              <span class="roundLbl mono" id="smrLiveRound">round 0</span>
             </div>
           </div>
-          <div class="pop" id="smrTrafficPop">
-            <button class="btn popBtn" id="smrTrafficPopBtn">traffic</button>
-            <div class="popBody" style="min-width:250px">
-              <span class="fMini">engine pmf — applies from the next round, stays in the exported spec</span>
-              <select class="fInput" id="smrTraffic">
-                <option value="0">off (0 / round)</option>
-                <option value="0.25">1 command / 4 rounds (mixture)</option>
-                <option value="0.5">1 command / 2 rounds (mixture)</option>
-                <option value="1">1 command / round</option>
-                <option value="2">2 commands / round</option>
-                <option value="4">4 commands / round</option>
-              </select>
-              <button class="btn" id="smrTrafficApply">apply pmf ▷</button>
+          <div class="sep"></div>
+          <div class="cgrp" id="smrStimulus">
+            <span class="cgLabel">Stimulus</span>
+            <div class="cgRow">
+              <span class="bv mono" id="smrSliderLbl">Blocking</span>
+              <input type="range" class="betaH" id="smrSlider" min="0" max="60" value="0" data-tip="fraction of servers blocked each round. In recovery this is the whole experiment: cranking it is the surge, dropping it is the release." />
+              <span class="bv mono" id="smrSliderVal">0%</span>
+              <span class="strat mono" id="smrStrat">fresh</span>
+              <div class="pop" id="smrInjectPop">
+                <button class="btn popBtn" id="smrInjectPopBtn">+ Command</button>
+                <div class="popBody">
+                  <span class="fMini">client</span><input class="fInput" id="smrInjClient" type="number" min="0" value="100" />
+                  <span class="fMini">op</span><input class="fInput" id="smrInjOp" type="number" min="1" value="1000" />
+                  <span class="fMini">target — empty = random (paper client)</span><input class="fInput" id="smrInjTarget" type="number" min="0" placeholder="random" />
+                  <button class="btn btn-inject" id="smrInjectBtn">submit command ▷</button>
+                </div>
+              </div>
+              <div class="pop" id="smrTrafficPop">
+                <button class="btn popBtn" id="smrTrafficPopBtn">Traffic</button>
+                <div class="popBody" style="min-width:250px">
+                  <span class="fMini">engine pmf — applies from the next round, stays in the exported spec</span>
+                  <select class="fInput" id="smrTraffic">
+                    <option value="0">off (0 / round)</option>
+                    <option value="0.25">1 command / 4 rounds (mixture)</option>
+                    <option value="0.5">1 command / 2 rounds (mixture)</option>
+                    <option value="1">1 command / round</option>
+                    <option value="2">2 commands / round</option>
+                    <option value="4">4 commands / round</option>
+                  </select>
+                  <button class="btn" id="smrTrafficApply">apply pmf ▷</button>
+                </div>
+              </div>
             </div>
-          </div>
-          <button class="btn" id="smrExportSpecLive" title="replayable scenario json of the exact session">spec</button>
-          <button class="btn" id="smrEndBtn" title="end live session">✕</button>
-          <div class="sep recoveryOnly hidden"></div>
-          <div class="recChips recoveryOnly hidden" id="smrRecChips">
-            <span class="recChip mono" id="smrClockChip" title="WHY: everything in Alg 6 happens on the window clock — commits, checkpoints and rollbacks all land on boundaries. WHAT: the current window [a,b), its length T, and the rounds left to the next boundary. Once a release has been seen it also carries r* (the recovered round) and R = r* − release. DATA: recovery rows' window field plus the spec's T.">–</span>
-            <span class="recChip mono" id="smrPhaseChip" title="WHY: a recovery claim is only meaningful once the surge has actually ended — on a calm run there is nothing to recover from. WHAT: PROVISIONAL from the first release (β &gt; 0 → 0) until a clean converged suffix confirms it; CONFIRMED after. r* is suffix-universal — a relapse voids a provisional candidate, which is why the chip refuses to commit early. DATA: the recorded β track plus the same scan the engine's recovered_round uses.">–</span>
-            <span class="recChip mono" id="smrForkChip" title="WHY: two different checkpoints alive at the same window would break the whole construction (Lemma 6.5/6.7). WHAT: how many distinct (S, P) exist among the servers at the largest window — 1 is healthy, more flares. Blind spot: it is sampled at boundaries only, so it shows onset and ubiquity, not every transient. Run T just under the broadcast-time floor (T 4 at n 256) to watch it flare live. DATA: cp_fork_k, latched on the row after each boundary.">–</span>
-            <span class="recChip mono" id="smrLifeChip" title="WHY: 'done' means different things at different stages, exactly as in Solana's processed / confirmed / finalized — except here the clock drives it, not votes. WHAT: settled = reached every log, still revocable — a rollback discards it and the resend re-ages · ckpt = staged in the newest checkpoint's aged prefix, safe once that checkpoint spreads (the below-T_B cliff is exactly this tier failing) · final = §6-committed at a boundary, irreversible by monotonicity · ⟲ = rollbacks so far. DATA: command landmarks plus max_cp_p_len and the cumulative rollback count.">–</span>
           </div>
           <div class="spacer"></div>
-          <div class="ctlMetrics mono" id="smrCtlMetrics"></div>
+          <div class="cgrp">
+            <span class="cgLabel">Session</span>
+            <div class="cgRow">
+              <div class="pop" id="smrExportPop">
+                <button class="btn popBtn" id="smrExportBtn">Export</button>
+                <div class="popBody menu">
+                  <button class="menuItem" id="smrExportSpec" data-tip="replayable scenario json of the exact session, including injected commands">scenario spec</button>
+                  <button class="menuItem" id="smrExportReport" data-tip="full report json: metrics, recovery rows, per-command audit trails">full report</button>
+                </div>
+              </div>
+              <button class="btn" id="smrEndBtn" data-tip="stop the session; the run stays on screen as a finished run">End</button>
+              <button class="btn hidden" id="smrNewBtn" data-tip="discard this run and return to the setup form">New run</button>
+            </div>
+          </div>
         </div>
-        <div class="lawCard hidden" id="smrLawCard"></div>
         <div class="abortBanner hidden" id="smrAbort"></div>
+        <div class="statusLine mono" id="smrStatus"></div>
         <div class="smrStageWrap">
           <div class="smrStage" id="smrStage">
             <div class="smrFormCard" id="smrFormCard">
@@ -235,22 +328,22 @@
                     <button class="vt" data-proto="recovery">recovery</button>
                   </div>
                   <div class="fCol compactOnly hidden" id="rowSmrT">
-                    <span class="fMini">commit T (rounds) — a command executes once aged T rounds; safety needs T &gt; T_B + max(T_B, T_M), so scale with log₂n (too-small T = live commitment errors, watch the safety flag)</span>
+                    <span class="fMini">commit T (rounds) — a command executes once aged T rounds</span>
                     <input class="fInput" id="smrT" type="number" min="1" value="24" />
                   </div>
                   <div class="fCol recoveryOnly hidden" id="rowSmrTw">
-                    <span class="fMini">window T (rounds) — the checkpoint clock: every T rounds the aged prefix is executed and a new checkpoint minted, or a reset-armed server rolls back to the last one. Below the broadcast-time floor T_B the system cannot re-converge at all (cliff preset)<span class="qHint" title="WHY: T is the single knob that decides whether a surged system ever comes back. WHAT: the length of one checkpoint window — commit clock and rollback granularity in one. DATA: spec proto.t_window_rounds; the clock chip reads it back from the run.">?</span></span>
+                    <span class="fMini">window T (rounds) — every T rounds the aged prefix is executed and a checkpoint minted, or a reset-armed server rolls back<span class="qHint" title="Length of one checkpoint window: commit clock and rollback granularity in one.">?</span></span>
                     <input class="fInput" id="smrTw" type="number" min="1" value="40" />
                   </div>
                   <div class="fCol recoveryOnly hidden" id="rowSmrAck">
-                    <span class="fMini">§5 certificates (RQ11) — clients resend past commitment until a server acks, the only moment a commit notification can ride back<span class="qHint" title="WHY: §6 p. 30 claims the §5 certificate layer carries over to Alg 6 in one sentence and never constructs it; Theorem 6 is proved for the compact protocol only. This is the thesis's construction, not the paper's. WHAT: certificate state lives inside each checkpoint, so rollback restores it and adoption clones it with no new propagation path, and commands are attested only once a boundary has fully executed them (Lemma 6.9) — never while they sit revocable in P. Clients then run §5's client protocol verbatim (p. 25), resending until a contacted server acknowledges. DATA: certs_json over the servers' checkpoint-resident forests; off by default because the ack-tied client changes the client-stage draw pattern.">?</span></span>
+                    <span class="fMini">§5 certificates (RQ11) — clients resend past commitment until a server acks<span class="qHint" title="The thesis’s own construction (RQ11), not the paper’s: the paper asserts that §5 certificates carry over to Alg 6 and proves Theorem 6 for compact only.">?</span></span>
                     <div class="protoToggle" id="smrAckToggle">
                       <button class="vt on" data-ack="off">off</button>
                       <button class="vt" data-ack="on">certificates on</button>
                     </div>
                   </div>
                   <div class="fCol recoveryOnly hidden" id="rowSmrPreset">
-                    <span class="fMini">scenario preset — prefills the form and programs the β slider; edit anything before starting<span class="qHint" title="WHY: the headline results need a specific stimulus shape, and hand-driving the slider is fiddly. WHAT: a form prefill plus a per-round β program that drives the slider for you — surge → release replays the release law's regime (full blackout ending inside a window), partial surge blocks 30% and heals without the spiral, cliff runs T below the broadcast-time floor until the engine aborts. DATA: pure JS — the run still records its actual per-round fractions, so the export replays exactly what happened.">?</span></span>
+                    <span class="fMini">scenario preset — prefills the form and the scheduled program; edit anything before starting<span class="qHint" title="Fills the form and the scheduled program; the run records its actual per-round fractions, so the export replays exactly what happened.">?</span></span>
                     <div class="protoToggle" id="smrPresetToggle">
                       <button class="vt on" data-preset="custom">custom</button>
                       <button class="vt" data-preset="surge">surge → release</button>
@@ -267,22 +360,30 @@
                     <div class="fCol"><span class="fMini">seed — same seed, same run</span><input class="fInput" id="smrSeed" type="number" min="0" value="1" /></div>
                   </div>
                   <div class="fPair">
-                    <div class="fCol"><span class="fMini">σ — amp = ⌈σ·log₂n⌉ appends</span><input class="fInput" id="smrSigma" type="number" min="0.1" step="0.1" value="1" /></div>
+                    <div class="fCol"><span class="fMini">σ — amp = ⌈σ·log₂n⌉ appends</span><input class="fInput" id="smrSigma" type="number" min="1" step="0.1" value="1" /></div>
                     <div class="fCol"><span class="fMini">max rounds</span><input class="fInput" id="smrMax" type="number" min="1" max="5000" value="200" /></div>
                   </div>
                 </div>
                 <div class="fSect">
-                  <div class="fSectTitle">blocking adversary β</div>
-                  <div class="fPair">
-                    <div class="fCol"><span class="fMini">live slider mode</span>
-                      <select class="fInput" id="smrLiveMode">
-                        <option value="fresh">fresh — re-sampled every round</option>
-                        <option value="sticky">sticky + background</option>
-                      </select>
-                    </div>
-                    <div class="fCol"><span class="fMini">blocked % of n</span><input class="fInput" id="smrBeta" type="number" min="0" max="60" value="10" /></div>
+                  <div class="fSectTitle">blocking adversary</div>
+                  <div class="fCol"><span class="fMini">strategy</span>
+                    <select class="fInput" id="smrStrategy">
+                      <option value="fresh">Fresh per round</option>
+                      <option value="sticky">Sticky + background</option>
+                      <option value="permanent" disabled>Permanent — coming</option>
+                      <option value="program">Scheduled program</option>
+                      <option value="windows" disabled>Windows — coming</option>
+                      <option value="adaptive0" disabled>Adaptive 0-late — single-value only</option>
+                      <option value="adaptiveAlpha" disabled>Adaptive α-late — single-value only</option>
+                    </select>
                   </div>
-                  <div class="sHint">batch runs block a fresh % each round · in live sticky mode this % becomes never-stopping background noise under the slider</div>
+                  <div class="fCol" id="rowBeta"><span class="fMini" id="smrBetaLabel">blocked % of n</span><input class="fInput" id="smrBeta" type="number" min="0" max="60" value="10" /></div>
+                  <div class="fCol hidden" id="rowProgram">
+                    <div class="progHeadRow"><span>from round</span><span>to round</span><span>blocked %</span><span></span></div>
+                    <div id="smrProgRows"></div>
+                    <div class="fBtns"><button class="btn" id="smrProgAdd">+ add segment</button></div>
+                  </div>
+                  <div class="sHint" id="smrStrategyHint"></div>
                 </div>
                 <div class="fSect">
                   <div class="fSectTitle">injections — one per client</div>
@@ -339,80 +440,133 @@
                 <div class="fSect">
                   <div class="fSectTitle">run</div>
                   <div class="fBtns">
-                    <button class="btn btn-go" id="smrRunBtn">run ▶</button>
-                    <button class="btn" id="smrLiveBtn" title="start a live stepped session">live ▷</button>
+                    <button class="btn btn-go" id="smrStartBtn" title="start a live session: step it, or press max for a run to the end">Start ▶</button>
                     <span style="flex:1"></span>
-                    <button class="btn" id="smrExportSpec" title="replayable scenario json (live: the exact session incl. injected commands)">spec</button>
-                    <button class="btn" id="smrExportReport" title="full report json (metrics + audit trails)">report</button>
+                    <button class="btn" id="smrFormExportSpec" title="replayable scenario json of this form. The lab cannot run or replay recovery with repeated_commit: skip — it mounts the §5 certificates, which refuse execute-once.">export spec</button>
                   </div>
-                  <div class="runStatus mono" id="smrStatus"></div>
                 </div>
               </div>
             </div>
-            <section class="stageSect hidden" id="smrNetBox">
+            <div class="smrRun hidden" id="smrRun">
+            <section class="stageSect" id="smrNetBox">
+              <div class="srvHead" id="srvHead">
+                <button class="srvToggle" id="srvToggle" data-tip="show or hide the per-server grid">▸</button>
+                <span class="pTitle">Servers</span>
+                <canvas class="srvStrip" id="srvStrip"></canvas>
+                <span class="pStat mono" id="srvCounts"></span>
+                <span class="spacer"></span>
+                <span class="pStat mono hidden" id="srvWatch"><span id="srvWatchLbl"></span><button class="srvX" id="srvWatchX" data-tip="stop watching this command">×</button></span>
+                <div class="chartTabs hidden" id="smrGridTabs">
+                  <button class="ct on" data-grid="lag" data-tip="entries behind the commit frontier: the longest executed sequence among the servers minus the server's own">lag</button>
+                  <button class="ct" data-grid="know" id="srvKnowBtn" data-tip="share of the currently spreading commands this server holds">knowledge</button>
+                  <button class="ct recoveryOnly hidden" data-grid="rstate">R-state</button>
+                  <button class="ct" data-grid="watch" id="srvWatchBtn" data-tip="pick a command in the audit trail or a block to watch who holds it">watched</button>
+                </div>
+                <button class="ct sortBtn hidden" id="srvSort" data-tip="arrange the dots by the current mode’s value instead of server id">sorted</button>
+                <span class="pStat" id="srvHint">expand to pin a server</span>
+              </div>
+              <div class="srvBody hidden" id="srvBody">
               <div class="panelHead">
-                <span class="pTitle">Node overview</span>
-                <div class="chartTabs recoveryOnly hidden" id="smrGridTabs">
-                  <button class="ct on" data-grid="watched">watched</button>
-                  <button class="ct" data-grid="rstate">R-state</button>
-                </div>
-                <span class="qHint recoveryOnly hidden" title="WHY: whether a server will roll back at the next boundary is decided by R, and R is NOT readable off its log — a reset-armed server can still hold one. WHAT: teal = no-reset (safe) · amber = reset (will roll back) · grey = ⊥. Lines flash the peer that caused a change: teal = whose checkpoint was adopted, amber = whose reply cleared the reset. Pink ring = blocked by the schedule, dashed ring = blocked by you (⌖ — a surgical adversary instead of the slider's random one). The reset wave literally spreads by gossip; the flashes show the carriers. DATA: the r field on each node glance, plus the step payload's edge lists.">?</span>
+                <span class="qHint recoveryOnly hidden" title="Teal: no-reset · amber: reset (will roll back) · grey: ⊥. Pink ring: blocked by the schedule; dashed ring: blocked by you.">?</span>
                 <span class="pStat mono" id="smrNetNote"></span>
-                <div class="glyphs">
-                  <span class="g"><span class="gd watch"></span>watched</span>
-                  <span class="g"><span class="gd bot"></span>⊥</span>
-                  <span class="g"><span class="gd blk"></span>blocked</span>
-                  <span class="qHint" title="Each dot is a node. Colored = holds the watched command · gray = ⊥ · pink ring = blocked this round.">?</span>
-                </div>
+                <div class="glyphs" id="smrNetLegend"></div>
               </div>
               <div class="netBody"><canvas id="smrNet"></canvas></div>
-              <div class="drillHint recoveryOnly hidden">click a node to pin it — its detail refreshes every round<span class="qHint" title="WHY: a rollback is invisible in aggregate counts; you have to watch ONE server lose its history and rebuild it. WHAT: the pinned server's R, log and executed lengths, its checkpoint window and |P|, and two hashes — its current executed sequence against the one its checkpoint holds, Lemma 6.7's identity check by eye. They diverge while it runs ahead and re-converge when a boundary commits or a rollback resets it. Time travel does not apply here: the engine keeps no per-node history, so this is live state only. DATA: node_detail, fetched on demand and re-fetched each round while pinned.">?</span></div>
+              <div class="drillHint recoveryOnly hidden">click a node to pin it — its detail refreshes every round<span class="qHint" title="Click a server to pin it; its detail refreshes every round while it is pinned.">?</span></div>
               <div class="drillPanel hidden" id="smrDrill"></div>
-            </section>
-            <section class="stageSect recoveryOnly hidden" id="smrBlocksBox">
-              <div class="panelHead">
-                <span class="pTitle">Committed sequence</span>
-                <span class="pStat mono" id="smrBlocksNote"></span>
-                <span class="qHint" title="WHY: under Alg 6 nothing commits between boundaries — throughput arrives in lumps, and a surge shows up as a run of empty ones followed by an oversized catch-up. WHAT: one block per window boundary, width proportional to how many entries executed there; slim slots are boundaries that committed nothing (⟲ = the boundary rolled back instead); DRAIN marks the first batch after a rollback — the re-aged backlog landing at once. Click a block to open its batch and see which commands landed in it; click a command to pin it on the charts. DATA: the jump in max_executed_len across consecutive post-boundary rows.">?</span>
-              </div>
-              <div class="blocksStrip" id="smrBlocks"></div>
-              <div class="batchDrawer hidden" id="smrBatchDrawer"></div>
-              <div class="ghostRow recoveryOnly hidden" id="smrGhostRow">
-                <b>Certificates hidden</b> — §5's certificate layer is defined for the compact rule, and its state
-                (forest roots, per-client windows) lives outside the (S, P, W) checkpoint a rollback restores, so it
-                would strand beside the replaced state. The committed sequence itself never un-executes, which is what
-                makes the forest below well-defined; the adapted certificate construction is an open question, not an
-                omission.
+              <div class="pStat srvNote hidden" id="srvNote">per-server state is not recorded for a spec run — open a live session to see servers</div>
               </div>
             </section>
-            <section class="stageSect hidden" id="smrTimelineBox">
+            <section class="stageSect" id="smrViewport">
               <div class="panelHead">
-                <span class="pTitle">Master timeline</span>
-                <span class="pStat mono">β · windows · R-states · client queue · spread γ · prefix</span>
-                <span class="qHint" title="WHY: the recovery story is a chain — a surge (β) drives servers to ⊥ and reset (R), which stalls the client queue, which shows up as collapsed spread and prefix. Reading it needs one shared clock. WHAT: six lanes, one x-axis, gridlines every T; ⟲ badges mark rollbacks with their depth at the boundary they belong to. Hover for every lane's value at that round; click to park the cursor. Reading it: the reset wave's width IS R; the backlog cliff and the DRAIN block below are the same event in two views; post-rollback resends re-enter as fresh steep γ curves; prefix snap-backs sit right under the ⟲ badges that cause them. DATA: the streamed report — recovery rows, metrics and command landmarks; the queue is derived from injection and §6-commit rounds.">?</span>
+                <span class="pTitle">Timeline</span>
+                <span class="pStat mono" id="vpLegend"></span>
+                <span class="spacer"></span>
+                <button class="vBtn hidden" id="vpLive" data-tip="snap back to the newest round and follow it">↦ back to live</button>
               </div>
-              <canvas id="smrTimeline"></canvas>
-            </section>
-            <section class="stageSect" id="smrSpreadBox">
-              <div class="panelHead">
-                <div class="chartTabs" id="smrChartTabs">
-                  <button class="ct on" data-chart="spread">spread</button>
-                  <button class="ct" data-chart="position">position</button>
+              <div class="vpWrap hidden" id="vpWrap">
+                <canvas class="vpOverview" id="vpOverview"></canvas>
+                <div class="vpLanes">
+                  <canvas class="vpCanvas" id="vpCanvas"></canvas>
+                  <button class="vBtn vpSpreadBtn" id="vpSpreadBtn">distribution ▾</button>
                 </div>
-                <span class="pTitle">Command spread — γₜ</span>
+              </div>
+              <div class="readoutLine mono" id="vpReadout"></div>
+        <div class="readout" id="smrReadout">
+          <div class="recChips recoveryOnly hidden" id="smrRecChips">
+            <span class="recChip mono" id="smrClockChip" title="The current window and the rounds to the next boundary; after a release it also shows r* and R = r* − release.">–</span>
+            <span class="recChip mono" id="smrPhaseChip" title="PROVISIONAL from the first release until a clean converged suffix confirms it; CONFIRMED after.">–</span>
+            <span class="recChip mono" id="smrForkChip" title="Distinct checkpoints alive at the largest window: 1 is healthy, more flares. Sampled at boundaries only.">–</span>
+            <span class="recChip mono" id="smrLifeChip" title="settled: reached every log, still revocable · ckpt: staged in the newest checkpoint’s aged prefix · final: §6-committed at a boundary · ⟲: rollbacks so far.">–</span>
+            <span class="lawTip hidden" id="smrLawCard"></span>
+          </div>
+        </div>
+            </section>
+            <section class="stageSect hidden" id="smrDrawer">
+              <div class="drawerHead">
+                <span class="pTitle" id="drawerKind">Block</span>
+                <span class="mono drawerTitle" id="drawerTitle"></span>
+                <div class="chartTabs" id="drawerTabs"></div>
+                <span class="spacer"></span>
+                <span class="warnIcon hidden" id="drawerWarn">⚠</span>
+                <button class="vBtn" id="drawerClose">close ×</button>
+              </div>
+              <div id="blockDrawer">
+                <div id="bdThis">
+                  <div class="bdChips" id="bdChips"></div>
+                  <div class="bdProof">
+                    <div class="bdProofViz" id="bdProofViz"></div>
+                    <ol class="bdSteps" id="bdSteps"></ol>
+                  </div>
+                </div>
+                <div id="bdForest">
+            <section class="stageSect chainPanel hidden" id="chainPanel">
+              <div class="panelHead">
+                <span class="pTitle" id="chainTitle">Committed sequence — §5 Merkle forest</span>
+                <span class="badge badge-mut mono" id="certM">m = 0</span>
+                <span class="badge badge-mut mono" id="certBin">0</span>
+                <span class="badge badge-mut mono" id="certTrees">trees 0</span>
+                <span class="badge badge-ok" id="certRoots">roots ✓</span>
                 <div class="glyphs">
-                  <span class="qHint" title="SPREAD: γₜ useful-holder fraction per command · dot = delivered · B/E ticks = T_B / T_E · flag = compact ack · dashed = 1/3 · amber = live round · older commands ghost. POSITION: selected command's min/median/max log position — the band collapses at T_E. Click an audit row to pin a command.">?</span>
+                  <span class="pStat mono" id="certSrv"></span>
+                  <span class="qHint" id="chainCertHint" title="Blocks are committed commands, newest right; the Merkle forest hangs below them. A big forest switches to the skyline.">?</span>
+                  <span class="qHint hidden" id="chainRecHint" title="One block per committed entry. Heights, ranges and roots come from the engine; no interior hash is invented.">?</span>
                 </div>
               </div>
-              <div class="tlCanvasWrap"><canvas id="smrSpread"></canvas></div>
-            </section>
-            <section class="stageSect" id="smrPrefixBox">
-              <div class="panelHead">
-                <span class="pTitle">Prefix agreement</span>
-                <span class="qHint" title="Per round: longest agreed sequence prefix ÷ longest sequence (extended: log LCP / max log; compact: shortest executed / longest executed — executed sequences are prefix-consistent). Full-height teal = full agreement.">?</span>
-                <div class="glyphs"><span class="pStat mono" id="smrLcpStat"></span></div>
+              <div class="forestBody">
+                <div class="forestScroll" id="forestScroll">
+                  <svg id="forestSvg"></svg>
+                  <div class="sky hidden" id="certSky"></div>
+                  <div class="skyDetail hidden" id="certDetail"><span>no commits yet</span></div>
+                </div>
               </div>
-              <canvas id="smrPrefix"></canvas>
+            </section>
+                  <div class="pStat bdNote hidden" id="bdNoForest"></div>
+                </div>
+                <div class="bdCerts" id="bdCerts">
+                  <div class="bdCertHead">
+                    <span class="pTitle">Certificates</span>
+                    <span class="pStat" id="bdCertNote"></span>
+                    <span class="pStat mono" id="certVerStamp"></span>
+                <button class="vBtn" id="certVerifyBtn" title="Verify every issued certificate against every server’s forest (Theorem 6); the tally is stamped with the round it was computed at.">verify everywhere</button>
+                  </div>
+                  <div class="certsCol" id="certClients"></div>
+                </div>
+              </div>
+              <div id="spreadDrawer" class="hidden">
+                <div class="drBar">
+                  <span class="fMini">measure</span>
+                  <select class="sel" id="drMeasure">
+                    <option value="view">commands in view</option>
+                    <option value="30">last 30</option>
+                    <option value="100">last 100</option>
+                    <option value="500">last 500</option>
+                    <option value="all">whole run</option>
+                  </select>
+                  <span class="pStat mono" id="drHead"></span>
+                </div>
+                <canvas id="drSpread"></canvas>
+              </div>
             </section>
             <section class="stageSect hidden" id="spillPanel">
               <div class="panelHead">
@@ -420,7 +574,7 @@
                 <span class="badge badge-mut" id="spillTrust">—</span>
                 <button class="vBtn" id="spillCloseBtn" title="close the spill and return the panels to the live session">close</button>
                 <div class="glyphs">
-                  <span class="qHint" title="WHY: a lean recovery run has its servers forget their committed prefix — that is the whole point, and it is what takes a big dispatch from ~15 GB to single-digit GB. Nothing in the run then holds the committed history any more, so the chain panel below cannot be fed from a server. The spill is the one canonical record of that history: the committed stream, plus every server's forget offset and executed length at every T-window boundary. WHAT: pick a boundary and a server; the chain panel renders that server's committed view, reconstructed from the stream and checked against the digest chain the run itself recorded — not trusted. Parse, reconstruction and verification all happen in the same Rust reader the run's own diagnosis path uses; the browser only reads the file and draws. DATA: .runs/spills/*.jsonl, written once per boundary by the observer just before the servers forget.">?</span>
+                  <span class="qHint" title="A lean run’s committed history, read from the canonical spill and checked against the run’s own digest chain.">?</span>
                 </div>
               </div>
               <div class="spillBody">
@@ -440,31 +594,7 @@
                 <ul class="spillAbsent" id="spillAbsent"></ul>
               </div>
             </section>
-            <section class="stageSect chainPanel hidden" id="chainPanel">
-              <div class="panelHead">
-                <span class="pTitle" id="chainTitle">Committed sequence — §5 Merkle forest</span>
-                <span class="badge badge-mut mono" id="certM">m = 0</span>
-                <span class="badge badge-mut mono" id="certBin">0</span>
-                <span class="badge badge-mut mono" id="certTrees">trees 0</span>
-                <span class="badge badge-ok" id="certRoots">roots ✓</span>
-                <button class="vBtn" id="certVerifyBtn" title="Verify every issued certificate against every server's forest (Thm 6): tally = accepted/covered, stamped with the round it was computed at. On demand — re-click to refresh.">verify everywhere</button>
-                <div class="glyphs">
-                  <span class="pStat mono" id="certVerStamp"></span>
-                  <span class="pStat mono" id="certSrv"></span>
-                  <span class="qHint" id="chainCertHint" title="Blocks = committed commands (newest right, dashed slot = next commit). The Merkle forest hangs from the blocks — scroll to follow it; a client row click highlights its tree path. Large m switches to the skyline (one bar per bit of m).">?</span>
-                  <span class="qHint hidden" id="chainRecHint" title="WHY: Alg 6 commits in lumps at window boundaries, and what it commits is a real sequence with real hashes — the blockchain the protocol actually builds. Watching it grow makes &quot;committed&quot; concrete, and the merge cascade shows a whole batch being absorbed at once. WHAT: one block per committed entry (newest right, dashed slot = the next commit), labelled with the command occupying it; the trees hanging below are the Merkle forest over those blocks — heights, ranges and root hashes come from the engine, no interior hash is invented. A boundary commit flashes the carry chain as equal-height trees merge; past 2^7 leaves the forest gives way to the skyline (one bar per bit of m). Click a block to pin its command on the charts. Empty stretches are honest: nothing commits between boundaries. DATA: chain_json over the canonical committed sequence — the longest executed prefix in the population, which never shrinks (Lemma 6.9). This is structure only: §5's certificate layer is not constructed for Alg 6.">?</span>
-                </div>
-              </div>
-              <div class="forestBody">
-                <div class="forestScroll" id="forestScroll">
-                  <svg id="forestSvg"></svg>
-                  <div class="sky hidden" id="certSky"></div>
-                  <div class="skyDetail hidden" id="certDetail"><span>no commits yet</span></div>
-                </div>
-                <div class="certsCol" id="certClients"></div>
-              </div>
-            </section>
-            <div class="runStatus mono" id="smrStrip">–</div>
+            </div>
           </div>
           <aside class="audit closed" id="smrAuditCol">
             <div class="auditClosed" id="auditClosedTag">
@@ -487,59 +617,15 @@
         </div>
       </div>
     </div>
-    <div class="side">
-      <div class="panel">
-        <div class="ptitle">Round</div>
-        <div class="row"><span class="rk">position</span><span class="rv mono" id="roundLabel">–</span></div>
-        <div class="row"><span class="rk">value holders</span><span class="rv mono" id="holdersLabel">–</span></div>
-        <div class="row"><span class="rk">undecided ⊥</span><span class="rv mono" id="botCount">–</span></div>
-        <div class="row"><span class="rk">blocked</span><span class="rv mono" id="blockedCount">–</span></div>
-        <div class="row"><span class="rk">distinct values</span><span class="rv mono" id="distinctCount">–</span></div>
-      </div>
-      <div class="panel">
-        <div class="ptitle">Value-holder fraction</div>
-        <canvas class="spark" id="spark"></canvas>
-      </div>
-      <div class="panel">
-        <div class="ptitle">Values</div>
-        <div id="legend"></div>
-      </div>
-      <div class="panel hidden" id="inspector">
-        <div class="ptitle">Node inspector</div>
-        <div class="row"><span class="rk">node</span><span class="rv mono" id="selId"></span></div>
-        <div class="row"><span class="rk">state</span><span class="rv mono" id="selState"></span></div>
-        <div class="row"><span class="rk">blocked this round</span><span class="rv mono" id="selBlocked"></span></div>
-        <div class="row"><span class="rk" style="color:#269c86">sampled →</span><span class="rv mono" id="selTargets"></span></div>
-        <div class="row"><span class="rk" style="color:#c05a9e">sampled by ←</span><span class="rv mono" id="selSamplers"></span></div>
-        <div class="hint">click empty space to deselect</div>
-      </div>
-      <div class="panel">
-        <div class="ptitle">Reading this view</div>
-        <div class="hint">Each dot is a node, colored by its current value (colors repeat past 7 values — a distinct init reads as noise early; order emerging IS the protocol working). Gray = ⊥. Red ring = blocked. Click a node for its sample edges (teal out, magenta in). Keys: ← → step, space = play. Click any chart to jump.</div>
-      </div>
-    </div>
-  </div>
-  <div class="transport" id="transport">
-    <button class="btn btn-ico" id="toStart">⏮</button>
-    <button class="btn btn-ico" id="stepBack">◀</button>
-    <button class="btn btn-ico" id="playBtn">▶️</button>
-    <button class="btn btn-ico" id="stepFwd">▶</button>
-    <button class="btn btn-ico" id="toEnd">⏭</button>
-    <input class="slider" type="range" id="scrub" min="0" max="1" value="0" />
-    <span class="mono meta" id="roundLabel2">–</span>
-    <select class="sel" id="speed">
-      <option value="0.5">0.5×</option>
-      <option value="1" selected>1×</option>
-      <option value="2">2×</option>
-      <option value="4">4×</option>
-    </select>
-    <select class="sel" id="edgeMode">
-      <option value="selected" selected>edges: selected</option>
-      <option value="all">edges: all</option>
-      <option value="none">edges: none</option>
-    </select>
   </div>
 </div>
+  <div class="aboutPanel hidden" id="aboutPanel">
+    <div class="aboutBox">
+      <div class="aboutHead"><span class="ptitle" style="margin:0">About this view</span><span class="spacer"></span><button class="vBtn" id="aboutClose">close ×</button></div>
+      <div class="aboutBody"><h3>Single-value consensus</h3><h4>Reading the grid</h4><p>Each dot is a node, colored by its current value (colors repeat past 7 values — a distinct init reads as noise early; order emerging IS the protocol working). Gray = ⊥. Red ring = blocked. Click a node for its sample edges (teal out, magenta in). Keys: ← → step, space = play. Click the timeline to move the grid to that round.</p><h4>The engine</h4><p>Rust simulator compiled to WASM — identical engine, RNG, and trace schema as the CLI, so seeds are canonical and reproducible: <span class="mono">cargo run --example trace -- out.json n seed beta</span> gives byte-identical traces. Targets (sample edges) are recorded only for n ≤ 2000 to bound trace size.</p><h4>Timeline lanes</h4><p>Value composition: the share of nodes per value over the rounds, ⊥ in gray on top, and a red strip for the share blocked. Per-node timeline: one row per node, grouped by initial value; with more nodes than rows it shows every k-th node and says so. A red notch marks a blocked node. The readout gives the numbers for the round under the cursor, and its status says whether every holder agrees on one value, nobody holds a value, or neither.</p><h4>Blocking strategies</h4><p>Fresh, sticky + background and a scheduled program run in a live session: the live path draws exactly the stream the batch engine draws for them. Permanent and the adaptive strategies need draws or node state the live path does not have, so they run through the batch engine and open as a finished run, which is the exact run the engine gives for that spec and seed. The 0-late adversary reads the state one round later than Definition 1.1 allows and is outside the paper’s model; the α-late adversary is Definition 1.1, and α = 1 is the 1-late adversary.</p><h4>Sticky + background</h4><p>The slider drives a persistent targeted set; the blocked % in the form adds never-stopping background noise under it.</p><h3>Setup form</h3><h4>Commit T (compact)</h4><p>A command executes once aged T rounds. Safety needs T &gt; T_B + max(T_B, T_M), so scale T with log₂n: a too-small T gives live commitment errors, visible in the safety flag.</p><h4>Window T and the broadcast-time floor</h4><p>The checkpoint clock: every T rounds the aged prefix is executed and a new checkpoint minted, or a reset-armed server rolls back to the last one. Below the broadcast-time floor T_B the system cannot re-converge at all (cliff preset).</p><h4>Window T — why it matters</h4><p><b>Why</b> T is the single knob that decides whether a surged system ever comes back.</p><p><b>What</b> the length of one checkpoint window — commit clock and rollback granularity in one.</p><p><b>Data</b> spec proto.t_window_rounds; the clock chip reads it back from the run.</p><h4>§5 certificates over recovery</h4><p><b>Why</b> §6 p. 30 claims the §5 certificate layer carries over to Alg 6 in one sentence and never constructs it; Theorem 6 is proved for the compact protocol only. This is the thesis's construction, not the paper's.</p><p><b>What</b> certificate state lives inside each checkpoint, so rollback restores it and adoption clones it with no new propagation path, and commands are attested only once a boundary has fully executed them (Lemma 6.9) — never while they sit revocable in P. Clients then run §5's client protocol verbatim (p. 25), resending until a contacted server acknowledges.</p><p><b>Data</b> certs_json over the servers' checkpoint-resident forests; off by default because the ack-tied client changes the client-stage draw pattern.</p><h4>Scenario presets</h4><p><b>Why</b> the headline results need a specific stimulus shape, and hand-driving the slider is fiddly.</p><p><b>What</b> a form prefill plus a scheduled blocking program (round segments, each with a blocked fraction) that drives the live slider for you — surge → release replays the release law's regime (full blackout ending inside a window), partial surge blocks 30% and heals without the spiral, cliff runs T below the broadcast-time floor until the engine aborts.</p><p><b>Data</b> pure JS — the run still records its actual per-round fractions, so the export replays exactly what happened.</p><h3>Servers</h3><h4>R-state grid</h4><p><b>Why</b> whether a server will roll back at the next boundary is decided by R, and R is NOT readable off its log — a reset-armed server can still hold one.</p><p><b>What</b> teal = no-reset (safe) · amber = reset (will roll back) · grey = ⊥. Lines flash the peer that caused a change: teal = whose checkpoint was adopted, amber = whose reply cleared the reset. Pink ring = blocked by the schedule, dashed ring = blocked by you (⌖ — a surgical adversary instead of the slider's random one). The reset wave literally spreads by gossip; the flashes show the carriers.</p><p><b>Data</b> the r field on each node glance, plus the step payload's edge lists.</p><h4>Pinning one server</h4><p><b>Why</b> a rollback is invisible in aggregate counts; you have to watch ONE server lose its history and rebuild it.</p><p><b>What</b> the pinned server's R, log and executed lengths, its checkpoint window and |P|, and two hashes — its current executed sequence against the one its checkpoint holds, Lemma 6.7's identity check by eye. They diverge while it runs ahead and re-converge when a boundary commits or a rollback resets it. Time travel does not apply here: the engine keeps no per-node history, so this is live state only.</p><p><b>Data</b> node_detail, fetched on demand and re-fetched each round while pinned.</p><h3>Readout under the timeline</h3><h4>Window clock</h4><p><b>Why</b> everything in Alg 6 happens on the window clock — commits, checkpoints and rollbacks all land on boundaries.</p><p><b>What</b> the current window [a,b), its length T, and the rounds left to the next boundary. Once a release has been seen it also carries r* (the recovered round) and R = r* − release.</p><p><b>Data</b> recovery rows' window field plus the spec's T.</p><h4>Recovery phase</h4><p><b>Why</b> a recovery claim is only meaningful once the surge has actually ended — on a calm run there is nothing to recover from.</p><p><b>What</b> PROVISIONAL from the first release (fewer than n/4 servers unblocked → n/4 or more) until a clean converged suffix confirms it; CONFIRMED after. r* is suffix-universal — a relapse voids a provisional candidate, which is why the chip refuses to commit early.</p><p><b>Data</b> the recorded β track plus the same scan the engine's recovered_round uses.</p><h4>Checkpoint fork</h4><p><b>Why</b> two different checkpoints alive at the same window would break the whole construction (Lemma 6.5/6.7).</p><p><b>What</b> how many distinct (S, P) exist among the servers at the largest window — 1 is healthy, more flares. Blind spot: it is sampled at boundaries only, so it shows onset and ubiquity, not every transient. Run T just under the broadcast-time floor (T 4 at n 256) to watch it flare live.</p><p><b>Data</b> cp_fork_k, latched on the row after each boundary.</p><h4>Durability tiers</h4><p><b>Why</b> 'done' means different things at different stages, exactly as in Solana's processed / confirmed / finalized — except here the clock drives it, not votes.</p><p><b>What</b> settled = reached every log, still revocable — a rollback discards it and the resend re-ages · ckpt = staged in the newest checkpoint's aged prefix, safe once that checkpoint spreads (the below-T_B cliff is exactly this tier failing) · final = §6-committed at a boundary, irreversible by monotonicity · ⟲ = rollbacks so far.</p><p><b>Data</b> command landmarks plus max_cp_p_len and the cumulative rollback count.</p><h3>Block drawer: chain, forest, certificates</h3><h4>Whole forest (compact)</h4><p>Blocks = committed commands (newest right, dashed slot = next commit). The Merkle forest hangs from the blocks — scroll to follow it; a client row click highlights its tree path. Large m switches to the skyline (one bar per bit of m).</p><h4>Whole forest (recovery)</h4><p><b>Why</b> Alg 6 commits in lumps at window boundaries, and what it commits is a real sequence with real hashes — the blockchain the protocol actually builds. Watching it grow makes "committed" concrete, and the merge cascade shows a whole batch being absorbed at once.</p><p><b>What</b> one block per committed entry (newest right, dashed slot = the next commit), labelled with the command occupying it; the trees hanging below are the Merkle forest over those blocks — heights, ranges and root hashes come from the engine, no interior hash is invented. A boundary commit flashes the carry chain as equal-height trees merge; past 2^7 leaves the forest gives way to the skyline (one bar per bit of m). Click a block to pin its command on the charts. Empty stretches are honest: nothing commits between boundaries.</p><p><b>Data</b> chain_json over the canonical committed sequence — the longest executed prefix in the population, the longest executed sequence among the n servers, a display construct rather than any one server's S_i. While prefix consistency holds it extends every server's S_i (Lemma 6.9); a prefix violation freezes the panel, and per-server retractions of executed commands (Def 1.5) are counted in the run report, not redrawn here. Without certificates this is structure only; with certificates on (the thesis's RQ11 construction, not the paper's) the drawer also lists client certificates and verifies them.</p><h4>Verify everywhere</h4><p>Verify every issued certificate against every server's forest (Thm 6): tally = accepted/covered, stamped with the round it was computed at. On demand — re-click to refresh.</p><h3>Canonical spill viewer</h3><h4>What a spill is</h4><p><b>Why</b> a lean recovery run has its servers forget their committed prefix — that is the whole point, and it is what takes a big dispatch from ~15 GB to single-digit GB. Nothing in the run then holds the committed history any more, so the chain panel below cannot be fed from a server. The spill is the one canonical record of that history: the committed stream, plus every server's forget offset and executed length at every T-window boundary.</p><p><b>What</b> pick a boundary and a server; the chain panel renders that server's committed view, reconstructed from the stream and checked against the digest chain the run itself recorded — not trusted. Parse, reconstruction and verification all happen in the same Rust reader the run's own diagnosis path uses; the browser only reads the file and draws.</p><p><b>Data</b> .runs/spills/*.jsonl, written once per boundary by the observer just before the servers forget.</p><h3>Timeline lanes</h3><h4>Servers lane</h4><p>Recovery: server states from the recovery rows, no-reset (teal), reset (amber), ⊥ (grey). Extended and compact: holds a log (teal) or ⊥ (grey), from the per-round metrics. The red line is the blocked share. Markers are checkpoint, rollback, collapse (every log ⊥), release and recovered (r*); the three bands are collapsed, recovering (release to r*) and recovered. No other phase is named.</p><h4>Spread lane</h4><p>One line per command: the share of useful servers holding it. The label measures commands delivered inside the view: rounds to every server = all_logs_round − delivered_round, the median and 90th percentile of those, and that median as a multiple of log₂n. Commands that have not reached every server yet are counted apart (still spreading), so a surge cannot look faster than it was.</p><h4>Commands lane</h4><p>Backlog is submitted and not yet committed. Committed means: recovery, the boundary at which every useful server executed it; compact, the first round every useful server executed it; extended has no commit, so it is the round the command reached every log. Oldest waiting is client wait time from injection; a rollback does not reset it. The 2T guide marks the normal commit latency of recovery: a command’s lifecycle spans two windows.</p><h4>Chain lane</h4><p>Recovery: one block per window boundary, with the entries committed there and the average submit-to-commit latency of its commands. Compact: one block per window of T rounds, a display unit only, since compact commits continuously; its latency is submit to that commit round. Rollback blocks commit nothing; the drain block is the first batch after a rollback.</p><h4>Rollback marker</h4><p>The report says how many servers rolled back and how many windows back, not how many entries were discarded, so the lab states exactly that and nothing more.</p><h4>Never committed</h4><p>Commands that have no commit landmark when the run ends: in flight (the run ended first), dead (every log ⊥) and, in extended only, stranded (the client stopped after delivery and no server amplified it, so it never entered a log).</p><h3>Spread drawer</h3><h4>Distribution</h4><p>Spread curves re-aligned to the round the command was delivered. The white line is the median across commands that have a sample at that age, the band is the 10 to 90 percent range, and the dashed line marks log₂n rounds as a scale reference only: the paper proves O(log n) without a constant.</p><h4>Position</h4><p>One command’s minimum, median and maximum log position per round; the band collapses at T_E, the round its prefix stops moving.</p></div>
+    </div>
+  </div>
+<div class="dropHint" id="dropHint">drop a trace, spec or spill to open it</div>
 <div class="tlTip" id="tip"></div>
 <script type="module" src="./main.js"></script>
 </body>

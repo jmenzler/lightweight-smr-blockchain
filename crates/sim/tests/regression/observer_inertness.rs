@@ -1,6 +1,7 @@
 //! Observer inertness: the simulated world (`smr/engine/`) must behave identically whether
 //! the optional observation over it (`smr/observe/`) runs or not. One seeded scenario runs
-//! three ways — every observer on, lean with spill, grid-lean with the census scoped out —
+//! four ways — every observer on, lean with spill, grid-lean with the census scoped out, and
+//! flat (grid that retires settled commands and folds rows as they land) —
 //! and the per-round protocol state of every node plus every RNG-dependent landmark must
 //! agree. An observer that consumed an RNG draw or wrote world state would shift the logs
 //! within a round or two.
@@ -12,9 +13,9 @@
 use protocol::compact::{Entry, SharedState, Timed};
 use protocol::recovery::RState;
 use sim::smr::{
-    ClientModel, CommandReport, Proto, SmrReport, SmrScenario, SmrState, TrafficPhase,
-    grid_observes_census, point_mass_pmf, run_smr_grid_observed, run_smr_lean_observed,
-    run_smr_observed,
+    ClientModel, CommandReport, Proto, SmrReport, SmrScenario, SmrState, SmrSummary, TrafficPhase,
+    grid_observes_census, point_mass_pmf, run_smr_flat_observed, run_smr_grid_observed,
+    run_smr_lean_observed, run_smr_observed,
 };
 use sim::{BlockSchedule, BlockTarget, BlockWindow, Config};
 use std::hint::black_box;
@@ -141,6 +142,17 @@ fn grid(scenario: &SmrScenario) -> Arm {
         report,
         trace,
     }
+}
+
+/// The flat arm has no report; its node trace, its summary and how many commands it retired.
+fn flat(scenario: &SmrScenario) -> (Trace, SmrSummary, usize) {
+    let mut trace = Trace::new();
+    let mut retired = 0;
+    let summary = run_smr_flat_observed(scenario, &mut |state| {
+        record(state, scenario.n, &mut trace);
+        retired = state.command_residency().0;
+    });
+    (trace, summary, retired)
 }
 
 fn assert_executed_agrees(reference: &Executed, got: &Executed, at: &str) {
@@ -306,6 +318,26 @@ fn assert_observers_inert(scenario: &SmrScenario) -> Arm {
     }
     assert_arm_agrees(&reference, &lean);
     assert_arm_agrees(&reference, &grid);
+
+    let (trace, mut summary, retired) = flat(scenario);
+    assert!(
+        retired > 0,
+        "the flat arm retired no command, so retirement was not exercised"
+    );
+    assert_arm_agrees(
+        &reference,
+        &Arm {
+            label: "flat (retiring, rows folded)",
+            report: reference.report.clone(),
+            trace,
+        },
+    );
+    summary.spill_path = None;
+    assert_eq!(
+        summary,
+        SmrSummary::from_report(&reference.report, scenario),
+        "flat: summary"
+    );
     reference
 }
 

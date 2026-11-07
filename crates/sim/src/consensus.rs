@@ -5,8 +5,8 @@ use protocol::MedianNode;
 pub(crate) mod blocking;
 pub use blocking::mask_schedule;
 use blocking::{
-    Blocking, adaptive_mask, adjust_sticky_mask, compile_blocking, fraction_count, round_mask,
-    sample_blocked, sticky_with_background,
+    SnapshotDelay, adjust_sticky_mask, ceil_fraction_count, check_scenario_fit, checked_mask,
+    compile_blocking, fraction_count, fraction_in_range, sample_blocked, sticky_with_background,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -22,8 +22,60 @@ pub struct Scenario {
     pub init: Init,
     pub max_rounds: usize,
     pub schedule: BlockSchedule,
+    /// Component id per node: replies cross only within a component. This is link-level
+    /// isolation, an extension beyond Def 1.1, which blocks whole servers. Partitioned nodes are
+    /// neither blocked nor counted as non-useful in `RoundMetrics`, and a partitioned run never
+    /// stops early on unanimity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition: Option<Vec<u32>>,
+}
+
+impl Scenario {
+    /// The rules a spec enforces on parse, for scenarios built directly in Rust.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.n < 1 {
+            return Err("n must be at least 1".into());
+        }
+        self.cfg.check().map_err(|e| e.to_string())?;
+        check_partition(self.partition.as_deref(), self.n)?;
+        self.init.validate()?;
+        self.schedule.validate(self.n)
+    }
+}
+
+impl Init {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Init::Split { fraction } => fraction_in_range("split fraction", *fraction),
+            Init::UniformRandom { k } if *k < 1 => {
+                Err("uniform_random k must be at least 1".into())
+            }
+            Init::EvenSplit { values } if *values < 1 => {
+                Err("even_split values must be at least 1".into())
+            }
+            Init::Weighted { weights, range } => {
+                crate::smr::validate_weights("weighted init", "weights", weights)?;
+                if *range < weights.len() as u64 {
+                    return Err(format!(
+                        "weighted range {range} smaller than its {} buckets",
+                        weights.len()
+                    ));
+                }
+                Ok(())
+            }
+            Init::WithUndecided {
+                useful_fraction,
+                inner,
+            } => {
+                if matches!(**inner, Init::WithUndecided { .. }) {
+                    return Err("nested with_undecided is not supported".into());
+                }
+                fraction_in_range("useful_fraction", *useful_fraction)?;
+                inner.validate()
+            }
+            Init::UniformRandom { .. } | Init::EvenSplit { .. } | Init::Distinct => Ok(()),
+        }
+    }
 }
 
 // Target sampling stays unrestricted; cross-component targets just never answer (RNG stream unchanged).
@@ -54,10 +106,13 @@ pub enum BlockSchedule {
     Permanent {
         fraction: f64,
     },
+    /// Overlapping windows block the union of their nodes.
     Windows(Vec<BlockWindow>),
     PerRoundFractions(Vec<f64>),
-    /// α = 0 adaptive blocking; the name is a frozen mislabel kept for replay (1-late is `AdaptiveAlphaLate { alpha: 1 }`).
-    Adaptive1Late {
+    /// 0-late adaptive blocking: B_t reads the holders at the beginning of round t, one round later
+    /// than Def 1.1 allows. A stress adversary outside the paper's model; the 1-late adversary is
+    /// `AdaptiveAlphaLate { alpha: 1 }`.
+    Adaptive0Late {
         fraction: f64,
         policy: AdaptivePolicy,
     },
@@ -67,9 +122,33 @@ pub enum BlockSchedule {
         alpha: u32,
         policy: AdaptivePolicy,
     },
+    /// A sticky set adjusted to each round's target fraction, plus a fresh `background` sample
+    /// blocked in the same round. The blocked set is their union, so a round blocks between
+    /// max(target, background) and target + background of the nodes; `RoundMetrics::blocked`
+    /// holds the realised count, which exceeds the declared target fraction when the two differ.
     PerRoundSticky {
         background: f64,
         targets: Vec<f64>,
+    },
+    /// Exploratory, not registered thesis evidence: the worst-case 1-late β-blocking adversary
+    /// for availability (thesis/supervisor/optimal-adversary, proof v5). Every round blocks
+    /// ⌊fraction·n⌋ servers drawn uniformly from those it did not block the round before.
+    /// Needs fraction ≤ 1/2 (else too few fresh servers). "Previous round" means its own last
+    /// mask: SMR `manual_blocks` are unioned on afterwards and are invisible to it.
+    /// Worst case for availability only: it speeds up two-value agreement versus blocking nobody
+    /// (optimal-adversary README), so it is no agreement stress test.
+    Disjoint {
+        fraction: f64,
+    },
+    /// Exploratory, not registered thesis evidence: the worst-case 1-late β-blocking adversary
+    /// against two-value agreement (thesis/supervisor/optimal-adversary). Plays the exact DP's
+    /// optimal action for the state (|B_{t−1}|, value counts of U_{t−1}) from a per-(n, ⌊βn⌋)
+    /// table in `crates/sim/data/noise_controller/`; round 1 acts on the DP's start state
+    /// (all n servers, split ⌊n/2⌋ : ⌈n/2⌉). Refused unless the scenario is the DP's model:
+    /// the (6,3) rule, no partition, init `UniformRandom { k: 2 }` (iid, so U_1 is binomial).
+    /// Alg-1 only; panics without a table for (n, ⌊βn⌋) or when U_{t−1} holds more than two values.
+    NoiseController {
+        fraction: f64,
     },
 }
 
@@ -110,11 +189,82 @@ pub enum Init {
     },
 }
 
+/// What holds at the end of the run. Def 1.2 agreement and availability are reported separately (p. 6);
+/// the paper leaves how to classify them open, so the convention is fixed here.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Outcome {
-    Agreement { value: Value, rounds: usize },
+    /// All value holders hold one value from round `rounds` on. Unanimity cannot be undone, and the
+    /// all-⊥ state counts as agreement on ⊥ (p. 19), so extinction after unanimity stays an agreement.
+    /// `rounds` is the first round after which the holders are unanimous. Def 1.2 tests the useful
+    /// servers of a round r, those holding a value at its start and not blocked in it; the first
+    /// such r with unanimity is `rounds` or `rounds + 1`, never earlier.
+    Agreement {
+        value: Value,
+        rounds: usize,
+        availability: Availability,
+    },
+    /// Every node is ⊥ at round `rounds` without a single-value unanimity beforehand.
     AllUndecided { rounds: usize },
+    /// The horizon was reached with several values still held.
     NoConvergence { rounds: usize },
+}
+
+/// Whether the system is still live when the run ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Availability {
+    /// At least a third of the nodes hold a value after the last round.
+    Held,
+    /// Fewer than a third hold a value after the last round (`at`): the regime where the median
+    /// rule trivially drives everyone to ⊥ (p. 19).
+    Collapsing { at: usize },
+    /// Every node is ⊥ since round `at`.
+    Extinct { at: usize },
+}
+
+impl Outcome {
+    /// Agreement with availability intact at the end of the run.
+    pub fn survived(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Agreement {
+                availability: Availability::Held,
+                ..
+            }
+        )
+    }
+
+    /// Round at which every node became ⊥, if the run ended in extinction.
+    pub fn extinction_round(&self) -> Option<usize> {
+        match self {
+            Outcome::AllUndecided { rounds }
+            | Outcome::Agreement {
+                availability: Availability::Extinct { at: rounds },
+                ..
+            } => Some(*rounds),
+            _ => None,
+        }
+    }
+
+    /// Row label and round for run tables; only "agreement" counts as survival.
+    pub fn label(&self) -> (&'static str, usize) {
+        match self {
+            Outcome::Agreement {
+                availability: Availability::Held,
+                rounds,
+                ..
+            } => ("agreement", *rounds),
+            Outcome::Agreement {
+                availability: Availability::Collapsing { at },
+                ..
+            } => ("collapsing", *at),
+            Outcome::Agreement {
+                availability: Availability::Extinct { at },
+                ..
+            }
+            | Outcome::AllUndecided { rounds: at } => ("died", *at),
+            Outcome::NoConvergence { rounds } => ("censored", *rounds),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -245,6 +395,7 @@ impl SimState {
     }
 
     pub fn step_masked(&mut self, blocked: &[bool]) -> RoundStatus {
+        assert_eq!(blocked.len(), self.n, "a mask names every node");
         self.step_with(blocked)
     }
 
@@ -272,6 +423,17 @@ impl SimState {
             .collect()
     }
 
+    /// Value counts of this round's useful set: current holders not in `blocked`, ascending by value.
+    pub(crate) fn useful_value_counts(&self, blocked: &[bool]) -> Vec<(Value, usize)> {
+        let mut counts = std::collections::BTreeMap::new();
+        for (node, _) in self.nodes.iter().zip(blocked).filter(|(_, b)| !**b) {
+            if let Some(v) = node.answer() {
+                *counts.entry(v).or_insert(0) += 1;
+            }
+        }
+        counts.into_iter().collect()
+    }
+
     pub fn round(&self) -> usize {
         self.round
     }
@@ -286,6 +448,13 @@ impl SimState {
 
     pub fn agreed_since(&self) -> Option<(Value, usize)> {
         self.agreed_since
+    }
+
+    /// Whether `status` can never change again, given that no further round blocks anyone.
+    /// Unanimity with every node holding a value is stable only when every reply can arrive,
+    /// which a partition prevents: cross-component targets never answer.
+    pub fn is_absorbed(&self, status: &RoundStatus, no_more_blocking: bool) -> bool {
+        status.agreed.is_some() && status.all_hold && no_more_blocking && self.partition.is_none()
     }
 
     pub fn into_parts(self) -> (Vec<RoundMetrics>, Option<Trace>) {
@@ -377,6 +546,9 @@ pub(crate) fn run_inner(
     scenario: &Scenario,
     record_trace: bool,
 ) -> (Outcome, Vec<RoundMetrics>, Option<Trace>) {
+    scenario
+        .validate()
+        .unwrap_or_else(|e| panic!("invalid scenario: {e}"));
     let n = scenario.n;
     let mut state = SimState::new(
         n,
@@ -387,57 +559,72 @@ pub(crate) fn run_inner(
         scenario.partition.as_deref(),
     );
 
+    check_scenario_fit(
+        &scenario.schedule,
+        scenario.cfg,
+        &scenario.init,
+        scenario.partition.as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     // Blocking compiles before round 1; declaration order is part of the RNG stream.
-    let blocking = compile_blocking(&scenario.schedule, n, state.rng_mut());
-    let mut sticky_mask = vec![false; n];
-    let mut holder_history: std::collections::VecDeque<Vec<usize>> =
-        std::collections::VecDeque::new();
+    let mut blocking = compile_blocking(&scenario.schedule, n, state.rng_mut());
+    let mut delay = SnapshotDelay::new(blocking.knowledge());
 
     for round in 1..=scenario.max_rounds {
-        let mask = match &blocking {
-            Blocking::Adaptive { count } if round > 1 => {
-                let holders = state.holder_ids();
-                adaptive_mask(state.rng_mut(), &holders, n, *count)
-            }
-            Blocking::Adaptive { count } => sample_blocked(state.rng_mut(), n, *count),
-            Blocking::AdaptiveAlpha { count, alpha } => {
-                if holder_history.len() > *alpha as usize {
-                    adaptive_mask(state.rng_mut(), &holder_history[0], n, *count)
-                } else {
-                    sample_blocked(state.rng_mut(), n, *count)
-                }
-            }
-            _ => round_mask(&blocking, round, &mut sticky_mask, n, state.rng_mut()),
-        };
+        let mask = checked_mask(blocking.as_mut(), &delay.view(round), state.rng_mut(), n);
+        delay.record_useful(|| state.useful_value_counts(&mask));
         let status = state.step_masked(&mask);
-        if let Blocking::AdaptiveAlpha { alpha, .. } = &blocking {
-            holder_history.push_back(state.holder_ids());
-            if holder_history.len() > *alpha as usize + 1 {
-                holder_history.pop_front();
-            }
-        }
+        delay.record(|| state.holder_ids());
 
         if status.all_undecided {
+            let outcome = match state.agreed_since() {
+                Some((value, rounds)) => Outcome::Agreement {
+                    value,
+                    rounds,
+                    availability: Availability::Extinct { at: round },
+                },
+                None => Outcome::AllUndecided { rounds: round },
+            };
             let (metrics, trace) = state.into_parts();
-            return (Outcome::AllUndecided { rounds: round }, metrics, trace);
+            return (outcome, metrics, trace);
         }
         // Absorbing only if all hold and nobody can be blocked later: with ⊥ nodes, holders can still go extinct.
-        if status.agreed.is_some() && status.all_hold && blocking.done_blocking_after(round) {
+        if state.is_absorbed(&status, blocking.done_blocking_after(round)) {
             let (value, rounds) = state.agreed_since().expect("agreed implies recorded");
             let (metrics, trace) = state.into_parts();
-            return (Outcome::Agreement { value, rounds }, metrics, trace);
+            let outcome = Outcome::Agreement {
+                value,
+                rounds,
+                availability: Availability::Held,
+            };
+            return (outcome, metrics, trace);
         }
     }
     // The median rule never invents values, so a single surviving value is final.
-    let outcome = if let Some((value, rounds)) = state.agreed_since() {
-        Outcome::Agreement { value, rounds }
-    } else {
-        Outcome::NoConvergence {
+    let outcome = match state.agreed_since() {
+        Some((value, rounds)) => Outcome::Agreement {
+            value,
+            rounds,
+            availability: horizon_availability(state.metrics(), n, scenario.max_rounds),
+        },
+        None => Outcome::NoConvergence {
             rounds: scenario.max_rounds,
-        }
+        },
     };
     let (metrics, trace) = state.into_parts();
     (outcome, metrics, trace)
+}
+
+fn horizon_availability(metrics: &[RoundMetrics], n: usize, horizon: usize) -> Availability {
+    let holders = metrics
+        .last()
+        .expect("an agreement implies a round ran")
+        .holders as usize;
+    if holders * 3 < n {
+        Availability::Collapsing { at: horizon }
+    } else {
+        Availability::Held
+    }
 }
 
 /// One weighted bucket draw (exactly one f64); the SMR traffic count-draw shares this shape.
@@ -458,14 +645,14 @@ pub fn draw_weighted_index(rng: &mut ChaCha12Rng, weights: &[f64]) -> usize {
 /// One node's initial value; call for i in 0..n over one RNG, since the draw order is the assignment.
 pub fn initial_state(init: &Init, i: usize, n: usize, rng: &mut ChaCha12Rng) -> Option<Value> {
     match init {
-        Init::Split { fraction } => Some(if (i as f64) < fraction * n as f64 {
+        Init::Split { fraction } => Some(if i < ceil_fraction_count(*fraction, n) {
             0
         } else {
             1
         }),
         Init::UniformRandom { k } => Some(rng.random_range(0..*k)),
         Init::Distinct => Some(i as Value),
-        Init::EvenSplit { values } => Some((i * values / n) as Value),
+        Init::EvenSplit { values } => Some((i as u128 * *values as u128 / n as u128) as Value),
         Init::Weighted { weights, range } => {
             let pick = draw_weighted_index(rng, weights);
             let m = weights.len() as u128;
@@ -483,7 +670,7 @@ pub fn initial_state(init: &Init, i: usize, n: usize, rng: &mut ChaCha12Rng) -> 
             useful_fraction,
             inner,
         } => {
-            let useful = (useful_fraction * n as f64).ceil() as usize;
+            let useful = ceil_fraction_count(*useful_fraction, n);
             (i < useful)
                 .then(|| initial_state(inner, i, useful.max(1), rng))
                 .flatten()
@@ -513,6 +700,6 @@ fn population_state(nodes: &[MedianNode]) -> Population {
     if !any_value {
         return Population::AllUndecided;
     }
-    // Def 1.2: all value-holding servers agree; ⊥ nodes allowed (instantaneous check).
+    // All value-holding servers agree after this round; ⊥ nodes allowed (see `Outcome::Agreement` for how this relates to Def 1.2).
     Population::Agreed(agreed.expect("any_value implies Some"))
 }

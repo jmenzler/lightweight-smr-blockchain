@@ -1,17 +1,20 @@
 //! Collector goldens: byte-exact sim-schema CSV, the persistent-unanimity
-//! convergence rule (incl. its sharpest edge: unanimity broken then
-//! restored), message aggregation under the F6 accounting rule, gates.
+//! convergence rule, message aggregation under the F6 accounting rule, gates.
 
-use network_node::collect::{aggregate, aggregate_smr};
+use network_node::collect::{ClientLog, aggregate, aggregate_smr};
 use network_node::record::{PostState, RoundRecord, TrackedDigest};
 use network_node::spec::NodeRunSpec;
 
-fn spec() -> NodeRunSpec {
-    NodeRunSpec::from_json(
-        r#"{"scenario":{"median":{"n":2,"seed":1,"k":6,"ell":3,
-            "init":{"kind":"distinct"},"max_rounds":4}},"sync":"timer"}"#,
-    )
+fn spec_rounds(rounds: usize) -> NodeRunSpec {
+    NodeRunSpec::from_json(&format!(
+        r#"{{"scenario":{{"median":{{"n":2,"seed":1,"k":6,"ell":3,
+            "init":{{"kind":"distinct"}},"max_rounds":{rounds}}}}},"sync":"timer"}}"#
+    ))
     .expect("spec")
+}
+
+fn spec() -> NodeRunSpec {
+    spec_rounds(4)
 }
 
 fn rec(r: u64, blocked: bool, snap_held: bool, post: Option<u64>) -> RoundRecord {
@@ -22,10 +25,12 @@ fn rec(r: u64, blocked: bool, snap_held: bool, post: Option<u64>) -> RoundRecord
         post: PostState::Value(post),
         replies: 0,
         req_sent: if blocked { 0 } else { 6 },
-        rep_sent: 0,
+        req_recv: if blocked { 0 } else { 6 },
+        rep_sent: 2,
         rep_recv: 2,
         app_sent: 0,
         app_recv: 0,
+        app_blocked: 0,
         cli_recv: 0,
         acks: 0,
         bytes_out: 100,
@@ -33,7 +38,12 @@ fn rec(r: u64, blocked: bool, snap_held: bool, post: Option<u64>) -> RoundRecord
         late_rep: 0,
         late_app: 0,
         dropped_past: 0,
+        late_cli: 0,
+        early_cli: 0,
+        cli_blocked: 0,
+        sn_order_violation: false,
         encode_err: 0,
+        transport_err: 0,
         exec_prefix: Vec::new(),
         t_last_reply_us: 0,
         t_step_done_us: 0,
@@ -72,32 +82,31 @@ fn summary_aggregates_round_timing_tails() {
 
 #[test]
 fn metrics_csv_is_byte_exact_sim_schema() {
-    // Node 0: holds 7 all four rounds, blocked in round 2.
-    // Node 1: ⊥ in r1-r2, adopts 7 in r3.
+    // A trace Alg 1 can produce: node 0 holds 7 throughout; node 1 holds 9 in r1, is blocked
+    // (⊥) in r2 and adopts 7 from node 0's reply in r3.
     let records = vec![
         vec![
             rec(1, false, true, Some(7)),
-            rec(2, true, true, None),
-            rec(3, false, false, Some(7)),
+            rec(2, false, true, Some(7)),
+            rec(3, false, true, Some(7)),
             rec(4, false, true, Some(7)),
         ],
         vec![
-            rec(1, false, true, None),
-            rec(2, false, false, None),
+            rec(1, false, true, Some(9)),
+            rec(2, true, true, None),
             rec(3, false, false, Some(7)),
             rec(4, false, true, Some(7)),
         ],
     ];
     let out = aggregate(&records, &spec()).expect("aggregate");
     let want = "round,holders,undecided,blocked,useful,distinct_values\n\
-                1,1,1,0,2,1\n\
-                2,0,2,1,0,0\n\
-                3,2,0,0,0,1\n\
+                1,2,0,0,2,2\n\
+                2,1,1,1,1,1\n\
+                3,2,0,0,1,1\n\
                 4,2,0,0,2,1\n";
     assert_eq!(out.metrics_csv, want);
-    // unanimity holds from r1 (holders {7}), breaks at r2 (no holders),
-    // returns at r3 and persists → convergence round 3.
-    assert_eq!(out.summary.convergence_round, Some(3));
+    // r1 holds two values; from r2 the holders are unanimous on 7 and stay so.
+    assert_eq!(out.summary.convergence_round, Some(2));
 }
 
 #[test]
@@ -161,13 +170,17 @@ fn empty_input_is_an_error_not_a_panic() {
 
 // --- SMR aggregation --------------------------------------------------------
 
-fn smr_spec() -> NodeRunSpec {
-    NodeRunSpec::from_json(
-        r#"{"scenario":{"smr":{"n":2,"seed":1,"k":6,"ell":3,"sigma":1.0,
-            "proto":{"kind":"compact","t_commit_rounds":3},"injections":[],
-            "max_rounds":2}},"sync":"timer"}"#,
-    )
+fn smr_spec_rounds(rounds: usize) -> NodeRunSpec {
+    NodeRunSpec::from_json(&format!(
+        r#"{{"scenario":{{"smr":{{"n":2,"seed":1,"k":6,"ell":3,"sigma":1.0,
+            "proto":{{"kind":"compact","t_commit_rounds":3}},"injections":[],
+            "max_rounds":{rounds}}}}},"sync":"timer"}}"#
+    ))
     .expect("spec")
+}
+
+fn smr_spec() -> NodeRunSpec {
+    smr_spec_rounds(2)
 }
 
 fn smr_rec(r: u64, log_len: Option<usize>, exec_len: usize, log_hash: Option<u64>) -> RoundRecord {
@@ -192,7 +205,15 @@ fn smr_metrics_csv_matches_the_ten_column_schema() {
             smr_rec(2, None, 1, None), // went ⊥
         ],
     ];
-    let out = aggregate_smr(&records, &smr_spec(), Some(&[2, 0])).expect("aggregate");
+    let out = aggregate_smr(
+        &records,
+        &smr_spec(),
+        Some(&ClientLog {
+            arrivals: vec![2, 0],
+            ..client_log(0)
+        }),
+    )
+    .expect("aggregate");
     let want = "round,nonbot_logs,blocked,useful,distinct_logs,max_log_len,min_executed_len,max_executed_len,arrivals,lcp_len\n\
                 1,2,0,2,1,3,1,1,2,1\n\
                 2,1,0,1,1,4,1,2,0,1\n";
@@ -243,7 +264,7 @@ fn encode_errors_fail_the_gates() {
     );
 }
 
-// --- strong safety + SMR landmarks ------------------------------------------
+// --- safety gate + SMR landmarks ------------------------------------------
 
 fn smr_rec_full(
     r: u64,
@@ -267,6 +288,7 @@ fn digest(op: u64, present: bool, pos: Option<usize>, prefix_hash: Option<u64>) 
     TrackedDigest {
         op,
         present,
+        in_log: present,
         pos,
         prefix_hash,
     }
@@ -290,7 +312,7 @@ fn agreeing_prefixes_of_different_lengths_stay_safe() {
     // Node b is one entry behind — a prefix, not a divergence.
     let a = vec![smr_rec_full(1, Some(1), vec![(1, 0xA1), (2, 0xB1)], vec![])];
     let b = vec![smr_rec_full(1, Some(1), vec![(1, 0xA1)], vec![])];
-    let out = aggregate_smr(&[a, b], &smr_spec(), None).expect("aggregate");
+    let out = aggregate_smr(&[a, b], &smr_spec_rounds(1), None).expect("aggregate");
     assert!(out.gates.safety_ok);
     assert!(out.gates.clean());
 }
@@ -457,4 +479,317 @@ fn transient_agreement_resets_the_te_candidate() {
         Some(4),
         "T_E restarts after the transient rounds-1..2 agreement breaks"
     );
+}
+
+// --- message reconciliation -------------------------------------------------
+
+fn two_nodes() -> Vec<Vec<RoundRecord>> {
+    vec![
+        vec![rec(1, false, true, Some(1))],
+        vec![rec(1, false, true, Some(1))],
+    ]
+}
+
+#[test]
+fn a_balanced_run_reconciles() {
+    let out = aggregate(&two_nodes(), &spec_rounds(1)).expect("aggregate");
+    assert!(out.gates.clean(), "{:?}", out.gates);
+}
+
+#[test]
+fn replies_sent_but_never_received_fail_the_gates() {
+    let mut records = two_nodes();
+    records[1][0].rep_recv = 0;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.rep_unreconciled, 2);
+    assert!(!out.gates.clean(), "2 replies vanished without a trace");
+}
+
+#[test]
+fn replies_counted_late_still_reconcile_but_fail_through_late_rep() {
+    let mut records = two_nodes();
+    records[1][0].rep_recv = 0;
+    records[1][0].late_rep = 2;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.rep_unreconciled, 0);
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn requests_sent_but_never_received_fail_the_gates() {
+    let mut records = two_nodes();
+    records[0][0].req_recv = 4;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.req_unreconciled, 2);
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn appends_lost_in_transit_fail_but_appends_to_blocked_servers_do_not() {
+    let mut records = two_nodes();
+    records[0][0].app_sent = 3;
+    records[1][0].app_recv = 2;
+    records[1][0].app_blocked = 1;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.app_unreconciled, 0);
+    assert!(out.gates.clean(), "{:?}", out.gates);
+    records[1][0].app_blocked = 0;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.app_unreconciled, 1);
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn transport_errors_fail_the_gates() {
+    let mut records = two_nodes();
+    records[0][0].transport_err = 1;
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert_eq!(out.gates.transport_err, 1);
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn smr_aggregation_applies_the_same_reconciliation() {
+    let mut a = smr_rec(1, Some(1), 0, Some(1));
+    a.rep_sent = 3;
+    let b = smr_rec(1, Some(1), 0, Some(1));
+    let out = aggregate_smr(&[vec![a], vec![b]], &smr_spec(), None).expect("aggregate");
+    assert_eq!(out.gates.rep_unreconciled, 1);
+    assert!(!out.gates.clean());
+}
+
+// --- value modes: what the population agreed on ------------------------------
+
+fn priority_spec() -> NodeRunSpec {
+    NodeRunSpec::from_json(
+        r#"{"scenario":{"priority":{"n":4,"seed":1,"k":6,"ell":3,
+            "init":{"kind":"distinct"},"max_rounds":2}},"sync":"timer"}"#,
+    )
+    .expect("spec")
+}
+
+fn gossip_spec() -> NodeRunSpec {
+    NodeRunSpec::from_json(
+        r#"{"scenario":{"gossip":{"n":4,"seed":1,"k":6,"ell":3,"holders":1,
+            "x":7,"x0":0,"max_rounds":2}},"sync":"timer"}"#,
+    )
+    .expect("spec")
+}
+
+fn all_hold(values: &[Option<u64>]) -> Vec<Vec<RoundRecord>> {
+    values
+        .iter()
+        .map(|v| vec![rec(1, false, true, *v), rec(2, false, true, *v)])
+        .collect()
+}
+
+#[test]
+fn gossip_extinction_is_agreement_on_x0_not_convergence() {
+    let out = aggregate(&all_hold(&[Some(0); 4]), &gossip_spec()).expect("aggregate");
+    assert_eq!(out.summary.agreed_value, Some(0));
+    assert_eq!(out.summary.agreed_round, Some(1));
+    assert_eq!(out.summary.convergence_round, None, "x went extinct");
+    assert_eq!(out.summary.target_holders, vec![0, 0]);
+}
+
+#[test]
+fn gossip_full_spread_converges_on_x() {
+    let out = aggregate(&all_hold(&[Some(7); 4]), &gossip_spec()).expect("aggregate");
+    assert_eq!(out.summary.agreed_value, Some(7));
+    assert_eq!(out.summary.convergence_round, Some(1));
+    assert_eq!(out.summary.target_value, Some(7));
+    assert_eq!(out.summary.target_holders, vec![4, 4]);
+}
+
+#[test]
+fn priority_agreement_below_the_maximum_is_not_convergence() {
+    // distinct init over n = 4: the maximum initial value is 3
+    let low = aggregate(&all_hold(&[Some(1); 4]), &priority_spec()).expect("aggregate");
+    assert_eq!(low.summary.target_value, Some(3));
+    assert_eq!(low.summary.agreed_value, Some(1));
+    assert_eq!(low.summary.convergence_round, None);
+    let max = aggregate(&all_hold(&[Some(3); 4]), &priority_spec()).expect("aggregate");
+    assert_eq!(max.summary.convergence_round, Some(1));
+}
+
+#[test]
+fn target_holders_count_only_servers_holding_the_target() {
+    let values = [Some(7), Some(0), Some(7), None];
+    let out = aggregate(&all_hold(&values), &gossip_spec()).expect("aggregate");
+    assert_eq!(out.summary.target_holders, vec![2, 2]);
+    assert_eq!(out.summary.agreed_value, None);
+}
+
+#[test]
+fn median_has_no_target_and_keeps_its_convergence_rule() {
+    let out = aggregate(&all_hold(&[Some(5); 2]), &spec()).expect("aggregate");
+    assert_eq!(out.summary.target_value, None);
+    assert!(out.summary.target_holders.is_empty());
+    assert_eq!(out.summary.agreed_value, Some(5));
+    assert_eq!(out.summary.convergence_round, Some(1));
+}
+
+#[test]
+fn summary_json_exports_the_agreed_value_and_target_holders() {
+    let out = aggregate(&all_hold(&[Some(0); 4]), &gossip_spec()).expect("aggregate");
+    let json: serde_json::Value =
+        serde_json::from_str(&network_node::collect::summary_json(&out)).expect("valid json");
+    assert_eq!(json["agreed_value"], 0);
+    assert_eq!(json["agreed_round"], 1);
+    assert!(json["convergence_round"].is_null());
+    assert_eq!(json["target_value"], 7);
+    assert_eq!(json["target_holders"], serde_json::json!([0, 0]));
+}
+
+#[test]
+fn late_client_commands_fail_the_gates() {
+    let mut records = two_nodes();
+    records[0][0].late_cli = 2;
+    let out = aggregate(&records, &spec()).expect("aggregate");
+    assert_eq!(out.gates.late_cli, 2);
+    assert!(!out.gates.clean());
+}
+
+// --- what the safety gate and the horizon gate check --------------------------
+
+#[test]
+fn a_held_value_nobody_started_with_fails_the_value_mode_gate() {
+    // distinct init at n = 2 starts the nodes on 0 and 1
+    let records = vec![
+        vec![rec(1, false, true, Some(0))],
+        vec![rec(1, false, true, Some(99))],
+    ];
+    let out = aggregate(&records, &spec_rounds(1)).expect("aggregate");
+    assert!(!out.gates.safety_ok);
+    assert!(
+        out.gates.network_clean(),
+        "a bad value is not a network fault"
+    );
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn a_run_cut_short_of_the_horizon_fails_even_when_every_node_stopped_alike() {
+    let records = vec![
+        vec![rec(1, false, true, Some(1)), rec(2, false, true, Some(1))],
+        vec![rec(1, false, true, Some(1)), rec(2, false, true, Some(1))],
+    ];
+    let out = aggregate(&records, &spec_rounds(4)).expect("aggregate");
+    assert!(!out.gates.rounds_consistent, "2 of 4 rounds on every node");
+    let out = aggregate(&records, &spec_rounds(2)).expect("aggregate");
+    assert!(out.gates.rounds_consistent);
+}
+
+#[test]
+fn a_safety_violation_leaves_the_network_gates_clean() {
+    let a = vec![smr_rec_full(1, Some(1), vec![(1, 0xA1)], vec![])];
+    let b = vec![smr_rec_full(1, Some(1), vec![(1, 0xA2)], vec![])];
+    let out = aggregate_smr(&[a, b], &smr_spec_rounds(1), None).expect("aggregate");
+    assert!(out.gates.network_clean());
+    assert!(!out.gates.safety_ok);
+    assert!(!out.gates.clean());
+}
+
+#[test]
+fn a_command_committed_before_it_covered_every_log_never_latches_t_b() {
+    // node a has executed op 700 and dropped it from its log while node b first receives it
+    let held = |in_log: bool| TrackedDigest {
+        op: 700,
+        present: true,
+        in_log,
+        pos: Some(0),
+        prefix_hash: Some(0xF0),
+    };
+    let a = vec![
+        smr_rec_full(1, Some(1), vec![], vec![held(false)]),
+        smr_rec_full(2, Some(1), vec![], vec![held(false)]),
+    ];
+    let b = vec![
+        smr_rec_full(1, Some(1), vec![], vec![held(true)]),
+        smr_rec_full(2, Some(1), vec![], vec![held(false)]),
+    ];
+    let out = aggregate_smr(&[a, b], &smr_spec(), None).expect("aggregate");
+    let lm = &out.landmarks[0];
+    assert_eq!(
+        lm.all_logs_round, None,
+        "the simulator's coverage latch needs the log"
+    );
+    assert_eq!(
+        lm.prefix_fixed_round,
+        Some(1),
+        "T_E still sees the executed copy"
+    );
+}
+
+#[test]
+fn client_log_sums_failures_and_keeps_the_command_line() {
+    let log = ClientLog::parse(
+        "{\"r\":1,\"arrivals\":2}\n{\"r\":1,\"sent\":5}\n{\"r\":1,\"lost\":1}\n{\"r\":1,\"starved\":0}\n\
+         {\"r\":2,\"arrivals\":0}\n{\"r\":2,\"sent\":1}\n{\"r\":2,\"lost\":2}\n{\"r\":2,\"starved\":4}\n{\"commands\":[]}",
+    )
+    .expect("parse");
+    assert_eq!(log.arrivals, vec![2, 0]);
+    assert_eq!((log.lost, log.starved, log.sent), (3, 4, 6));
+    assert_eq!(log.commands, "{\"commands\":[]}");
+    assert!(ClientLog::parse("{\"r\":1,\"typo\":1}").is_err());
+}
+
+fn client_log(sent: u64) -> network_node::collect::ClientLog {
+    network_node::collect::ClientLog {
+        arrivals: vec![0, 0],
+        lost: 0,
+        starved: 0,
+        sent,
+        commands: String::new(),
+    }
+}
+
+#[test]
+fn client_sends_reconcile_against_received_late_early_and_blocked_commands() {
+    let mut records = vec![
+        vec![
+            smr_rec(1, Some(1), 0, Some(1)),
+            smr_rec(2, Some(1), 0, Some(1)),
+        ],
+        vec![
+            smr_rec(1, Some(1), 0, Some(1)),
+            smr_rec(2, Some(1), 0, Some(1)),
+        ],
+    ];
+    records[0][0].cli_recv = 3;
+    records[0][1].late_cli = 1;
+    records[1][0].early_cli = 1;
+    records[1][1].cli_blocked = 2;
+    let out = aggregate_smr(&records, &smr_spec(), Some(&client_log(7))).expect("aggregate");
+    assert_eq!(out.gates.cli_unreconciled, 0);
+    assert_eq!((out.gates.late_cli, out.gates.early_cli), (1, 1));
+    let out = aggregate_smr(&records, &smr_spec(), Some(&client_log(9))).expect("aggregate");
+    assert_eq!(out.gates.cli_unreconciled, 2);
+    assert!(!out.gates.network_clean());
+}
+
+#[test]
+fn a_run_without_client_data_has_nothing_to_reconcile() {
+    let mut records = vec![vec![smr_rec(1, Some(1), 0, Some(1))]];
+    records[0][0].cli_recv = 3;
+    let out = aggregate_smr(&records, &smr_spec_rounds(1), None).expect("aggregate");
+    assert_eq!(out.gates.cli_unreconciled, 0);
+}
+
+#[test]
+fn an_sn_order_violation_fails_the_safety_check_but_not_the_network_gates() {
+    let mut records = vec![
+        vec![
+            smr_rec(1, Some(1), 0, Some(1)),
+            smr_rec(2, Some(1), 0, Some(1)),
+        ],
+        vec![
+            smr_rec(1, Some(1), 0, Some(1)),
+            smr_rec(2, Some(1), 0, Some(1)),
+        ],
+    ];
+    records[1][1].sn_order_violation = true;
+    let out = aggregate_smr(&records, &smr_spec(), None).expect("aggregate");
+    assert!(!out.gates.safety_ok);
+    assert!(out.gates.network_clean(), "{:?}", out.gates);
 }

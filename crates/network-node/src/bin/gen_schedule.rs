@@ -1,4 +1,5 @@
-//! Deterministic injection-schedule generator for an SMR spec's pinned `injections`.
+//! Deterministic injection-schedule generator for an SMR spec's `injections`.
+//! Targets stay unset (a fresh uniform server per attempt) unless `--pin-targets` is given.
 
 use network_node::cli::arg;
 
@@ -30,10 +31,12 @@ fn main() {
         .unwrap_or_else(|| die("--n required"))
         .parse()
         .unwrap_or_else(|_| die("--n must be a u32"));
+    let pin_targets = std::env::args().any(|a| a == "--pin-targets");
     let out = arg("--out").unwrap_or_else(|| die("--out required"));
 
-    let schedule = network_node::schedule::generate(seed, rounds, &pmf, clients, per_client, n)
-        .unwrap_or_else(|e| die(&e));
+    let schedule =
+        network_node::schedule::generate(seed, rounds, &pmf, clients, per_client, n, pin_targets)
+            .unwrap_or_else(|e| die(&e));
     let json = serde_json::to_string(&schedule).expect("schedule serializes");
     std::fs::write(&out, json).unwrap_or_else(|e| die(&format!("write {out}: {e}")));
 
@@ -44,6 +47,7 @@ fn main() {
         clients,
         per_client,
         n,
+        pin_targets,
     };
     let meta_path = format!("{out}.meta.json");
     let meta_json = serde_json::to_string(&meta).expect("meta serializes");

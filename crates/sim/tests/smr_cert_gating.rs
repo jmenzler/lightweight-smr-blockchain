@@ -158,7 +158,7 @@ fn a_cert_consumer_on_a_gated_off_run_panics_naming_the_flag() {
 #[test]
 fn the_gate_is_absent_from_the_wire_while_it_is_off() {
     let bare = r#"{"n":8,"seed":1,"k":6,"ell":3,"sigma":1.0,
-        "proto":{"kind":"recovery","t_window_rounds":4},
+        "proto":{"kind":"recovery","t_window_rounds":4,"resend_until_acked":false},
         "injections":[],"max_rounds":8}"#;
     let spec: SmrScenarioSpec = serde_json::from_str(bare).expect("a spec without the gate parses");
     assert!(!spec.certs, "an absent gate is off");
@@ -175,7 +175,7 @@ fn the_gate_is_absent_from_the_wire_while_it_is_off() {
 
     let mounted: SmrScenarioSpec = serde_json::from_str(
         r#"{"n":8,"seed":1,"k":6,"ell":3,"sigma":1.0,
-           "proto":{"kind":"recovery","t_window_rounds":4},
+           "proto":{"kind":"recovery","t_window_rounds":4,"resend_until_acked":false},
            "injections":[],"max_rounds":8,"certs":true}"#,
     )
     .expect("a spec naming the gate parses");

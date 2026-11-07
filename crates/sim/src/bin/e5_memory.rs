@@ -1,4 +1,5 @@
-//! Memory-per-node flatness runner under sustained load (Thm 5); run from the repo root.
+//! Uncommitted-pool flatness runner under sustained load (Thm 5's L_i term); run from the repo root.
+//! It gates max |L_i| only; the shared-state size and the per-client sn map are not measured.
 
 use rayon::prelude::*;
 use sim::analysis::ols_fit;
@@ -185,7 +186,7 @@ fn main() {
     }
 
     if failures.is_empty() {
-        println!("E5 PASS — all cells within registered criteria");
+        println!("E5 PASS — all cells within registered criteria (max |L_i| only)");
     } else {
         println!("E5 FAIL — outside criteria: {failures:?}");
         std::process::exit(1);

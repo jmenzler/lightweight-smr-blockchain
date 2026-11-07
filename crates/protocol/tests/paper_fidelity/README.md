@@ -1,6 +1,6 @@
-# Protocol paper-fidelity controls and expected-red contracts
+# Protocol paper-fidelity controls and alternative-reading checks
 
-This integration target combines independent passing controls and source-normative regressions with two ordinary ignored assertions for an unresolved timed-ordering interpretation. The ignored assertions state desired behavior and intentionally fail when run explicitly. They are bounded conformance evidence, not a second protocol implementation or a universal equivalence proof.
+This integration target combines independent passing controls and source-normative regressions with two sensitivity checks for the command-only reading of the median comparator. The paper admits (command, round stamp) as the comparison key (A5.OPEN.5), and the default uses it (DET-1). The sensitivity checks build the recipient with `StampTie::CommandsOnly` and require the command median, and they require that the default key does not produce it on the same fixture, so the fixture keeps separating the two readings. They are a sensitivity check on the alternative reading, not a fidelity requirement. They are bounded evidence, not a second protocol implementation or a universal equivalence proof.
 
 ## Module layout
 
@@ -35,7 +35,7 @@ The compact transition shape corresponds to published-v2 Algorithm 5 (p. 26), wh
 
 ## Passing controls
 
-The normal target has twelve passing checks:
+The normal target has fourteen passing checks:
 
 - three independent-oracle controls;
 - two independently reachable donor controls;
@@ -44,31 +44,23 @@ The normal target has twelve passing checks:
 - one compact logical-isolation control holding a public immutable reply log/state handle while the sender changes its log and commits a command;
 - one recovery logical-isolation control holding a public immutable reply log/checkpoint handle while the sender commits across a boundary;
 - one Algorithm 3 regression requiring an unblocked bottom-log extended node to amplify a newly received command;
-- one Algorithm 6 regression requiring recovery to inherit that bottom-log behavior; and
+- one Algorithm 6 regression requiring recovery to inherit that bottom-log behavior;
+- two alternative-reading sensitivity checks (below); and
 - one control showing that bare `RecoveryNode::wants_amplify` is sequence-agnostic. Future-sequence rejection belongs to the simulator's ACK-enabled adaptation, not Algorithm 6 itself.
 
 The isolation controls assert logical contents before and after mutation. They do not require a particular `Arc` identity and do not replace the shared path with test-created deep copies.
 
-## Ignored expected-red classifications
+## Alternative-reading sensitivity checks
 
-| Test | Classification | Published-v2 basis | Desired assertion |
+| Test | Classification | Published-v2 basis | Assertion |
 |---|---|---|---|
-| `inherited_command_order_compact` | Interpretation-dependent hypothesis pending a timed-log ordering ruling | Algorithm 3 defines lexicographic ordering over command sequences (p. 20); Algorithm 5 applies the median to timed compact logs (p. 26), while Section 4 discusses age agreement (pp. 25, 27) without defining whether age participates in strict command ordering | With replies A/B/C selected at indices `[0,1,2]`, the recipient starts with `seed,a,c`; suffix and stamp winner remain unconstrained |
-| `inherited_command_order_recovery` | Interpretation-dependent hypothesis pending the same timed-log ruling | Algorithm 6 inherits the extended median rule (p. 31) and does not independently settle the timed comparator | The recovery recipient starts with `seed,a,c`; suffix and stamp winner remain unconstrained |
+| `command_only_median_alternative_compact` | Alternative reading (A5.OPEN.5): the comparator ignores round stamps | Algorithm 3 defines lexicographic ordering over command sequences (p. 20); Algorithm 5 applies the median to timed compact logs (p. 26), while Section 4 discusses age agreement (pp. 25, 27) without defining whether age participates in strict command ordering | With replies A/B/C selected at indices `[0,1,2]`, a `CommandsOnly` recipient starts with `seed,a,c` and a default-key recipient does not; suffix and stamp winner remain unconstrained |
+| `command_only_median_alternative_recovery` | Alternative reading (A5.OPEN.5), as above | Algorithm 6 inherits the extended median rule (p. 31) and does not independently settle the timed comparator | A `CommandsOnly` recovery recipient starts with `seed,a,c` and a default-key one does not; suffix and stamp winner remain unconstrained |
 
 ## Commands
-
-Normal passing controls:
 
 ```text
 cargo test -p protocol --test paper_fidelity
 ```
 
-Each expected-red contract must be run separately and serially:
-
-```text
-cargo test -p protocol --test paper_fidelity inherited_command_order_compact -- --exact --ignored --test-threads=1
-cargo test -p protocol --test paper_fidelity inherited_command_order_recovery -- --exact --ignored --test-threads=1
-```
-
-The normal command currently has twelve passing checks and two ignored timed-ordering hypotheses.
+The command runs fourteen passing checks, the two sensitivity checks among them.

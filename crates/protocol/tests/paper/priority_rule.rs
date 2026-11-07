@@ -1,4 +1,5 @@
-use protocol::{Config, MedianNode, PriorityNode, largest};
+use crate::law;
+use protocol::{Config, PriorityNode, largest};
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use rstest::rstest;
@@ -44,16 +45,23 @@ fn adopted_value_is_always_one_of_the_replies() {
 }
 
 #[test]
-fn priority_rule_is_the_f_largest_instance() {
-    // Definition 3.5 = the (k,ℓ,f)-rule with f = largest
+fn adopted_value_follows_the_largest_of_a_uniform_ell_subset() {
+    // Def 3.5: the largest of ℓ replies chosen uniformly at random, not of all replies.
+    // Over the C(6,3) = 20 subsets of [11,5,42,7,23,5] the maximum is 42 in C(5,2) = 10,
+    // 23 in C(4,2) = 6, 11 in C(3,2) = 3, 7 in C(2,2) = 1 and never 5. A max over all replies
+    // always gives 42, and a content-chosen subset (the ℓ largest) does too.
     let replies = [11, 5, 42, 7, 23, 5];
-    for seed in 0..50u64 {
-        let mut a = PriorityNode::new(1, Config::default());
-        let mut b = MedianNode::new(1, Config::default());
-        a.step(&replies, &mut ChaCha12Rng::seed_from_u64(seed));
-        b.step_with(&replies, &mut ChaCha12Rng::seed_from_u64(seed), largest);
-        assert_eq!(a.x_i(), b.x_i());
-    }
+    let adopted: Vec<_> = (0..law::TRIALS)
+        .map(|seed| {
+            let mut n = PriorityNode::new(1, Config::default());
+            n.step(&replies, &mut ChaCha12Rng::seed_from_u64(seed));
+            n.x_i().expect("at least ℓ replies")
+        })
+        .collect();
+    law::assert_follows_law(
+        &adopted,
+        &[(5, 0.0), (7, 0.05), (11, 0.15), (23, 0.3), (42, 0.5)],
+    );
 }
 
 #[test]
@@ -63,4 +71,12 @@ fn undecided_node_is_silent_and_recovers() {
     assert_eq!(n.answer(), None);
     n.step(&[4, 4, 8], &mut rng());
     assert_eq!(n.x_i(), Some(8));
+}
+
+#[test]
+fn own_value_is_not_an_input_to_the_maximum() {
+    // Definition 3.5: the largest of the chosen replies, whatever the own value was
+    let mut n = PriorityNode::new(9, Config::default());
+    n.step(&[3, 5, 1], &mut rng());
+    assert_eq!(n.x_i(), Some(5));
 }

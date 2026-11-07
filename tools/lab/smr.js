@@ -5,10 +5,13 @@ import { S, $, PALETTE, AUTO_CLIENT_BASE } from './state.js';
 import { post } from './engine.js';
 import { downloadJson } from './form.js';
 import { createPmfEditor } from './pmf-editor.js';
-import { onCertsSnapshot, onChainSnapshot, freezeChain, useEntrySelect, resetCertsDrawer, onVerifyTallies } from './smr-certs.js';
-import { drawTimeline, useSpreadCurves } from './smr-timeline.js';
+import { onCertsSnapshot, onChainSnapshot, freezeChain, useEntrySelect, resetCertsDrawer, onVerifyTallies, markCertsLoading, endCertsLoading } from './smr-certs.js';
+import { applyReportDelta, EMPTY_REPORT } from './smr-delta.js';
+import { recRows, rStarScan, releaseRound, lastLatched, lawText, programBeta, smrEnd, endText, END_LABEL } from './smr-derive.js';
+import { renderViewport, resetViewport } from './smr-viewport.js';
+import { renderDrawer, resetDrawer, blockDrawerOpen, useBlockDrawerOpen } from './smr-drawer.js';
 
-S.smr = { report: null, live: null, scenario: null, resultContext: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'extended', chart: 'spread', tw: null, program: null, detail: null, pin: null, manualBlocks: new Set(), grid: 'watched', batchSel: null, chain: null, ack: false, certsRec: false };
+S.smr = { report: null, live: null, scenario: null, ctx: null, pending: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'extended', speed: 1, handle: false, srvOpen: false, chart: 'spread', program: null, detail: null, pin: null, manualBlocks: new Set(), gridMode: null, gridSort: false, chain: null, ack: false, end: null };
 
 /* ---------- arrival traffic (engine pmf) ---------- */
 
@@ -36,18 +39,7 @@ $('smrArrRate').addEventListener('change', () => {
   if ($('smrArrRate').value === 'custom') ARR.draw();
 });
 
-/* ---------- shell: popovers, audit drawer, chart tabs, summary chip ---------- */
-
-for (const pop of [$('smrInjectPop'), $('smrTrafficPop')]) {
-  pop.querySelector('.popBtn').addEventListener('click', e => {
-    e.stopPropagation();
-    for (const o of document.querySelectorAll('.pop.open')) if (o !== pop) o.classList.remove('open');
-    pop.classList.toggle('open');
-  });
-}
-document.addEventListener('click', e => {
-  if (!e.target.closest('.pop')) for (const o of document.querySelectorAll('.pop.open')) o.classList.remove('open');
-});
+/* ---------- shell: audit drawer, chart tabs, config line ---------- */
 
 $('auditClosedTag').addEventListener('click', () => setAuditOpen(true));
 $('auditCollapse').addEventListener('click', () => setAuditOpen(false));
@@ -58,49 +50,85 @@ function setAuditOpen(open) {
   $('auditOpenWrap').classList.toggle('hidden', !open);
 }
 
-for (const b of document.querySelectorAll('#smrChartTabs .ct')) {
-  b.addEventListener('click', () => {
-    S.smr.chart = b.dataset.chart;
-    for (const x of document.querySelectorAll('#smrChartTabs .ct')) x.classList.toggle('on', x === b);
-    if (S.smr.report) drawSpread(S.smr.report);
-  });
+// Everything the page shows about a session is read from this captured
+// context, never from the editable form, which may change mid-session.
+function sessionCtx(spec, kind, sticky, program = null) {
+  const p = spec.proto;
+  return {
+    kind, spec, sticky, program, n: spec.n, maxRounds: spec.max_rounds, proto: p.kind,
+    tw: p.kind === 'recovery' ? p.t_window_rounds : null,
+    T: p.kind === 'recovery' ? p.t_window_rounds : p.kind === 'compact' ? p.t_commit_rounds : null,
+    certsRec: p.kind === 'recovery' && !!p.resend_until_acked,
+  };
 }
 
-function sumChipText() {
-  const proto = S.smr.proto === 'compact' ? `compact T=${$('smrT').value}`
-    : S.smr.proto === 'recovery' ? `recovery T=${$('smrTw').value}` : 'extended';
-  const beta = +$('smrBeta').value;
-  const mode = $('smrLiveMode').value;
-  const rate = $('smrArrRate').value;
-  return `n=${$('smrN').value} · seed ${$('smrSeed').value} · ${proto}` +
-    (beta ? ` · β ${mode} ${beta}%` : '') + (rate ? ` · ${rate === 'custom' ? 'pmf' : rate + '/r'}` : '') + ' ▾';
+function blockingText(spec, sticky, kind, program) {
+  const s = spec.schedule;
+  if (program) return `scheduled program, ${program.length} segment${program.length === 1 ? '' : 's'}`;
+  if (s?.fractions) return `scheduled program, ${s.fractions.length} rounds`;
+  if (kind === 'live') return sticky ? `sticky (slider + ${Math.round(s.fraction * 100)}% background)` : `fresh ${Math.round(s.fraction * 100)}% (live slider)`;
+  if (s?.kind === 'fresh_per_round') return `fresh ${Math.round(s.fraction * 100)}%`;
+  return 'none';
 }
-function scenarioChipText(spec) {
-  const proto = spec.proto.kind === 'compact' ? `compact T=${spec.proto.t_commit_rounds}`
-    : spec.proto.kind === 'recovery' ? `recovery T=${spec.proto.t_window_rounds}` : 'extended';
-  const schedule = spec.schedule;
-  const beta = schedule?.kind === 'fresh_per_round' && schedule.fraction
-    ? ` · β fresh ${schedule.fraction * 100}%`
-    : schedule?.fractions ? ` · β replay ${schedule.fractions.length} rounds` : '';
-  return `n=${spec.n} · seed ${spec.seed} · ${proto}${beta} ▾`;
+function trafficText(traffic) {
+  if (!traffic) return 'off';
+  const pmf = traffic.arrivals_pmf;
+  if (!pmf) return `${traffic.phases.length} phases`;
+  const total = pmf.reduce((a, w) => a + w, 0);
+  return `≈ ${(pmf.reduce((a, w, i) => a + i * w, 0) / total).toFixed(2)} commands / round`;
+}
+function configLine(ctx) {
+  const { spec } = ctx;
+  return [`${spec.n} servers`, ctx.proto, ctx.T ? `T ${ctx.T}` : null, `blocking ${blockingText(spec, ctx.sticky, ctx.kind, ctx.program)}`, `seed ${spec.seed}`]
+    .filter(Boolean).join(' · ');
+}
+function configRows(ctx) {
+  const { spec } = ctx;
+  return [
+    ['protocol', ctx.proto + (ctx.T ? `, T ${ctx.T}` : '')],
+    ctx.proto === 'recovery' ? ['certificates', ctx.certsRec ? 'on (thesis construction)' : 'off'] : null,
+    ['servers', spec.n], ['seed', spec.seed], ['σ', spec.sigma], ['max rounds', spec.max_rounds],
+    ['blocking', blockingText(spec, ctx.sticky, ctx.kind, ctx.program)],
+    ['traffic', trafficText(spec.traffic)],
+    ['injections', spec.injections.length],
+  ].filter(Boolean);
 }
 
-function sessionStarted(summary = sumChipText()) {
-  $('smrSumChip').textContent = summary;
+function sessionStarted(ctx) {
+  S.smr.ctx = ctx;
+  S.smr.safetyRound = null;
+  S.smr.blockSel = null;
+  resetViewport();
+  resetDrawer();
+  $('smrSumChip').textContent = configLine(ctx) + ' ▾';
   $('smrSumChip').classList.remove('hidden');
+  $('smrCfgPop').innerHTML = configRows(ctx).map(([k, v]) =>
+    `<div class="cfgRow"><span class="k">${k}</span><span class="v mono">${v}</span></div>`).join('') +
+    '<button class="btn cfgEdit" id="smrCfgEdit">edit…</button>';
+  $('smrCfgPop').classList.remove('hidden');
+  $('smrCfgEdit').addEventListener('click', () => {
+    $('smrCfgPop').classList.remove('open');
+    $('smrFormCard').classList.remove('hidden');
+    $('smrFormCard').classList.add('overlayMode');
+  });
   $('smrFormCard').classList.add('hidden');
   $('smrFormCard').classList.remove('overlayMode');
+  $('smrRun').classList.remove('hidden');
 }
-$('smrSumChip').addEventListener('click', () => {
-  const card = $('smrFormCard');
-  const opening = card.classList.contains('hidden');
-  card.classList.toggle('hidden', !opening);
-  card.classList.toggle('overlayMode', opening);
+$('smrSumChip').addEventListener('click', e => {
+  e.stopPropagation();
+  $('smrCfgPop').classList.toggle('open');
+});
+document.addEventListener('click', e => {
+  if (!e.target.closest('.cfgWrap')) $('smrCfgPop').classList.remove('open');
 });
 function sessionEnded() {
+  S.smr.ctx = null;
   $('smrSumChip').classList.add('hidden');
+  $('smrCfgPop').classList.add('hidden');
   $('smrFormCard').classList.remove('hidden', 'overlayMode');
   $('smrCtl').classList.add('hidden');
+  $('smrRun').classList.add('hidden');
 }
 
 /* ---------- injections editor ---------- */
@@ -144,18 +172,18 @@ const protoSpec = () => {
 
 export function buildSmrSpec() {
   const proto = protoSpec();
-  S.smr.tw = proto.kind === 'recovery' ? proto.t_window_rounds : null;
-  S.smr.certsRec = proto.kind === 'recovery' && proto.resend_until_acked;
   const spec = {
     n: Math.min(Math.max(+$('smrN').value || 64, 4), 200000),
     seed: +$('smrSeed').value || 0,
     k: 6,
     ell: 3,
-    sigma: Math.max(0.1, +$('smrSigma').value || 1),
+    sigma: +$('smrSigma').value || 1,
     proto,
     injections: readInjections(),
     max_rounds: Math.min(Math.max(+$('smrMax').value || 200, 1), 5000),
-    schedule: { kind: 'fresh_per_round', fraction: Math.min(Math.max(+$('smrBeta').value || 0, 0), 60) / 100 },
+    schedule: strategy() === 'program'
+      ? { kind: 'per_round_fractions', fractions: expandProgram(readProgram(), Math.min(Math.max(+$('smrMax').value || 200, 1), 5000)) }
+      : { kind: 'fresh_per_round', fraction: Math.min(Math.max(+$('smrBeta').value || 0, 0), 60) / 100 },
   };
   const traffic = formTrafficSpec();
   if (traffic) spec.traffic = traffic;
@@ -194,7 +222,8 @@ const PRESETS = {
   // for free and beats the law by a window; a partial surge skips it too.
   surge: { n: 256, tw: 40, sigma: 1, max: 400, beta: 0, rate: '1',
     program: [{ from: 41, to: 111, beta: 100 }] },
-  // 30% leaves ~4.2 expected replies — servers drop out without a spiral.
+  // 30% leaves ~4.2 expected replies — servers drop out without a spiral. Over 3n/4
+  // stay unblocked, so the run is benign and reads no release.
   partial: { n: 256, tw: 40, sigma: 1, max: 400, beta: 0, rate: '1',
     program: [{ from: 41, to: 141, beta: 30 }] },
   // T = 2 sits under the broadcast-time floor, so a sustained-but-survivable
@@ -206,8 +235,11 @@ const PRESETS = {
 
 function applyPreset(name) {
   const p = PRESETS[name];
-  S.smr.program = p ? p.program : null;
   if (!p) return;
+  $('smrStrategy').value = 'program';
+  $('smrProgRows').innerHTML = '';
+  for (const seg of p.program) progRow(seg.from, seg.to, seg.beta);
+  syncStrategy();
   $('smrN').value = p.n;
   $('smrTw').value = p.tw;
   $('smrSigma').value = p.sigma;
@@ -226,50 +258,98 @@ for (const btn of $('smrPresetToggle').children) {
 }
 
 // The program owns the slider only until the user grabs it.
-function programBeta(round) {
-  const prog = S.smr.program;
-  if (!prog) return null;
-  const seg = prog.find(s => round >= s.from && round < s.to);
-  return seg ? seg.beta : 0;
-}
 function clearProgram() {
   S.smr.program = null;
   for (const b of $('smrPresetToggle').children) b.classList.toggle('on', b.dataset.preset === 'custom');
 }
 
+/* ---------- blocking strategy ---------- */
+
+// Strategies the SMR engine cannot run live stay listed but disabled, each
+// with the reason: a lab run must be the exact run the engine gives for the
+// same spec and seed, so nothing is emulated in JS.
+const STRATEGY_HINT = {
+  fresh: 'A new random set of servers is blocked every round; the slider changes the fraction live.',
+  sticky: 'A persistent targeted set follows the slider; the percentage here is never-stopping background noise under it.',
+  program: 'Blocked fraction per round segment, drawn from the same stream as a fresh schedule; grabbing the slider takes manual control from that round.',
+};
+const strategy = () => $('smrStrategy').value;
+
+function syncStrategy() {
+  const st = strategy();
+  $('rowBeta').classList.toggle('hidden', st === 'program');
+  $('rowProgram').classList.toggle('hidden', st !== 'program');
+  $('smrBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n' : 'blocked % of n (the live slider starts here)';
+  $('smrStrategyHint').textContent = STRATEGY_HINT[st] ?? '';
+}
+$('smrStrategy').addEventListener('change', syncStrategy);
+
+function progRow(from = 41, to = 111, pct = 100) {
+  const row = document.createElement('div');
+  row.className = 'progRow';
+  row.innerHTML = `
+    <input class="fInput progFrom" type="number" min="1" value="${from}" />
+    <input class="fInput progTo" type="number" min="2" value="${to}" />
+    <input class="fInput progPct" type="number" min="0" max="100" value="${pct}" />
+    <button class="injDel" title="remove">✕</button>`;
+  row.querySelector('.injDel').addEventListener('click', () => row.remove());
+  $('smrProgRows').appendChild(row);
+}
+$('smrProgAdd').addEventListener('click', () => progRow());
+
+function readProgram() {
+  return [...document.querySelectorAll('#smrProgRows .progRow')].map(row => ({
+    from: Math.max(1, Math.round(+row.querySelector('.progFrom').value || 1)),
+    to: Math.round(+row.querySelector('.progTo').value || 1),
+    beta: Math.min(Math.max(+row.querySelector('.progPct').value || 0, 0), 100),
+  })).filter(seg => seg.to > seg.from);
+}
+const expandProgram = (program, rounds) => Array.from({ length: rounds }, (_, i) => (programBeta(program, i + 1) ?? 0) / 100);
+
 /* ---------- batch + live wiring ---------- */
 
 function resetFailureOutcome() {
   S.smr.scenario = null;
-  S.smr.resultContext = null;
   $('smrAbort').classList.add('hidden');
 }
 
-$('smrRunBtn').addEventListener('click', () => {
+// A spec file runs through the engine's batch path and opens as a finished
+// run: that keeps replay of exports a live session refuses (manual blocks,
+// pool clients) and keeps the batch failure path.
+export function runSpecBatch(spec) {
   if (S.engine !== 'wasm') { $('smrStatus').textContent = 'engine not ready'; return; }
   resetFailureOutcome();
   S.smr.live = null;
-  $('smrCtl').classList.add('hidden');
-  $('smrStatus').textContent = 'running…';
-  post({ type: 'smr-run', spec: buildSmrSpec() });
-});
+  $('smrStatus').textContent = 'running spec…';
+  S.smr.pending = sessionCtx(spec, 'batch', false, null);
+  post({ type: 'smr-run', spec });
+}
 
-$('smrLiveBtn').addEventListener('click', () => {
+$('smrStartBtn').addEventListener('click', () => {
   if (S.engine !== 'wasm') { $('smrStatus').textContent = 'engine not ready'; return; }
   resetFailureOutcome();
-  const sticky = $('smrLiveMode').value === 'sticky';
+  const sticky = strategy() === 'sticky';
+  const program = strategy() === 'program' ? readProgram() : null;
   $('smrStatus').textContent = 'starting live session…';
-  post({ type: 'smr-live-new', spec: buildSmrSpec(), sticky });
+  const spec = buildSmrSpec();
+  S.smr.pending = sessionCtx(spec, 'live', sticky, program);
+  post({ type: 'smr-live-new', spec, sticky });
 });
 
 export function onSmrDone(m) {
   S.smr.report = JSON.parse(m.json).report;
   S.smr.scenario = null;
-  S.smr.resultContext = null;
   S.smr.lastStatus = null;
-  $('smrStatus').textContent = `done: ${S.smr.report.metrics.length} rounds in ${m.ms} ms`;
-  sessionStarted();
+  S.smr.handle = false;
+  sessionStarted(S.smr.pending);
+  setEnd(smrEnd(S.smr.report.terminal, S.smr.ctx.maxRounds));
   renderSmr();
+}
+
+function violationText(v) {
+  if ('previous_len' in v) return `executed length fell from ${v.previous_len} to ${v.len}`;
+  if ('committed_sn' in v) return `execute-once refused: client ${v.client} committed sn ${v.sn} while its committed sn was ${v.committed_sn}`;
+  return `prefix ${v.pre_len}, log ${v.log_len}, first mismatch ${v.first_mismatch}`;
 }
 
 export function onSmrFailed(m) {
@@ -282,53 +362,76 @@ export function onSmrFailed(m) {
     S.smr.live.runUntil = null;
   }
   S.smr.live = null;
+  S.smr.handle = m.mode === 'live';
   S.smr.report = report;
   S.smr.scenario = scenario;
-  S.smr.resultContext = {
-    proto: scenario.proto.kind,
-    tw: scenario.proto.kind === 'recovery' ? scenario.proto.t_window_rounds : null,
-    certsRec: scenario.proto.kind === 'recovery' && !!scenario.proto.resend_until_acked,
-    n: scenario.n,
-  };
   S.smr.lastStatus = m.status ? JSON.parse(m.status) : null;
   S.smr.detail = null;
   S.smr.pin = null;
   S.smr.chain = null;
   S.smr.manualBlocks = new Set();
   resetCertsDrawer();
-  $('smrCtl').classList.add('hidden');
-  updateSmrPlayBtn();
-  sessionStarted(scenarioChipText(scenario));
-  $('smrStatus').textContent = `FAILED: attempted ${terminal.attempted_round} · completed ${terminal.completed_round} · observed ${terminal.observed_round}`;
+  sessionStarted(sessionCtx(scenario, m.mode, S.smr.pending?.sticky ?? false));
+  setEnd(smrEnd(report.terminal, S.smr.pending?.maxRounds ?? scenario.max_rounds));
+  const headline = m.failure.phase === 'BoundaryPreflight'
+    ? `recovery stopped before mutating boundary ${terminal.attempted_round}.` +
+      `<span class="abortWhy">Completed through r${terminal.completed_round}; valid pre-boundary observations include r${terminal.observed_round}.</span>`
+    : `the run stopped in round ${terminal.attempted_round}.` +
+      `<span class="abortWhy">Completed through r${terminal.completed_round}; observations include r${terminal.observed_round}.</span>`;
   $('smrAbort').innerHTML =
-    `<b>FAILED</b> — recovery stopped before mutating boundary ${terminal.attempted_round}.` +
-    `<span class="abortWhy">Completed through r${terminal.completed_round}; valid pre-boundary observations include r${terminal.observed_round}.</span>` +
-    `<span class="abortWhy">Node ${m.failure.node}: prefix ${m.failure.violation.pre_len}, log ${m.failure.violation.log_len}, first mismatch ${m.failure.violation.first_mismatch}. The report and replay are frozen and exportable.</span>`;
+    `<b>FAILED</b> — ${headline}` +
+    `<span class="abortWhy">Node ${m.failure.node}: ${violationText(m.failure.violation)}. The report and replay are frozen and exportable.</span>`;
   $('smrAbort').classList.remove('hidden');
   renderSmr();
 }
 
 export function onSmrReady(m) {
-  S.smr.resultContext = null;
   $('smrAbort').classList.add('hidden');
-  $('smrSlider').max = S.smr.proto === 'recovery' ? 100 : 60;
+  $('smrSlider').max = S.smr.pending.proto === 'recovery' ? 100 : 60;
+  S.smr.handle = false;
   S.smr.detail = null;
   S.smr.pin = null;
   S.smr.manualBlocks = new Set();
-  S.smr.report = JSON.parse(m.report);
+  try {
+    S.smr.report = applyReportDelta(EMPTY_REPORT, JSON.parse(m.delta));
+  } catch (e) {
+    S.smr.report = null;
+    onSmrAbort({ error: String(e), page: true });
+    return;
+  }
   S.smr.live = { playing: false, awaiting: false, runUntil: null };
   S.smr.lastStatus = null;
+  S.smr.end = null;
+  const ctx = S.smr.pending;
+  S.smr.program = ctx.program;
+  setSlider(ctx.program ? programBeta(ctx.program, 1) ?? 0 : ctx.sticky ? 0 : Math.round((ctx.spec.schedule.fraction ?? 0) * 100));
   S.smr.sel = null;
-  sessionStarted();
-  $('smrCtl').classList.remove('hidden');
-  $('smrLiveRound').textContent = 'r 0';
-  $('smrStatus').textContent = 'live session — β slider, inject commands anytime';
-  updateSmrPlayBtn();
+  sessionStarted(S.smr.pending);
+  $('smrStatus').textContent = 'live session — blocking slider, inject commands anytime';
+  updateToolbar();
   // a previous session's rule may have fed the other chain feed
   resetCertsDrawer();
   S.smr.chain = null;
-  onChainOrCerts(m);
   renderSmr();
+}
+
+// The forest panel lives in the block drawer, so the engine's certificate and chain feeds are
+// read only while that drawer is open, and once more when it opens. Merge animations after
+// skipped rounds replay just the newest step's merges.
+function feedFlags() {
+  const open = blockDrawerOpen();
+  const certsFeed = !isRec() || displayCertsRec();
+  return { wantCerts: open && certsFeed, wantChain: open && !certsFeed };
+}
+useBlockDrawerOpen(() => {
+  if (!S.smr.live && !S.smr.handle) return;
+  markCertsLoading();
+  post({ type: 'smr-live-feeds', ...feedFlags() });
+});
+export function onSmrFeeds(m) {
+  onChainOrCerts(m);
+  endCertsLoading();
+  renderDrawer();
 }
 
 // The chain panel has three feeds: compact streams the §5 certificate
@@ -359,29 +462,97 @@ useEntrySelect(ent => {
   if (i >= 0) selectCmd(i);
 });
 
-function scheduleSmrStep(session, delay) {
+// While `S.smr.live` is set the session can step. A stopped live session
+// (End, max rounds, dead, failed) keeps its engine handle in the worker so its
+// export, verify and node-detail calls keep working on the frozen run.
+const MAX_CHUNK = 25;
+const lastRound = () => (S.smr.lastStatus ? S.smr.lastStatus.round : 0);
+const speedDelay = () => (S.smr.speed === 'max' ? 0 : 720 / S.smr.speed);
+const speedChunk = () => (S.smr.speed === 'max' ? MAX_CHUNK : 1);
+const blockingStrategy = ctx => (ctx.program || ctx.spec.schedule?.fractions ? 'program' : ctx.sticky ? 'sticky' : 'fresh');
+
+function updateToolbar() {
+  const lv = S.smr.live;
+  const end = S.smr.end;
+  const hasSession = !!S.smr.ctx;
+  $('smrCtl').classList.toggle('hidden', !hasSession);
+  for (const id of ['smrPlayBtn', 'smrStepBtn', 'smrJumpBtn', 'smrInjectPopBtn', 'smrTrafficPopBtn', 'smrSlider']) $(id).disabled = !lv;
+  for (const b of document.querySelectorAll('#smrSpeed button')) b.disabled = !lv;
+  if (end) $('smrPlayBtn').dataset.tip = `${endText(end)}. Nothing more can run: New run starts another; Export keeps this one.`;
+  else delete $('smrPlayBtn').dataset.tip;
+  if (hasSession) {
+    const round = end ? end.round : lastRound();
+    $('smrLiveRound').textContent = `round ${round}/${S.smr.ctx.maxRounds}` + (end ? ' · ' + END_LABEL[end.kind] : '');
+    $('smrLiveRound').classList.toggle('ended', !!end);
+  }
+  $('smrStimulus').classList.toggle('off', !lv);
+  $('smrEndBtn').classList.toggle('hidden', !lv);
+  $('smrNewBtn').classList.toggle('hidden', !!lv || !hasSession);
+  $('smrPlayBtn').textContent = lv && lv.playing ? '⏸ Pause' : '⏵ Play';
+  for (const b of document.querySelectorAll('#smrSpeed button')) b.classList.toggle('on', b.dataset.speed === String(S.smr.speed));
+  for (const b of document.querySelectorAll('.recoveryItem')) b.disabled = !isRec();
+  $('smrStrat').textContent = hasSession ? blockingStrategy(S.smr.ctx) : '';
+}
+
+// The single place a session becomes a finished run: everything that tells the
+// user why nothing more can run reads S.smr.end.
+function setEnd(end) {
+  S.smr.end = end;
+  $('smrStatus').textContent = endText(end);
+  updateToolbar();
+}
+function finishLive(end) {
+  const lv = S.smr.live;
+  if (!lv) return;
+  lv.playing = false;
+  lv.runUntil = null;
+  S.smr.live = null;
+  S.smr.handle = true;
+  setEnd(end);
+  renderSmr();
+}
+// a Play or step key on a finished run re-states why, instead of doing nothing
+function remindEnd() {
+  $('smrStatus').textContent = endText(S.smr.end) + ' · New run starts another';
+  $('smrStatus').classList.add('flash');
+  setTimeout(() => $('smrStatus').classList.remove('flash'), 700);
+}
+
+function scheduleSmrStep(session, delay, count = 1) {
   setTimeout(() => {
-    if (S.smr.live === session) smrStep();
+    if (S.smr.live === session) smrStep(count);
   }, delay);
 }
 
-function smrStep() {
+function setSlider(percent) {
+  $('smrSlider').value = Math.min(percent, +$('smrSlider').max);
+  $('smrSliderVal').textContent = $('smrSlider').value + '%';
+}
+// The program owns the slider only until the user grabs it.
+function fractionFor(round) {
+  const programmed = programBeta(S.smr.program, round);
+  if (programmed !== null) setSlider(programmed);
+  return (+$('smrSlider').value) / 100;
+}
+
+function smrStep(count = 1) {
   const lv = S.smr.live;
   if (!lv || lv.awaiting) return;
-  const programmed = programBeta((S.smr.lastStatus ? S.smr.lastStatus.round : 0) + 1);
-  if (programmed !== null) {
-    $('smrSlider').value = Math.min(programmed, +$('smrSlider').max);
-    $('smrSliderVal').textContent = 'β ' + $('smrSlider').value + '%';
-  }
+  const room = S.smr.ctx.maxRounds - lastRound();
+  if (room <= 0) { finishLive(smrEnd(null, S.smr.ctx.maxRounds)); return; }
+  const n = Math.min(count, room);
+  const first = lastRound() + 1;
   lv.awaiting = true;
-  post({ type: 'smr-live-step', fraction: (+$('smrSlider').value) / 100 });
+  if (n === 1) { post({ type: 'smr-live-step', fraction: fractionFor(first), ...feedFlags() }); return; }
+  post({ type: 'smr-live-steps', fractions: Array.from({ length: n }, (_, i) => fractionFor(first + i)), ...feedFlags() });
 }
+
 // arrival traffic is engine-side: the live pmf edit lands as a phase from the
 // next round and rides in the exported spec (replays byte-identically)
 $('smrTrafficApply').addEventListener('click', () => {
   if (!S.smr.live) { $('smrStatus').textContent = 'start a live session first'; return; }
   post({ type: 'smr-live-traffic', pmf: rateToPmf($('smrTraffic').value) });
-  $('smrTrafficPopBtn').textContent = 'traffic: ' + $('smrTraffic').value + '/r';
+  $('smrTrafficPopBtn').textContent = 'Traffic: ' + $('smrTraffic').value + '/r';
 });
 export function onSmrTrafficSet(m) {
   const out = JSON.parse(m.json);
@@ -392,11 +563,21 @@ export function onSmrRound(m) {
   if (!lv) return;
   lv.awaiting = false;
   const status = JSON.parse(m.status);
+  try {
+    S.smr.report = applyReportDelta(S.smr.report, JSON.parse(m.delta));
+  } catch (e) {
+    onSmrAbort({ error: String(e), page: true });
+    return;
+  }
   S.smr.lastStatus = status;
-  S.smr.report = JSON.parse(m.report);
-  $('smrLiveRound').textContent = 'r ' + status.round;
-  if (status.absorbed || status.dead !== null) lv.playing = false;
-  updateSmrPlayBtn();
+  // a batched step cannot say which round of the batch flipped the flag
+  if (!S.smr.report.safety_ok && S.smr.safetyRound == null && m.steps === undefined) S.smr.safetyRound = status.round;
+  const max = S.smr.ctx.maxRounds;
+  const stopNote = status.absorbed || status.dead !== null
+    ? smrEnd({ Dead: { round: status.dead ?? status.round } }, max)
+    : status.round >= max ? smrEnd({ Ran: { rounds: status.round } }, max) : null;
+  if (stopNote) lv.playing = false;
+  updateToolbar();
   onChainOrCerts(m);
   if (S.smr.pin !== null && isRec()) post({ type: 'smr-node-detail', node: S.smr.pin, pinned: true });
   renderSmr();
@@ -404,8 +585,7 @@ export function onSmrRound(m) {
     lv.runSteps++;
     const hit = lv.runUntil(status, S.smr.report);
     const done = hit === true || (typeof hit === 'string' && hit);
-    const stuck = status.absorbed || status.dead !== null || lv.runSteps >= 2000;
-    if (done || stuck) {
+    if (done || stopNote || lv.runSteps >= 2000) {
       $('smrStatus').textContent = done
         ? `stopped at r${status.round} — ${typeof hit === 'string' ? hit : lv.runLabel}`
         : `stopped at r${status.round} — no ${lv.runLabel} within ${lv.runSteps} rounds`;
@@ -415,36 +595,57 @@ export function onSmrRound(m) {
       return;
     }
   }
-  if (lv.playing) scheduleSmrStep(lv, 720 / (+$('smrSpeed').value || 1));
-}
-function updateSmrPlayBtn() {
-  $('smrPlayBtn').textContent = S.smr.live && S.smr.live.playing ? '⏸' : '▶️';
+  if (stopNote) { finishLive(stopNote); return; }
+  if (lv.playing) scheduleSmrStep(lv, speedDelay(), speedChunk());
 }
 $('smrPlayBtn').addEventListener('click', () => {
   if (!S.smr.live) return;
   S.smr.live.playing = !S.smr.live.playing;
-  updateSmrPlayBtn();
-  if (S.smr.live.playing) smrStep();
+  updateToolbar();
+  if (S.smr.live.playing) smrStep(speedChunk());
 });
 $('smrStepBtn').addEventListener('click', () => {
   if (!S.smr.live) return;
   S.smr.live.playing = false;
-  updateSmrPlayBtn();
+  updateToolbar();
   smrStep();
 });
+// the replay shortcuts carry over: space plays or pauses, the arrows step
+window.addEventListener('keydown', e => {
+  if (S.view !== 'smr' || ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (!S.smr.live) {
+    if (S.smr.end && (e.key === ' ' || e.key === 'ArrowRight')) { e.preventDefault(); remindEnd(); }
+    return;
+  }
+  if (e.key === ' ') { e.preventDefault(); $('smrPlayBtn').click(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); $('smrStepBtn').click(); }
+});
 $('smrSlider').addEventListener('input', () => {
-  $('smrSliderVal').textContent = 'β ' + $('smrSlider').value + '%';
+  $('smrSliderVal').textContent = $('smrSlider').value + '%';
   clearProgram();
 });
-$('smrSpeed').addEventListener('change', () => {});
+for (const b of document.querySelectorAll('#smrSpeed button')) {
+  b.addEventListener('click', () => {
+    S.smr.speed = b.dataset.speed === 'max' ? 'max' : +b.dataset.speed;
+    updateToolbar();
+  });
+}
 $('smrAuditScope').addEventListener('change', () => {
   if (S.smr.report) renderAudit(S.smr.report);
 });
-$('smrEndBtn').addEventListener('click', () => {
-  S.smr.live = null;
+$('smrEndBtn').addEventListener('click', () => finishLive({ kind: 'ended', round: lastRound(), max: S.smr.ctx.maxRounds }));
+$('smrNewBtn').addEventListener('click', () => {
+  S.smr.handle = false;
+  S.smr.end = null;
+  S.smr.report = null;
+  S.smr.lastStatus = null;
+  S.smr.scenario = null;
   S.smr.chain = null;
-  sessionEnded();
+  S.smr.pin = null;
+  S.smr.detail = null;
+  resetFailureOutcome();
   resetCertsDrawer();
+  sessionEnded();
 });
 
 /* ---------- interactive injection ---------- */
@@ -454,7 +655,7 @@ $('smrInjectBtn').addEventListener('click', () => {
   const client = Math.max(0, Math.round(+$('smrInjClient').value || 0));
   const op = Math.max(1, Math.round(+$('smrInjOp').value || 1));
   const t = $('smrInjTarget').value;
-  post({ type: 'smr-live-inject', client, op, target: t === '' ? null : Math.max(0, Math.round(+t)) });
+  post({ type: 'smr-live-inject', client, op, target: t === '' ? null : Math.max(0, Math.round(+t)), ...feedFlags() });
 });
 export function onSmrInjected(m) {
   const out = JSON.parse(m.json);
@@ -481,16 +682,22 @@ export function onSmrVerify(m) {
   onVerifyTallies(m.json);
 }
 
+// A captured failure scenario or a frozen batch spec exports as run; only a
+// stepping or stopped live session asks the engine for its recorded spec.
 function exportSpec() {
-  if (S.smr.live) { post({ type: 'smr-live-export' }); return; }
-  const spec = S.smr.scenario || buildSmrSpec();
+  if (S.smr.scenario) { downloadJson('smr-scenario.json', JSON.stringify(S.smr.scenario, null, 2)); return; }
+  if (S.smr.live || S.smr.handle) { post({ type: 'smr-live-export' }); return; }
+  const spec = S.smr.ctx ? S.smr.ctx.spec : buildSmrSpec();
   downloadJson('smr-scenario.json', JSON.stringify(spec, null, 2));
 }
 $('smrExportSpec').addEventListener('click', exportSpec);
-$('smrExportSpecLive').addEventListener('click', exportSpec);
+$('smrFormExportSpec').addEventListener('click', () => downloadJson('smr-scenario.json', JSON.stringify(buildSmrSpec(), null, 2)));
+// A live or stopped session exports the engine's own report, never the page's merge of deltas.
 $('smrExportReport').addEventListener('click', () => {
+  if (S.smr.live || S.smr.handle) { post({ type: 'smr-live-report' }); return; }
   if (S.smr.report) downloadJson('smr-report.json', JSON.stringify(S.smr.report, null, 2));
 });
+export function onSmrReport(m) { downloadJson('smr-report.json', JSON.stringify(JSON.parse(m.json), null, 2)); }
 export function onSmrScenario(m) { downloadJson('smr-live-scenario.json', m.json); }
 
 /* ---------- abort as an outcome ---------- */
@@ -499,9 +706,11 @@ export function onSmrScenario(m) { downloadJson('smr-live-scenario.json', m.json
 // history stays on screen with the engine's own message.
 export function onSmrAbort(m) {
   S.smr.live = null;
-  updateSmrPlayBtn();
+  S.smr.handle = false;
+  if (S.smr.ctx) setEnd({ kind: 'aborted', round: lastRound(), max: S.smr.ctx.maxRounds });
+  else updateToolbar();
   $('smrAbort').innerHTML =
-    `<b>ABORTED</b> — the engine refused to continue.` +
+    `<b>ABORTED</b> — ${m.page ? 'the page lost sync with the engine.' : 'the engine refused to continue.'}` +
     `<span class="abortWhy">${escapeHtml(m.panic || m.error)}</span>` +
     `<span class="abortWhy">The run up to here is still on screen and exportable. ` +
     `Start a new session to continue.</span>`;
@@ -528,51 +737,14 @@ export function onSmrBlocked(m) {
 
 /* ---------- recovery clock, phase, law ---------- */
 
-const displayProto = () => S.smr.resultContext?.proto ?? S.smr.proto;
-const displayTw = () => S.smr.resultContext?.tw ?? S.smr.tw;
-const displayCertsRec = () => S.smr.resultContext?.certsRec ?? S.smr.certsRec;
-const displayN = () => S.smr.resultContext?.n ?? 0;
+const displayProto = () => S.smr.ctx?.proto ?? S.smr.proto;
+const displayTw = () => S.smr.ctx?.tw ?? null;
+const displayCertsRec = () => S.smr.ctx?.certsRec ?? false;
+const displayN = () => S.smr.ctx?.n ?? 0;
 const isRec = () => displayProto() === 'recovery' && !!displayTw();
-const recRows = rep => (rep.recovery ? rep.recovery.rounds : null);
-
-// The same scan the engine's SmrReport::recovered_round performs, twinned in
-// crates/sim-wasm/tests/smr_recovery_live.rs — any change to this predicate
-// must change that test too.
-function rStarScan(rep, n, T) {
-  if (rep.terminal?.Failed) return null;
-  const rows = recRows(rep);
-  if (!rows) return null;
-  const ms = rep.metrics;
-  const floor = Math.ceil(0.75 * n);
-  const bs = [];
-  for (let r = T; r <= ms.length; r += T) bs.push(r);
-  const clean = b => rows[b - 1].reset === 0 && ms[b - 1].nonbot_logs >= floor;
-  for (const rStar of bs) {
-    const m = ms[rStar - 1];
-    if (m.min_executed_len !== m.max_executed_len) continue;
-    if (bs.every(b => b < rStar || clean(b))) return rStar;
-  }
-  return null;
-}
-
-// Release = the first round β fell back to 0 after being positive. Read off
-// the recorded blocked counts, so it is whatever actually happened — slider,
-// preset program or spec schedule alike.
-function releaseRound(rep) {
-  const ms = rep.metrics;
-  let surged = false;
-  for (let i = 0; i < ms.length; i++) {
-    if (ms[i].blocked > 0) { surged = true; continue; }
-    if (surged) return i + 1;
-  }
-  return null;
-}
-
 function renderRecChips(rep) {
   const on = isRec();
   $('smrRecChips').classList.toggle('hidden', !on);
-  $('smrGridTabs').classList.toggle('hidden', !on);
-  document.querySelectorAll('#smrBoundaryBtn, #smrEventBtn').forEach(b => b.classList.toggle('hidden', !on));
   if (!on) { $('smrLawCard').classList.add('hidden'); return; }
   const T = displayTw();
   const rows = recRows(rep);
@@ -580,12 +752,12 @@ function renderRecChips(rep) {
   if (!rows || !round) return;
   const w = rows[round - 1].window;
   const nextAt = (Math.floor((round - 1) / T) + 1) * T;
-  const n = S.smr.lastStatus ? S.smr.lastStatus.nodes.length : displayN();
+  const n = displayN();
   const failed = !!rep.terminal?.Failed;
-  const release = releaseRound(rep);
+  const release = releaseRound(rep, n);
   const rStar = failed || release === null ? null : rStarScan(rep, n, T);
 
-  let clock = `W ${w} [${w * T + 1},${(w + 1) * T + 1}) · T ${T} · next in ${nextAt - round}`;
+  let clock = `W ${w} · next b${nextAt}`;
   if (release !== null && rStar !== null) clock += ` · r* ${rStar} · R ${rStar - release}`;
   $('smrClockChip').textContent = clock;
 
@@ -597,7 +769,7 @@ function renderRecChips(rep) {
   $('smrPhaseChip').className = 'recChip mono' + (phase === 'CONFIRMED' ? ' ok' : phase ? ' warn' : '');
 
   const forkK = lastLatched(rows, 'cp_fork_k');
-  $('smrForkChip').textContent = `cp-fork k ${forkK || '–'}`;
+  $('smrForkChip').textContent = forkK > 1 ? `⚠ checkpoint fork k ${forkK}` : `checkpoint fork k ${forkK || '–'}`;
   $('smrForkChip').className = 'recChip mono' + (forkK > 1 ? ' alarm' : '');
 
   const settled = rep.commands.filter(c => c.all_logs_round !== null).length;
@@ -609,110 +781,12 @@ function renderRecChips(rep) {
   renderLawCard(release, rStar, T);
 }
 
-// Latched fields land on the row after a boundary and are 0 elsewhere; the
-// chip should keep showing the newest one, not blank between boundaries.
-function lastLatched(rows, key) {
-  for (let i = rows.length - 1; i >= 0; i--) if (rows[i][key] !== 0) return rows[i][key];
-  return 0;
-}
-
 function renderLawCard(release, rStar, T) {
-  const card = $('smrLawCard');
-  if (release === null || rStar === null) { card.classList.add('hidden'); return; }
-  const phi = release % T;
-  const predicted = 2 * T + ((T - phi) % T);
-  const actual = rStar - release;
-  card.innerHTML =
-    `<b>Recovery took ${actual} rounds</b> — released at r${release}, recovered at r${rStar}.` +
-    `<div class="lawEq">R = 2T + (T − φ) mod T = 2·${T} + (${T} − ${phi}) mod ${T} = ${predicted}` +
-    (actual === predicted ? ' ✓' : ` · measured ${actual}`) + `</div>` +
-    (actual === predicted ? '' :
-      `<div>The law describes a FULL blackout released inside a window, which costs one ` +
-      `window to re-arm every server to reset before a boundary can roll it back. This run ` +
-      `skipped that window — either the surge left useful servers alive, or the release ` +
-      `landed exactly on a boundary, where the re-arm comes free.</div>`) +
-    `<div>φ = ${phi} is the release round's phase in its window: the two windows are the re-arm and the rollback, ` +
-    `and (T − φ) mod T is the wait for the first boundary after release.</div>`;
-  card.classList.remove('hidden');
-}
-
-/* ---------- committed sequence: one block per boundary ---------- */
-
-// Nothing commits between boundaries, so a batch is the jump in executed
-// length across consecutive post-boundary rows — row mT+1 against (m−1)T+1.
-function renderBlocks(rep) {
-  const strip = $('smrBlocks');
-  const rows = recRows(rep);
-  if (!rows) { strip.innerHTML = ''; return; }
-  const T = displayTw(), ms = rep.metrics;
-  const at = r => (r <= ms.length ? ms[r - 1].max_executed_len : null);
-  const batches = [];
-  let rolledBack = false;
-  for (let m = 1; (m - 1) * T + 1 <= ms.length; m++) {
-    const here = at(m * T + 1);
-    if (here === null) break;
-    const size = Math.max(0, here - at((m - 1) * T + 1));
-    // DRAIN = the first batch that lands after a rollback: the catch-up.
-    const drain = rolledBack && size > 0;
-    if (drain) rolledBack = false;
-    const rb = rows[m * T] ? rows[m * T].rollbacks : 0;
-    if (rb > 0) rolledBack = true;
-    batches.push({ m, boundary: m * T, size, drain, rb });
-  }
-  if (S.smr.batchSel !== null && !batches.some(b => b.m === S.smr.batchSel && b.size > 0))
-    S.smr.batchSel = null;
-  strip.innerHTML = batches.map(b => {
-    if (b.size === 0) {
-      const rolled = b.rb > 0;
-      const title = rolled
-        ? `boundary ${b.boundary}: rolled back ×${b.rb} — speculative entries discarded, clients re-send`
-        : `boundary ${b.boundary}: nothing had aged a full clean window — no commit`;
-      return `<div class="blk empty${rolled ? ' rolled' : ''}" title="${title}">` +
-        `<span class="blkB">b${b.boundary}</span><span class="blkS">${rolled ? '⟲' : '0'}</span></div>`;
-    }
-    const on = S.smr.batchSel === b.m ? ' on' : '';
-    return `<div class="blk${b.drain ? ' drain' : ''}${on}" data-m="${b.m}" ` +
-      `style="width:${Math.min(140, 34 + b.size * 10)}px" ` +
-      `title="boundary ${b.boundary}: ${b.size} entr${b.size === 1 ? 'y' : 'ies'} committed — click for the batch">` +
-      `<span class="blkB">b${b.boundary}${b.rb > 0 ? ' ⟲' : ''}</span>` +
-      `<span class="blkS">${b.size}${b.drain ? '<span class="blkTag"> DRAIN</span>' : ''}</span></div>`;
-  }).join('') +
-    `<div class="blk next"><span class="blkB">b${(batches.length + 1) * T}</span><span class="blkS">next</span></div>`;
-  const total = batches.reduce((a, b) => a + b.size, 0);
-  const rolled = batches.filter(b => b.size === 0 && b.rb > 0).length;
-  const bare = batches.filter(b => b.size === 0 && b.rb === 0).length;
-  $('smrBlocksNote').textContent = `${batches.length} boundaries · ${total} entries committed` +
-    (rolled ? ` · ${rolled} ⟲ rolled back` : '') + (bare ? ` · ${bare} aged nothing` : '');
-  renderBatchDrawer(rep, batches, total);
-}
-
-// The explorer half: which commands landed in the selected batch. Membership
-// is exact — executed_round latches at the boundary pass, so it equals mT.
-function renderBatchDrawer(rep, batches, total) {
-  const box = $('smrBatchDrawer');
-  const m = S.smr.batchSel;
-  if (m === null) {
-    if (total === 0 && batches.length > 0) {
-      box.innerHTML = '<span class="bdDim">nothing committed yet — a boundary commits only entries ' +
-        'that survived a full clean window; each rollback discards them and their resends re-age from zero</span>';
-      box.classList.remove('hidden');
-    } else box.classList.add('hidden');
-    return;
-  }
-  const T = displayTw();
-  const batch = batches.find(b => b.m === m);
-  const cmds = rep.commands.map((c, i) => ({ c, i })).filter(x => x.c.executed_round === m * T);
-  box.innerHTML =
-    `<span class="bdHead mono">b${m * T} · ${batch.size} entr${batch.size === 1 ? 'y' : 'ies'}` +
-    (cmds.length !== batch.size ? ` · ${cmds.length} client command${cmds.length === 1 ? '' : 's'}` : '') +
-    `</span>` +
-    (cmds.length
-      ? cmds.map(x =>
-          `<button class="bdCmd mono${S.smr.sel === x.i ? ' on' : ''}" data-i="${x.i}" ` +
-          `style="color:${cmdColor(x.i)};border-color:${cmdColor(x.i)}44" ` +
-          `title="injected r${x.c.injection_round} — click to pin on the charts">${cmdLabel(x.c)}</button>`).join('')
-      : '<span class="bdDim">structural entries only — no client commands in this batch</span>');
-  box.classList.remove('hidden');
+  const tip = $('smrLawCard');
+  if (release === null || rStar === null) { tip.classList.add('hidden'); return; }
+  tip.textContent = `R ${rStar - release}`;
+  tip.dataset.tip = lawText(release, rStar, T);
+  tip.classList.remove('hidden');
 }
 
 /* ---------- steppers ---------- */
@@ -726,7 +800,7 @@ function runUntil(pred, label) {
   lv.runUntil = pred;
   lv.runLabel = label;
   lv.runSteps = 0;
-  updateSmrPlayBtn();
+  updateToolbar();
   smrStep();
 }
 
@@ -734,34 +808,32 @@ function runUntil(pred, label) {
 // that is where the stepper stops.
 const boundaryPred = st => st.round > 1 && (st.round - 1) % displayTw() === 0;
 
-function eventPred(st, rep) {
+function eventsAt(st, rep) {
   const rows = recRows(rep);
-  if (!rows) return null;
-  const row = rows[st.round - 1];
+  const row = rows && rows[st.round - 1];
+  if (!row) return [];
   const prev = st.round > 1 ? rows[st.round - 2] : null;
-  if (row.rollbacks > 0) return `rollback ×${row.rollbacks} (depth ${row.rollback_depth})`;
-  if (row.bot_r > 0 && (!prev || prev.bot_r === 0)) return 'first ⊥';
-  if (row.cp_fork_k > 1) return `cp-fork k=${row.cp_fork_k}`;
-  const release = releaseRound(rep);
-  const n = st.nodes.length;
-  if (release !== null && rStarScan(rep, n, displayTw()) === st.round) return 'recovery CONFIRMED';
-  return null;
+  const found = [];
+  if (row.rollbacks > 0) found.push({ kind: 'rollback', label: `rollback ×${row.rollbacks} (depth ${row.rollback_depth})` });
+  if (row.bot_r > 0 && (!prev || prev.bot_r === 0)) found.push({ kind: 'bot', label: 'first ⊥' });
+  if (row.cp_fork_k > 1) found.push({ kind: 'fork', label: `cp-fork k=${row.cp_fork_k}` });
+  const n = displayN();
+  if (releaseRound(rep, n) !== null && rStarScan(rep, n, displayTw()) === st.round) found.push({ kind: 'confirmed', label: 'recovery CONFIRMED' });
+  return found;
 }
+const eventPred = kind => (st, rep) => {
+  const hit = eventsAt(st, rep).find(e => kind === 'event' || e.kind === kind);
+  return hit ? hit.label : null;
+};
 
-$('smrBoundaryBtn').addEventListener('click', () => runUntil(boundaryPred, 'boundary'));
-$('smrEventBtn').addEventListener('click', () => runUntil(eventPred, 'event'));
-
-$('smrBlocks').addEventListener('click', e => {
-  const el = e.target.closest('.blk');
-  if (!el || el.dataset.m === undefined) return;
-  const m = +el.dataset.m;
-  S.smr.batchSel = S.smr.batchSel === m ? null : m;
-  renderSmr();
-});
-$('smrBatchDrawer').addEventListener('click', e => {
-  const el = e.target.closest('.bdCmd');
-  if (el) selectCmd(+el.dataset.i);
-});
+for (const item of document.querySelectorAll('#smrJumpPop .menuItem')) {
+  item.addEventListener('click', () => {
+    $('smrJumpPop').classList.remove('open');
+    const kind = item.dataset.jump;
+    if (kind === 'boundary') runUntil(boundaryPred, 'boundary');
+    else runUntil(eventPred(kind), kind === 'event' ? 'event' : item.textContent);
+  });
+}
 
 /* ---------- rendering ---------- */
 
@@ -782,17 +854,10 @@ const OC = {
 function renderSmr() {
   const rep = S.smr.report;
   if (!rep) return;
-  // In recovery the two standalone panels ARE timeline lanes 5 and 6; showing
-  // both would duplicate the same curve on two different axes.
   const rec = isRec();
-  $('smrSpreadBox').classList.toggle('hidden', rec);
-  $('smrPrefixBox').classList.toggle('hidden', rec);
-  $('smrTimelineBox').classList.toggle('hidden', !rec);
-  $('smrBlocksBox').classList.toggle('hidden', !rec);
-  $('smrGhostRow').classList.toggle('hidden', !rec);
-  if (rec) renderBlocks(rep);
-  drawSmrNet(rep);
-  if (rec) drawTimeline(rep); else { drawSpread(rep); drawPrefix(rep); }
+  renderServers(rep);
+  renderViewport(rep);
+  renderDrawer();
   renderMetrics(rep);
   renderRecChips(rep);
   renderAudit(rep);
@@ -819,13 +884,187 @@ function prepCanvas(cv) {
   return { ctx, W, H };
 }
 
-function drawSmrNet(rep) {
-  const box = $('smrNetBox');
+// Servers section. Counts come from the report's newest row; the strip and the
+// grid need the live status, which a spec (batch) run lacks. The grid shows the
+// newest round, also on a finished run.
+const LAG_NEAR = 5;
+// Knowledge counts, per server, how many of the spreading commands it holds,
+// from the status' holder lists. Measured with 60 spreading commands the count
+// costs 0.1-0.3 ms at n = 1000 and 1.3 ms at n = 8000, but the status message
+// grows to 2 MB there, so the mode stops at 2000 until the engine delivers the
+// counts itself.
+const KNOW_MAX_N = 2000;
+const LAG_COLORS = ['#3dd6c4', '#e0c27a', '#b9691f'];
+const frontier = st => st.nodes.reduce((a, g) => Math.max(a, g.executed_len), 0);
+const lagBucket = lag => (lag === 0 ? 0 : lag <= LAG_NEAR ? 1 : 2);
+
+function knowledgeShares(st) {
+  const total = st.spreading.length;
+  const held = new Uint16Array(st.nodes.length);
+  for (const c of st.spreading) for (const i of c.holders) held[i]++;
+  const shares = total ? Array.from(held, x => x / total) : null;
+  let min = Infinity, max = -Infinity;
+  if (shares) st.nodes.forEach((g, i) => { if (g.log_len !== null) { min = Math.min(min, shares[i]); max = Math.max(max, shares[i]); } });
+  return { total, shares, range: { min, max } };
+}
+
+// Knowledge is the default wherever it is available; Lag is the fallback.
+function gridMode(st, n) {
+  const mode = S.smr.gridMode ?? (n <= KNOW_MAX_N ? 'know' : 'lag');
+  if (mode === 'rstate' && !isRec()) return 'lag';
+  if (mode === 'know' && n > KNOW_MAX_N) return 'lag';
+  if (mode === 'watch' && S.smr.sel === null) return 'lag';
+  return mode;
+}
+
+// Per-server look for the current mode: colour, optional alpha and a sort key.
+// ⊥ servers are grey and sort last in every mode.
+function gridLook(rep, st, mode) {
+  const n = st.nodes.length;
+  const f = frontier(st);
+  const know = mode === 'know' ? knowledgeShares(st) : null;
+  let holders = null;
+  const sel = S.smr.sel;
+  if (mode === 'watch' && sel !== null) {
+    const cmd = rep.commands[sel];
+    const sp = st.spreading.find(c => c.client === cmd.client);
+    holders = sp ? new Set(sp.holders) : cmd.all_logs_round !== null ? 'all' : new Set();
+  }
+  return st.nodes.map((g, i) => {
+    if (g.log_len === null) return { color: '#4b5563', alpha: 1, key: 1e9 };
+    if (mode === 'lag') { const lag = f - g.executed_len; return { color: LAG_COLORS[lagBucket(lag)], alpha: 1, key: lag, lag }; }
+    if (mode === 'know') {
+      if (!know.shares) return { color: '#252c36', alpha: 1, key: 0 };
+      // brightness stretches the round's actual min..max share over the whole
+      // range; the sort key stays the true share
+      const { min, max } = know.range;
+      const stretched = max === min ? 1 : (know.shares[i] - min) / (max - min);
+      return { color: '#3dd6c4', alpha: 0.15 + 0.85 * stretched, key: -know.shares[i] };
+    }
+    if (mode === 'rstate') return { color: g.r === 0 ? '#3dd6c4' : g.r === 1 ? '#e0af68' : '#4b5563', alpha: 1, key: g.r };
+    const holds = holders === 'all' || (holders && holders.has(i));
+    return { color: holds ? cmdColor(sel) : '#252c36', alpha: 1, key: holds ? 0 : 1 };
+  });
+}
+
+function gridSummary(rep, st, mode, looks) {
+  const n = st.nodes.length;
+  const bot = st.nodes.filter(g => g.log_len === null).length;
+  const blocked = st.blocked.length;
+  if (mode === 'lag') {
+    const c = [0, 0, 0];
+    looks.forEach(l => { if (l.lag !== undefined) c[lagBucket(l.lag)]++; });
+    return `lag: ${c[0]} up to date · ${c[1]} ≤ ${LAG_NEAR} · ${c[2]} > ${LAG_NEAR} · ${bot} ⊥ · ${blocked} blocked`;
+  }
+  if (mode === 'know') {
+    const k = knowledgeShares(st);
+    return k.total ? `knowledge: ${k.total} command${k.total === 1 ? '' : 's'} spreading · ${bot} ⊥ · ${blocked} blocked` : `knowledge: no command is spreading · ${bot} ⊥ · ${blocked} blocked`;
+  }
+  if (mode === 'rstate') {
+    const c = st.nodes.reduce((a, g) => (a[g.r]++, a), [0, 0, 0]);
+    return `no-reset ${c[0]} · reset ${c[1]} · ⊥ ${c[2]} · ${blocked} blocked`;
+  }
+  const held = looks.filter(l => l.key === 0).length;
+  return `${cmdLabel(rep.commands[S.smr.sel])}: held by ${held}/${n} · ${bot} ⊥ · ${blocked} blocked`;
+}
+
+const LEGENDS = {
+  lag: () => `<span class="g gNote">lights up only when servers fall behind the commit frontier</span><span class="g"><span class="gd" style="background:${LAG_COLORS[0]}"></span>up to date</span><span class="g"><span class="gd" style="background:${LAG_COLORS[1]}"></span>1–${LAG_NEAR} behind</span><span class="g"><span class="gd" style="background:${LAG_COLORS[2]}"></span>&gt; ${LAG_NEAR} behind</span>`,
+  know: st => {
+    const k = knowledgeShares(st);
+    if (!k.shares) return '<span class="g">no command is spreading</span>';
+    const pct = x => Math.round(x * 100) + '%';
+    return `<span class="g"><span class="gd" style="background:#3dd6c4;opacity:.2"></span>dim: holds ${pct(k.range.min)}</span><span class="g"><span class="gd" style="background:#3dd6c4"></span>bright: holds ${pct(k.range.max)}</span><span class="g">of ${k.total} spreading · brightness stretched to this round’s range</span>`;
+  },
+  rstate: () => `<span class="g"><span class="gd" style="background:#3dd6c4"></span>no-reset</span><span class="g"><span class="gd" style="background:#e0af68"></span>reset</span>`,
+  watch: () => '<span class="g"><span class="gd watch"></span>holds it</span>',
+};
+const LEGEND_TAIL = '<span class="g"><span class="gd bot"></span>⊥</span><span class="g"><span class="gd blk"></span>blocked</span>';
+
+function renderServers(rep) {
   const st = S.smr.lastStatus;
-  const live = !!S.smr.live;
-  box.classList.toggle('hidden', !live);
-  if (!live || !st) return;
-  const sel = selectedCmd(rep);
+  const m = rep.metrics[rep.metrics.length - 1];
+  const n = displayN();
+  const atNote = S.smr.live ? '' : ` · at r${rep.metrics.length}`;
+  const mode = st ? gridMode(st, st.nodes.length) : S.smr.gridMode;
+  const looks = st ? gridLook(rep, st, mode) : null;
+  $('srvCounts').textContent = st
+    ? gridSummary(rep, st, mode, looks) + atNote
+    : m ? `${m.nonbot_logs} with value · ${n - m.nonbot_logs} ⊥ · ${m.blocked} blocked${atNote}` : '';
+  $('srvBody').classList.toggle('hidden', !S.smr.srvOpen);
+  $('srvToggle').textContent = S.smr.srvOpen ? '▾' : '▸';
+  $('srvHint').classList.toggle('hidden', !S.smr.srvOpen || !isRec() || !st);
+  $('srvHint').textContent = 'click a server to pin it';
+  $('srvNote').classList.toggle('hidden', !!st);
+  $('smrGridTabs').classList.toggle('hidden', !st || !S.smr.srvOpen);
+  $('srvSort').classList.toggle('hidden', !st || !S.smr.srvOpen);
+  $('srvSort').classList.toggle('on', S.smr.gridSort);
+  for (const b of document.querySelectorAll('#smrGridTabs .ct')) b.classList.toggle('on', b.dataset.grid === mode);
+  $('srvKnowBtn').disabled = !!st && st.nodes.length > KNOW_MAX_N;
+  $('srvKnowBtn').dataset.tip = st && st.nodes.length > KNOW_MAX_N
+    ? 'needs per-server counts from the engine' : 'share of the currently spreading commands this server holds';
+  $('srvWatchBtn').disabled = S.smr.sel === null;
+  const cmd = S.smr.sel !== null ? rep.commands[S.smr.sel] : null;
+  $('srvWatch').classList.toggle('hidden', !cmd || !st);
+  if (cmd) $('srvWatchLbl').textContent = 'watching ' + cmdLabel(cmd) + ' ';
+  for (const b of document.querySelectorAll('#smrGridTabs .recoveryOnly')) b.classList.toggle('hidden', !isRec());
+  drawServerStrip(m, n, st, looks);
+  if (S.smr.srvOpen && st) drawSmrNet(rep, mode, looks);
+}
+$('srvToggle').addEventListener('click', () => {
+  S.smr.srvOpen = !S.smr.srvOpen;
+  if (S.smr.report) renderSmr();
+});
+
+// slot order: server id, or sorted by the mode's value with id as tie-break
+function slotOrder(looks) {
+  const ids = looks.map((_, i) => i);
+  if (S.smr.gridSort) ids.sort((a, b) => looks[a].key - looks[b].key || a - b);
+  return ids;
+}
+
+function drawServerStrip(m, n, st, looks) {
+  const P = prepCanvas($('srvStrip'));
+  if (!P || !m || !n) return;
+  const { ctx, W, H } = P;
+  const blocked = new Set(st ? st.blocked : []);
+  if (st && n <= 160) {
+    const order = slotOrder(looks);
+    const r = Math.min(H / 2 - 1, W / n / 2 - 0.5);
+    order.forEach((node, slot) => {
+      const x = (slot + 0.5) * (W / n), y = H / 2;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(r, 1), 0, Math.PI * 2);
+      ctx.fillStyle = looks[node].color; ctx.globalAlpha = looks[node].alpha;
+      ctx.fill(); ctx.globalAlpha = 1;
+      if (blocked.has(node)) { ctx.strokeStyle = '#f7768e'; ctx.lineWidth = 1; ctx.stroke(); }
+    });
+    return;
+  }
+  // too many servers for one dot each: a share bar of the mode's colour classes
+  if (st) {
+    const groups = new Map();
+    for (const l of looks) { const k = l.color + l.alpha.toFixed(1); groups.set(k, { l, c: (groups.get(k)?.c || 0) + 1 }); }
+    let x = 0;
+    for (const { l, c } of [...groups.values()].sort((a, b) => a.l.key - b.l.key)) {
+      ctx.fillStyle = l.color; ctx.globalAlpha = l.alpha;
+      ctx.fillRect(x, 2, (c / n) * W, H - 4);
+      x += (c / n) * W;
+    }
+    ctx.globalAlpha = 1;
+  } else {
+    let x = 0;
+    for (const [count, col] of [[m.nonbot_logs, '#3dd6c4'], [n - m.nonbot_logs, '#4b5563']]) {
+      ctx.fillStyle = col;
+      ctx.fillRect(x, 2, (count / n) * W, H - 4);
+      x += (count / n) * W;
+    }
+  }
+  ctx.fillStyle = '#f7768e';
+  ctx.fillRect(0, H - 3, (m.blocked / n) * W, 2);
+}
+
+function drawSmrNet(rep, mode, looks) {
+  const st = S.smr.lastStatus;
   const P = prepCanvas($('smrNet'));
   if (!P) return;
   const { ctx, W, H } = P;
@@ -833,23 +1072,17 @@ function drawSmrNet(rep) {
   const cols = Math.max(1, Math.ceil(Math.sqrt(n * W / Math.max(1, H))));
   const rows = Math.ceil(n / cols);
   const cw = W / cols, ch = H / rows;
-  const rad = Math.max(1.5, Math.min(cw, ch) * 0.32);
+  const rad = Math.min(7, Math.max(1.5, Math.min(cw, ch) * 0.32));
   const blocked = new Set(st.blocked);
-  let holders = null;
-  if (sel !== null) {
-    const sp = st.spreading.find(c => c.client === rep.commands[sel].client);
-    if (sp) holders = new Set(sp.holders);
-    else if (rep.commands[sel].all_logs_round !== null) holders = 'all';
-    else holders = new Set();
-  }
-  const col = sel !== null ? cmdColor(sel) : '#3dd6c4';
-  const rstate = isRec() && S.smr.grid === 'rstate';
-  const at = i => ({ x: (i % cols) * cw + cw / 2, y: Math.floor(i / cols) * ch + ch / 2 });
-  S.smr.gridGeom = { cols, cw, ch, rad, n };
+  const order = slotOrder(looks);
+  const slotOf = new Array(n);
+  order.forEach((node, slot) => { slotOf[node] = slot; });
+  const at = i => ({ x: (slotOf[i] % cols) * cw + cw / 2, y: Math.floor(slotOf[i] / cols) * ch + ch / 2 });
+  S.smr.gridGeom = { cols, cw, ch, rad, n, order };
 
   // Adoption and reset-vote edges fade over the next couple of rounds so a
   // paused stepper still shows what the last round's replies caused.
-  if (rstate && st.rec) {
+  if (mode === 'rstate' && st.rec) {
     const edges = [...st.rec.adoptions.map(e => [e, '#3dd6c4']),
                    ...st.rec.reset_votes.map(e => [e, '#e0af68'])];
     ctx.lineWidth = 1;
@@ -865,16 +1098,12 @@ function drawSmrNet(rep) {
 
   for (let i = 0; i < n; i++) {
     const { x, y } = at(i);
-    const g = st.nodes[i];
-    const bot = g.log_len === null;
-    const holds = !bot && holders !== null && (holders === 'all' || holders.has(i));
     ctx.beginPath();
     ctx.arc(x, y, rad, 0, Math.PI * 2);
-    // R-state palette mirrors the engine's r_code: 0 no-reset · 1 reset · 2 ⊥
-    ctx.fillStyle = rstate
-      ? (g.r === 0 ? '#3dd6c4' : g.r === 1 ? '#e0af68' : '#4b5563')
-      : bot ? '#4b5563' : holds ? col : '#252c36';
+    ctx.fillStyle = looks[i].color;
+    ctx.globalAlpha = looks[i].alpha;
     ctx.fill();
+    ctx.globalAlpha = 1;
     if (blocked.has(i)) {
       ctx.beginPath();
       ctx.arc(x, y, rad + 1.5, 0, Math.PI * 2);
@@ -896,15 +1125,8 @@ function drawSmrNet(rep) {
       ctx.strokeStyle = '#cfd6df'; ctx.lineWidth = 1.4; ctx.stroke();
     }
   }
-  const cmd = sel !== null ? rep.commands[sel] : null;
-  if (rstate) {
-    const c = st.nodes.reduce((a, g) => (a[g.r]++, a), [0, 0, 0]);
-    $('smrNetNote').textContent = `no-reset ${c[0]} · reset ${c[1]} · ⊥ ${c[2]}`;
-  } else {
-    $('smrNetNote').textContent = cmd
-      ? `${cmdLabel(cmd)} · ${holders === 'all' ? 'all non-⊥' : holders.size + '/' + n}`
-      : 'inject to watch';
-  }
+  $('smrNetNote').textContent = '';
+  $('smrNetLegend').innerHTML = LEGENDS[mode](st) + LEGEND_TAIL;
   renderDrill();
 }
 
@@ -912,20 +1134,25 @@ function drawSmrNet(rep) {
 
 for (const b of document.querySelectorAll('#smrGridTabs .ct')) {
   b.addEventListener('click', () => {
-    S.smr.grid = b.dataset.grid;
-    for (const x of document.querySelectorAll('#smrGridTabs .ct')) x.classList.toggle('on', x === b);
+    S.smr.gridMode = b.dataset.grid;
     if (S.smr.report) renderSmr();
   });
 }
+$('srvSort').addEventListener('click', () => {
+  S.smr.gridSort = !S.smr.gridSort;
+  if (S.smr.report) renderSmr();
+});
+$('srvWatchX').addEventListener('click', () => selectCmd(null));
 
 $('smrNet').addEventListener('click', ev => {
   const geom = S.smr.gridGeom;
-  if (!geom || !S.smr.live || !isRec()) return;
+  if (!geom || !(S.smr.live || S.smr.handle) || !isRec()) return;
   const r = $('smrNet').getBoundingClientRect();
   const col = Math.floor((ev.clientX - r.left) / geom.cw);
   const row = Math.floor((ev.clientY - r.top) / geom.ch);
-  const node = row * geom.cols + col;
-  if (node < 0 || node >= geom.n) return;
+  const slot = row * geom.cols + col;
+  if (slot < 0 || slot >= geom.n) return;
+  const node = geom.order[slot];
   S.smr.pin = S.smr.pin === node ? null : node;
   S.smr.detail = null;
   if (S.smr.pin === null) renderSmr(); else post({ type: 'smr-node-detail', node });
@@ -962,203 +1189,7 @@ function row(k, v, diverged = false) {
   return `<div class="drillRow${diverged ? ' diverged' : ''}"><span class="k">${k}</span><span class="v">${v}</span></div>`;
 }
 
-function gammaAt(cmd, round) {
-  const p = cmd.spread.find(q => q.round === round) ||
-    cmd.spread.filter(q => q.round <= round).at(-1);
-  return p && p.useful_total ? p.useful_holders / p.useful_total : 0;
-}
-
-function chartFrame(ctx, W, H, rounds) {
-  const padL = 44, padR = 18, padT = 16, padB = 28;
-  const X = r => padL + (r / rounds) * (W - padL - padR);
-  ctx.font = '10px ui-monospace, Menlo, monospace';
-  ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'center';
-  const step = Math.max(1, Math.ceil(rounds / 6 / 5) * 5);
-  for (let r = 0; r <= rounds; r += step) {
-    ctx.strokeStyle = '#1c2129';
-    ctx.beginPath(); ctx.moveTo(X(r), padT); ctx.lineTo(X(r), H - padB); ctx.stroke();
-    ctx.fillStyle = '#565f6b'; ctx.fillText('r' + r, X(r), H - padB + 16);
-  }
-  // live round marker
-  if (S.smr.live && S.smr.lastStatus) {
-    const lx = X(S.smr.lastStatus.round);
-    ctx.strokeStyle = '#e0af68'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(lx, padT); ctx.lineTo(lx, H - padB); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = '#e0af68'; ctx.textAlign = 'left';
-    ctx.fillText('r' + S.smr.lastStatus.round, Math.min(lx + 4, W - padR - 24), padT + 6);
-  }
-  return { padL, padR, padT, padB, X };
-}
-
-function drawSpread(rep) {
-  const P = prepCanvas($('smrSpread'));
-  if (!P) return;
-  const { ctx, W, H } = P;
-  const rounds = Math.max(1, rep.metrics.length);
-  const { padL, padR, padT, padB, X } = chartFrame(ctx, W, H, rounds);
-  if (S.smr.chart === 'position') { drawPosition(rep, ctx, W, H, X, padT, padB, padL); return; }
-  const Y = g => (H - padB) - g * (H - padT - padB);
-  const sel = selectedCmd(rep);
-
-  ctx.font = '10px ui-monospace, Menlo, monospace';
-  ctx.textBaseline = 'middle';
-  for (const g of [0, 0.25, 0.5, 0.75, 1]) {
-    ctx.strokeStyle = '#1c2129'; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(padL, Y(g)); ctx.lineTo(W - padR, Y(g)); ctx.stroke();
-    if (g === 0 || g === 0.5 || g === 1) {
-      ctx.fillStyle = '#565f6b'; ctx.textAlign = 'right';
-      ctx.fillText(g.toFixed(1), padL - 8, Y(g));
-    }
-  }
-  // γ = 1/3 window ceiling
-  ctx.strokeStyle = '#2c3440'; ctx.setLineDash([3, 4]);
-  ctx.beginPath(); ctx.moveTo(padL, Y(1 / 3)); ctx.lineTo(W - padR, Y(1 / 3)); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.textBaseline = 'alphabetic';
-  ctx.save(); ctx.translate(12, (padT + H - padB) / 2); ctx.rotate(-Math.PI / 2);
-  ctx.fillStyle = '#565f6b'; ctx.textAlign = 'center'; ctx.fillText('γ', 0, 0); ctx.restore();
-
-  drawSpreadCurves(ctx, rep, X, Y, sel, {});
-}
-
-// Shared by the standalone spread panel and the timeline's γ lane, so both
-// read the same curve. `thin` drops the landmark glyphs the lane has no room
-// for; with no options it is the panel's original drawing exactly.
-export function drawSpreadCurves(ctx, rep, X, Y, sel, opts) {
-  // recent commands draw full-strength; older ones stay as faint ghosts
-  // (capped) instead of silently vanishing — select via audit for full view
-  const curveFrom = Math.max(0, rep.commands.length - 24);
-  const ghostFrom = Math.max(0, curveFrom - 200);
-  ctx.textAlign = 'center';
-  rep.commands.forEach((cmd, i) => {
-    if (!cmd.spread.length) return;
-    if (i < ghostFrom && i !== sel) return;
-    const ghost = i < curveFrom && i !== sel;
-    const col = cmdColor(i);
-    const active = sel === i;
-    ctx.globalAlpha = ghost ? 0.14 : sel !== null && !active ? 0.3 : 1;
-    ctx.strokeStyle = col;
-    ctx.lineWidth = active ? 2.6 : 1.8;
-    ctx.shadowColor = active ? col : 'transparent';
-    ctx.shadowBlur = active ? 8 : 0;
-    ctx.beginPath();
-    cmd.spread.forEach((p, j) => {
-      const y = Y(p.useful_total ? p.useful_holders / p.useful_total : 0);
-      if (j === 0) ctx.moveTo(X(p.round), y); else ctx.lineTo(X(p.round), y);
-    });
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-    if (ghost || opts.thin) { ctx.globalAlpha = 1; return; }
-
-    ctx.font = 'bold 9px ui-monospace, Menlo, monospace';
-    if (cmd.delivered_round !== null) {
-      ctx.fillStyle = col;
-      ctx.beginPath();
-      ctx.arc(X(cmd.delivered_round), Y(gammaAt(cmd, cmd.delivered_round)), active ? 5 : 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#14181e'; ctx.lineWidth = 1.5; ctx.stroke();
-    }
-    const tick = (round, tcol, label) => {
-      if (round === null) return;
-      const x = X(round), y = Y(gammaAt(cmd, round));
-      ctx.strokeStyle = tcol; ctx.lineWidth = active ? 2.2 : 1.6;
-      ctx.beginPath(); ctx.moveTo(x, y - 7); ctx.lineTo(x, y + 7); ctx.stroke();
-      ctx.fillStyle = tcol; ctx.fillText(label, x, y - 11);
-    };
-    tick(cmd.all_logs_round, '#7dcfff', 'B');
-    tick(cmd.prefix_fixed_round, '#bb9af7', 'E');
-    if (cmd.committed_ack_round !== null) {
-      const x = X(cmd.committed_ack_round), y = Y(gammaAt(cmd, cmd.committed_ack_round));
-      ctx.strokeStyle = '#5ec9bd'; ctx.lineWidth = 1.4;
-      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y - 14); ctx.stroke();
-      ctx.fillStyle = '#5ec9bd';
-      ctx.beginPath(); ctx.moveTo(x, y - 14); ctx.lineTo(x + 9, y - 11); ctx.lineTo(x, y - 8);
-      ctx.closePath(); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-  });
-}
-
-// position band: selected command's min/median/max log position per round
-function drawPosition(rep, ctx, W, H, X, padT, padB, padL) {
-  const sel = selectedCmd(rep);
-  if (sel === null) return;
-  const cmd = rep.commands[sel];
-  const pts = cmd.spread.filter(p => p.pos_max !== undefined && p.pos_max !== null);
-  ctx.font = '10px ui-monospace, Menlo, monospace';
-  if (!pts.length) {
-    ctx.fillStyle = '#565f6b'; ctx.textAlign = 'left';
-    ctx.fillText('no position samples yet — command not in any log', padL + 8, padT + 14);
-    return;
-  }
-  const maxPos = Math.max(...pts.map(p => p.pos_max), 1);
-  const Y = pos => (H - padB) - (pos / maxPos) * (H - padT - padB - 8);
-  ctx.textBaseline = 'middle'; ctx.textAlign = 'right'; ctx.fillStyle = '#565f6b';
-  for (const f of [0, 0.5, 1]) {
-    const pos = Math.round(maxPos * f);
-    ctx.fillText(String(pos), padL - 8, Y(pos));
-  }
-  ctx.textBaseline = 'alphabetic';
-  // band min..max
-  ctx.fillStyle = 'rgba(61,214,196,0.18)';
-  ctx.beginPath();
-  pts.forEach((p, j) => { const y = Y(p.pos_max); j === 0 ? ctx.moveTo(X(p.round), y) : ctx.lineTo(X(p.round), y); });
-  for (let j = pts.length - 1; j >= 0; j--) ctx.lineTo(X(pts[j].round), Y(pts[j].pos_min));
-  ctx.closePath(); ctx.fill();
-  // median line
-  ctx.strokeStyle = '#3dd6c4'; ctx.lineWidth = 2.2;
-  ctx.beginPath();
-  pts.forEach((p, j) => { const y = Y(p.pos_med); j === 0 ? ctx.moveTo(X(p.round), y) : ctx.lineTo(X(p.round), y); });
-  ctx.stroke();
-  // T_E marker
-  if (cmd.prefix_fixed_round !== null) {
-    const x = X(cmd.prefix_fixed_round);
-    ctx.strokeStyle = '#bb9af7'; ctx.lineWidth = 1.4;
-    ctx.beginPath(); ctx.moveTo(x, H - padB); ctx.lineTo(x, H - padB + 6); ctx.stroke();
-    ctx.fillStyle = '#bb9af7'; ctx.textAlign = 'center';
-    ctx.fillText('T_E', x, H - 6);
-  }
-  ctx.fillStyle = '#6f7986'; ctx.textAlign = 'left';
-  ctx.fillText(`${cmdLabel(cmd)} · position band (min/median/max)`, padL + 8, padT + 12);
-}
-
-// prefix ribbon: per-round agreed-prefix fraction
-function drawPrefix(rep) {
-  const P = prepCanvas($('smrPrefix'));
-  if (!P) return;
-  const { ctx, W, H } = P;
-  const ms = rep.metrics;
-  if (!ms.length) return;
-  const bw = W / ms.length;
-  ms.forEach((m, i) => {
-    const denom = Math.max(m.max_log_len, m.max_executed_len, 1);
-    const v = Math.max(0, Math.min(1, m.lcp_len / denom));
-    ctx.fillStyle = v > 0.995 ? '#3dd6c4' : 'rgba(61,214,196,0.45)';
-    const h = v * (H - 6);
-    ctx.fillRect(i * bw + 0.5, H - 3 - h, Math.max(bw - 1, 0.75), h);
-  });
-  const last = ms[ms.length - 1];
-  $('smrLcpStat').textContent = `lcp ${last.lcp_len} / max ${Math.max(last.max_log_len, last.max_executed_len)}`;
-}
-
 function renderMetrics(rep) {
-  const m = rep.metrics[rep.metrics.length - 1];
-  const failed = rep.terminal.Failed;
-  const term = failed
-    ? `FAILED attempted r${failed.attempted_round} · completed r${failed.completed_round} · observed r${failed.observed_round}`
-    : rep.terminal.Dead ? `DEAD r${rep.terminal.Dead.round}` : `${rep.metrics.length} rounds`;
-  const pending = rep.commands.filter(c => c.status === 'Pending').length;
-  $('smrStrip').textContent = m
-    ? `${term} · logs ${m.nonbot_logs} · useful ${m.useful} · max|L| ${m.max_log_len}` +
-      ` · exec ${m.min_executed_len}–${m.max_executed_len}` +
-      ` · in flight ${pending}/${rep.commands.length}` +
-      (rep.safety_ok ? '' : ' · ⚠ SAFETY VIOLATION')
-    : '–';
-  $('smrCtlMetrics').innerHTML = m
-    ? `logs <b>${m.nonbot_logs}</b> · useful <b>${m.useful}</b> · exec <b>${m.min_executed_len}–${m.max_executed_len}</b>` +
-      (rep.safety_ok ? '' : ' · <b style="color:#f7768e">⚠ SAFETY</b>')
-    : '';
   $('auditCnt').textContent = String(rep.commands.length);
 }
 
@@ -1231,6 +1262,6 @@ function renderAudit(rep) {
 
 // one starter row so the form is runnable as-is
 injRow(2);
+syncStrategy();
 window.addEventListener('resize', () => { if (S.smr.report && S.view === 'smr') renderSmr(); });
 export { renderSmr };
-useSpreadCurves(drawSpreadCurves);

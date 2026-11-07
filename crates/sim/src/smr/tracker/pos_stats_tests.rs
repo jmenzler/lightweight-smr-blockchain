@@ -33,3 +33,8 @@ fn permute(v: &mut Vec<u32>, k: usize, out: &mut std::collections::BTreeSet<Vec<
         v.swap(k, i);
     }
 }
+
+#[test]
+fn the_median_of_an_even_count_is_the_upper_one() {
+    assert_eq!(pos_stats(vec![3, 5, 7, 9]), (Some(3), Some(7), Some(9)));
+}

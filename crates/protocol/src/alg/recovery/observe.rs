@@ -53,17 +53,17 @@ impl RecoveryNode {
         Arc::clone(&self.c_i)
     }
 
+    /// Whether the boundary's "P is a prefix of L_i" holds for this node alone. A rollback sets
+    /// L_i := P first, so a reset node passes by construction: whether its P agrees with the
+    /// other servers' same-W checkpoints (Lemma 6.7) is a population question this cannot see.
     pub fn validate_boundary(&self) -> Result<(), RecoveryPrefixViolation> {
-        let pre = self.c_i.p.as_deref().unwrap_or(&[]);
         if self.r_i == RState::Reset {
-            return match self.c_i.p.as_deref() {
-                Some(log) => validate_prefix(pre, log.len(), log.iter()),
-                None => Ok(()),
-            };
+            return Ok(());
         }
         let Some(log) = self.log_seq() else {
             return Ok(());
         };
+        let pre = self.c_i.p.as_deref().unwrap_or(&[]);
         validate_prefix(pre, log.len(), log.iter())
     }
 

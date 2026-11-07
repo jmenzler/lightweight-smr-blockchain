@@ -23,6 +23,8 @@ let tallies = null;
 // 'compact' = §5 as the paper proves it · 'recovery' = the RQ11 construction
 // over Alg 6 · 'none' = chain structure only, no certificate layer to show
 let certsMode = 'compact';
+// true from the drawer opening until the engine's feed answers; the snapshot is dropped meanwhile
+let loading = false;
 let selectEntry = () => {};
 
 // smr.js owns the report, so it resolves a committed entry to a command index
@@ -31,7 +33,30 @@ export function useEntrySelect(fn) { selectEntry = fn; }
 const BW = 84, GAP = 22, X0 = 14, BY = 6, BH = 44, LVL = 64;
 const SKYLINE_PEAK_HEIGHT = 7; // trees taller than 2^6 leaves → skyline
 
+// Read side for the block drawer: the best server's forest, the committed
+// entries it covers and how certificates are fed (compact / recovery / none).
+export function forestView() {
+  if (!snap) return null;
+  const srv = best(snap);
+  return { m: srv.m, peaks: srv.peaks, entries: snap.committed || null, mode: certsMode };
+}
+export function tallyFor(client, sn) {
+  return tallies ? { round: tallies.round, tally: tallies.map[client]?.[sn] ?? null } : null;
+}
+export function cmdIndexFor(ent) {
+  const i = cmdIndexMap().get(ent.client + ':' + ent.sn);
+  return i === undefined ? -1 : i;
+}
+
+export const certsLoading = () => loading;
+export function markCertsLoading() {
+  resetCertsDrawer();
+  loading = true;
+}
+export function endCertsLoading() { loading = false; }
+
 export function resetCertsDrawer() {
+  loading = false;
   snap = null;
   selPos = null;
   tallies = null;
@@ -413,7 +438,7 @@ function cmdIndexMap() {
 
 // block label: who occupies the committed slot. The recovery feed carries op
 // (the identity its audit trail and batch drawer use); compact carries sn.
-function entryLabel(ent) {
+export function entryLabel(ent) {
   if (ent.kind === 'nop') return { text: '·', color: '#565f6b', title: 'no-op filler' };
   const auto = ent.client >= AUTO_CLIENT_BASE;
   const own = ent.op != null ? '·op' + ent.op : '·' + ent.sn;

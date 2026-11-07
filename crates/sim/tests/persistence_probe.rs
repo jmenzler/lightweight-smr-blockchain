@@ -1,5 +1,6 @@
 //! RQ2 persistence probe: displacement metric, per-round split-brain oracle,
-//! and replay equivalence with the batch runner.
+//! and replay equivalence with the batch runner. Design registered in
+//! experiments/rq2-commitment-errors/prereg-persistence.md.
 
 use protocol::compact::{ClientCommand, Entry};
 use protocol::shared_state::ExecSeq;
@@ -32,7 +33,7 @@ fn identical_branches_displace_nothing() {
 }
 
 /// The registered shift-invariance property: one command jumping past a whole
-/// suffix costs D = 1, not "the entire suffix" (registered design, § E1).
+/// suffix costs D = 1, not "the entire suffix" (prereg § E1).
 #[test]
 fn one_command_displacing_a_whole_suffix_costs_one() {
     // A executes x first, B executes it last; a,b,c shift by one position.
@@ -199,7 +200,7 @@ fn a_population_that_agrees_has_no_forked_branch() {
     assert_eq!(forked_branch(&seqs), None);
 }
 
-/// Red flag 1 of the probe design: a command executed twice on one server. The
+/// Red flag 1 of the prereg: a command executed twice on one server. The
 /// compact rule has no gate against it — `execute_aged_prefix` pushes every
 /// aged log entry — so it has to be measured rather than assumed away.
 #[test]
@@ -365,7 +366,7 @@ fn the_probe_reproduces_the_batch_runner_report_on_a_run_that_splits_its_brain()
     assert_eq!(probe.report, run_smr(&scenario));
 }
 
-/// Obligation 2 of the probe design: the probe's per-round oracle must agree with the
+/// Prereg OBLIGATION 2: the probe's per-round oracle must agree with the
 /// engine's own latch, which flips in the round the split brain appears.
 #[test]
 fn the_probe_oracle_flips_in_the_same_round_as_the_engine_latch() {
@@ -449,7 +450,7 @@ fn the_post_violation_cap_stops_the_run_and_says_so() {
     assert_eq!(full.r_v, capped.r_v, "the prefix is the same run");
 }
 
-/// Obligation 2, on a ledgered run: the run ledger
+/// Prereg OBLIGATION 2, on a committed ledgered run: `.runs/sim-runs.jsonl`
 /// records this rq2-tn-boundary cell/seed as safety_ok = false. The grid ran
 /// it LEAN and the lean-vs-full pins deliberately cover only non-violating
 /// runs, so the probe reproducing the committed verdict is a real check.
@@ -767,5 +768,154 @@ fn a_plurality_on_one_side_of_the_fork_reads_exactly_as_before() {
     assert_eq!(
         o.d_mutual, o.d_fork,
         "generalised == registered when A is on a side"
+    );
+}
+
+fn probe_cell(n: usize, t: u64, beta: f64, pmf: &str, seed: u64, rounds: usize) -> SmrScenario {
+    scenario(&format!(
+        r#"{{"n": {n}, "seed": {seed}, "k": 6, "ell": 3, "sigma": 1.0,
+            "proto": {{"kind": "compact", "t_commit_rounds": {t}}},
+            "injections": [], "max_rounds": {rounds},
+            "schedule": {{"kind": "fresh_per_round", "fraction": {beta}}},
+            "traffic": {{"kind": "pmf", "arrivals_pmf": {pmf}}}}}"#
+    ))
+}
+
+/// Independent replay: rounds in which some server's executed sequence did not extend its previous one.
+fn retraction_rounds(scenario: &SmrScenario, upto_round: usize) -> Vec<usize> {
+    let sim::BlockSchedule::FreshPerRound { fraction } = scenario.schedule else {
+        panic!("fresh schedule expected");
+    };
+    let mut state = sim::smr::SmrState::new_with_certs(
+        scenario.n,
+        scenario.cfg,
+        scenario.proto,
+        scenario.sigma,
+        scenario.seed,
+        &scenario.injections,
+        scenario.traffic.as_deref().unwrap_or(&[]),
+        scenario.client_model,
+        scenario.partition.as_deref(),
+        false,
+        scenario.merge_policy,
+        scenario.repeated_commit,
+    );
+    let blocked = state.blocked_count(fraction);
+    let mut prev: Vec<Vec<Entry>> = vec![Vec::new(); scenario.n];
+    let mut rounds = Vec::new();
+    for round in 1..=upto_round {
+        state.step_sampled(blocked);
+        for (i, p) in prev.iter_mut().enumerate() {
+            let cur = state.executed_entries(i).expect("compact").to_vec();
+            if (cur.len() < p.len() || cur[..p.len()] != p[..]) && rounds.last() != Some(&round) {
+                rounds.push(round);
+            }
+            *p = cur;
+        }
+    }
+    rounds
+}
+
+// Def 1.5, p. 8: a retraction in a run that never splits still shows in the CSV.
+#[test]
+fn a_retraction_without_a_split_appears_in_the_probe_row() {
+    for (n, t, beta, seed) in [
+        (24usize, 3u64, 0.25f64, 3u64),
+        (24, 3, 0.25, 21),
+        (32, 4, 0.2, 36),
+    ] {
+        let scenario = probe_cell(n, t, beta, "[0,0.5,0.5]", seed, 150);
+        let probe = probe_run(&scenario, &ProbeOptions::default()).expect("probe");
+        let rounds = retraction_rounds(&scenario, probe.rounds);
+        assert!(
+            probe.r_v.is_none() && !rounds.is_empty(),
+            "precondition, seed {seed}"
+        );
+        let row = probe_row("rq2", &scenario, &probe);
+        assert_eq!(
+            column(&row, "shrink_events"),
+            "",
+            "unchanged: defined for split runs only"
+        );
+        assert!(column(&row, "retractions").parse::<u64>().expect("filled") >= 1);
+        assert_eq!(
+            column(&row, "first_retraction_round"),
+            rounds[0].to_string()
+        );
+        assert_eq!(column(&row, "heals"), "", "no split, so nothing to heal");
+    }
+}
+
+// p. 8 + p. 29: a return to consistency after a split is reached by rewriting executed commands.
+#[test]
+fn every_heal_is_labelled_with_the_retractions_it_took() {
+    for seed in [970012u64, 970007] {
+        let scenario = probe_cell(64, 16, 0.1, "[0,0,0,0,1]", seed, 200);
+        let opts = ProbeOptions {
+            stop_rounds_after_violation: Some(48),
+            ..ProbeOptions::default()
+        };
+        let probe = probe_run(&scenario, &opts).expect("probe");
+        let r_h = probe
+            .transience
+            .as_ref()
+            .and_then(|t| t.r_h)
+            .expect("precondition: heals");
+        assert!(retraction_rounds(&scenario, probe.rounds).contains(&r_h));
+        let row = probe_row("rq2", &scenario, &probe);
+        let heals: u64 = column(&row, "heals").parse().expect("filled");
+        assert!(heals >= 1);
+        assert_eq!(
+            column(&row, "heals_by_retraction"),
+            heals.to_string(),
+            "seed {seed}"
+        );
+        assert!(
+            column(&row, "r_h_retractions")
+                .parse::<u64>()
+                .expect("filled")
+                >= 1
+        );
+        assert!(
+            column(&row, "retraction_rewrites")
+                .parse::<u64>()
+                .expect("filled")
+                >= 1
+        );
+    }
+}
+
+#[test]
+fn heals_count_episode_ends_and_the_ones_that_retracted() {
+    let h = sim::persistence::heals(&[true, false, true, true, false], &[3, 2, 0, 0, 0]);
+    assert_eq!(
+        (h.heals, h.by_retraction, h.r_h_retractions),
+        (2, 1, Some(2))
+    );
+    let open = sim::persistence::heals(&[true, true], &[1, 1]);
+    assert_eq!(
+        (open.heals, open.by_retraction, open.r_h_retractions),
+        (0, 0, None)
+    );
+}
+
+#[test]
+fn a_heal_is_credited_to_a_retraction_anywhere_after_its_split_began() {
+    let early = sim::persistence::heals(&[true, true, false], &[0, 4, 0]);
+    assert_eq!(
+        (early.heals, early.by_retraction, early.r_h_retractions),
+        (1, 1, Some(0)),
+        "the retraction one round before the heal round counts"
+    );
+    let at_start = sim::persistence::heals(&[true, false], &[5, 0]);
+    assert_eq!(
+        at_start.by_retraction, 0,
+        "a retraction in the round the split appeared did not heal it"
+    );
+    let two = sim::persistence::heals(&[true, true, true, false, true, false], &[9, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        (two.heals, two.by_retraction),
+        (2, 1),
+        "each episode is credited only with its own retractions"
     );
 }

@@ -8,8 +8,10 @@ fn spec(n: usize, seed: u64, beta: f64, max_rounds: usize) -> String {
 }
 
 #[test]
-fn run_scenario_json_matches_native_run_traced() {
-    // canonical-seed promise: WASM wrapper = same trace as CLI for same inputs
+fn run_scenario_json_matches_run_traced_on_the_host_target() {
+    // The wrapper adds no behaviour of its own: same trace as the library for the same inputs.
+    // This runs natively and cannot see wasm32-only divergence; running the crate on wasm32
+    // needs a wasm-bindgen-test harness (`wasm-pack test --node`), which the workspace lacks.
     let out: serde_json::Value =
         serde_json::from_str(&run_scenario_json(&spec(50, 3, 0.10, 500))).unwrap();
     let (_, trace) = sim::run_traced(&sim::Scenario {
@@ -70,4 +72,13 @@ fn targets_stripped_above_2000_nodes() {
             .len(),
         100
     );
+}
+
+#[test]
+fn noise_controller_outside_the_dp_model_returns_error_json() {
+    let bad = r#"{"n":50,"seed":1,"k":6,"ell":3,"init":{"kind":"split","fraction":0.5},
+        "max_rounds":10,"schedule":{"kind":"noise_controller","fraction":0.1}}"#;
+    let out: serde_json::Value = serde_json::from_str(&run_scenario_json(bad)).unwrap();
+    let err = out["error"].as_str().expect("error field");
+    assert!(err.contains("uniform_random k=2"), "{err}");
 }

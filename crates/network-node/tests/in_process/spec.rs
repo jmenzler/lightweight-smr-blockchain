@@ -121,8 +121,8 @@ fn smr_rejects_sim_only_fields_the_node_does_not_implement() {
             "merge_policy",
         ),
         (
-            r#","schedule":{"kind":"adaptive_1late","fraction":0.1,"policy":"block_holders"}"#,
-            "adaptive_1late",
+            r#","schedule":{"kind":"adaptive_0late","fraction":0.1,"policy":"block_holders"}"#,
+            "adaptive_0late",
         ),
         (
             r#","schedule":{"kind":"adaptive_alpha_late","fraction":0.1,"alpha":2,"policy":"block_holders"}"#,
@@ -139,7 +139,7 @@ fn smr_rejects_sim_only_fields_the_node_does_not_implement() {
 fn smr_rejects_recovery_proto() {
     let json = smr_json("").replace(
         r#"{"kind":"compact","t_commit_rounds":10}"#,
-        r#"{"kind":"recovery","t_window_rounds":10}"#,
+        r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#,
     );
     let err = NodeRunSpec::from_json(&json).expect_err("recovery");
     assert!(err.contains("networked mode"), "{err}");
@@ -154,7 +154,7 @@ fn value_arms_reject_partition_and_adaptive_schedules() {
     assert!(err.contains("networked mode"), "{err}");
     let gossip_adaptive = gossip_json(4, 7, 0).replace(
         r#""max_rounds":40"#,
-        r#""max_rounds":40,"schedule":{"kind":"adaptive_1late","fraction":0.1,"policy":"block_holders"}"#,
+        r#""max_rounds":40,"schedule":{"kind":"adaptive_0late","fraction":0.1,"policy":"block_holders"}"#,
     );
     let err = NodeRunSpec::from_json(&gossip_adaptive).expect_err("gossip adaptive");
     assert!(err.contains("networked mode"), "{err}");
@@ -166,4 +166,57 @@ fn value_arms_reject_partition_and_adaptive_schedules() {
     let priority_partition = median_partition.replace("median", "priority");
     let err = NodeRunSpec::from_json(&priority_partition).expect_err("priority partition");
     assert!(err.contains("partition is not supported"), "{err}");
+}
+
+#[test]
+fn engine_construction_validates_a_spec_that_skipped_from_json() {
+    let priority_undecided = r#"{"scenario":{"priority":{"n":8,"seed":1,"k":6,"ell":3,
+        "init":{"kind":"with_undecided","useful_fraction":0.5,"inner":{"kind":"distinct"}},
+        "max_rounds":20}},"sync":"timer"}"#;
+    let no_holders = r#"{"scenario":{"gossip":{"n":8,"seed":1,"k":6,"ell":3,
+        "holders":0,"x":7,"x0":0,"max_rounds":20}},"sync":"timer"}"#;
+    for json in [priority_undecided, no_holders] {
+        let spec: NodeRunSpec = serde_json::from_str(json).expect("parses without validation");
+        assert!(
+            network_node::engine::RoundEngine::new(&spec, 0).is_err(),
+            "hand-built spec must be refused, not run or panic"
+        );
+    }
+}
+
+#[test]
+fn k_beyond_the_wire_slot_width_is_rejected() {
+    let json = |k: usize| {
+        format!(
+            r#"{{"scenario":{{"median":{{"n":16,"seed":1,"k":{k},"ell":3,
+            "init":{{"kind":"distinct"}},"max_rounds":5}}}},"sync":"timer"}}"#
+        )
+    };
+    assert!(NodeRunSpec::from_json(&json(65_535)).is_ok());
+    assert!(NodeRunSpec::from_json(&json(65_536)).is_err());
+}
+
+#[test]
+fn disjoint_is_accepted_because_its_masks_need_no_node_state() {
+    let json = smr_json(r#","schedule":{"kind":"disjoint","fraction":0.25}"#);
+    let spec = NodeRunSpec::from_json(&json).expect("disjoint is a history-only schedule");
+    network_node::engine::RoundEngine::new(&spec, 0).expect("engine precomputes the masks");
+    let err = NodeRunSpec::from_json(&smr_json(
+        r#","schedule":{"kind":"disjoint","fraction":0.6}"#,
+    ))
+    .expect_err("fraction above 1/2");
+    assert!(err.contains("fraction <= 1/2"), "{err}");
+}
+
+#[test]
+fn value_arms_reject_the_noise_controller_because_it_reads_node_state() {
+    for arm in ["median", "priority"] {
+        let json = format!(
+            r#"{{"scenario":{{"{arm}":{{"n":50,"seed":1,"k":6,"ell":3,
+            "init":{{"kind":"uniform_random","k":2}},"max_rounds":20,
+            "schedule":{{"kind":"noise_controller","fraction":0.1}}}}}},"sync":"timer"}}"#
+        );
+        let err = NodeRunSpec::from_json(&json).expect_err(arm);
+        assert!(err.contains("networked mode"), "{arm}: {err}");
+    }
 }

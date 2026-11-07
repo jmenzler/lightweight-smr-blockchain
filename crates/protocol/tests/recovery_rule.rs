@@ -1,8 +1,10 @@
 use protocol::Config;
 use protocol::certificates::{MmrForest, ServerCertState, leaf_hash};
-use protocol::compact::{ClientCommand, Entry, RepeatedCommit, SharedState, Timed};
+use protocol::compact::{ClientCommand, Entry, OutOfSnOrder, RepeatedCommit, SharedState, Timed};
 use protocol::log::Log;
-use protocol::recovery::{Checkpoint, PrefixMismatch, RState, RecoveryNode, RecoveryReply};
+use protocol::recovery::{
+    Checkpoint, PrefixMismatch, RState, RecoveryNode, RecoveryReply, latest_checkpoint_index,
+};
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use std::sync::Arc;
@@ -91,6 +93,43 @@ fn wants_amplify_suppresses_present_commands_only() {
 
     assert!(!n.wants_amplify(&existing));
     assert!(n.wants_amplify(&fresh));
+}
+
+// --- the reply bullet: guarded by R_i ≠ ⊥ (not by L_i), carrying L_i only when it is non-⊥ ---
+
+#[test]
+fn answer_carries_log_checkpoint_and_r_exactly_while_r_is_not_bot() {
+    let n = node();
+    let reply = n.answer().expect("R = no-reset answers");
+    assert_eq!(reply.r_j, RState::NoReset);
+    assert_eq!(reply.l_j.map(|l| l.entries().to_vec()), n.log_entries());
+    assert!(Arc::ptr_eq(&reply.c_j, &n.checkpoint_shared()));
+}
+
+#[test]
+fn answer_is_guarded_by_r_not_by_the_log() {
+    // R = reset with L = ⊥ (2 of 3 replies carry a log): the node still answers, without a log.
+    let mut reset_without_log = node();
+    reset_without_log.step(
+        &[
+            reply(Some(seed_log()), genesis(), RState::Reset),
+            reply(Some(seed_log()), genesis(), RState::Reset),
+            reply(None, genesis(), RState::Reset),
+        ],
+        &[],
+        1,
+        &mut rng(),
+    );
+    assert_eq!(reset_without_log.log_entries(), None, "precondition: L = ⊥");
+    let reply = reset_without_log.answer().expect("R = reset answers");
+    assert_eq!(reply.r_j, RState::Reset);
+    assert!(reply.l_j.is_none());
+
+    // R = ⊥ (no replies): the node does not answer.
+    let mut bot = node();
+    bot.step(&[], &[], 1, &mut rng());
+    assert_eq!(bot.reset_state(), RState::Bot, "precondition: R = ⊥");
+    assert!(bot.answer().is_none());
 }
 
 // --- during-window step 3: split ℓ-counts (Lemma 6.2, log-repliers ⊆ recovery-repliers) ---
@@ -206,6 +245,124 @@ fn tied_largest_window_checkpoints_may_resolve_either_way() {
     );
     assert_eq!(*n.shared_state(), *adopted.s);
     assert_eq!(n.log_entries(), adopted.p.clone());
+}
+
+/// A checkpoint of window `w` holding the one command `client`, so every window is distinguishable.
+fn window_checkpoint(w: u64) -> Checkpoint {
+    let c = cmd(w as u32, 1, 100 + w);
+    cp(state_of(&[c]), Some(vec![timed(Entry::Cmd(c), 2)]), w)
+}
+
+#[test]
+fn the_largest_window_among_mixed_replies_is_adopted_wherever_it_sits() {
+    // Alg 6: "the received checkpoint with largest W'" over ALL replies, not the first, the
+    // last or the smallest. Windows 1, 3, 2 in every order, then six replies with the
+    // maximum at each position.
+    let orders: [[u64; 3]; 6] = [
+        [1, 3, 2],
+        [1, 2, 3],
+        [3, 1, 2],
+        [3, 2, 1],
+        [2, 1, 3],
+        [2, 3, 1],
+    ];
+    for order in orders {
+        let mut n = node();
+        let replies: Vec<_> = order
+            .iter()
+            .map(|&w| reply(Some(seed_log()), window_checkpoint(w), RState::NoReset))
+            .collect();
+        n.step(&replies, &[], 4, &mut rng());
+        assert_eq!(n.checkpoint().w, 3, "windows {order:?}");
+        assert_eq!(*n.checkpoint(), window_checkpoint(3), "windows {order:?}");
+    }
+    for position in 0..6 {
+        let mut n = node();
+        let replies: Vec<_> = (0..6)
+            .map(|i| {
+                let w = if i == position { 9 } else { 1 + i as u64 % 4 };
+                reply(Some(seed_log()), window_checkpoint(w), RState::NoReset)
+            })
+            .collect();
+        n.step(&replies, &[], 4, &mut rng());
+        assert_eq!(n.checkpoint().w, 9, "maximum at reply {position}");
+    }
+}
+
+#[test]
+fn an_equal_window_checkpoint_with_other_contents_is_not_adopted() {
+    // Alg 6: "If W' > W": W' = W adopts nothing, even when S', P' differ from the node's own.
+    let mut n = node();
+    let own = window_checkpoint(2);
+    n.step(
+        &vec![reply(Some(seed_log()), own.clone(), RState::NoReset); 3],
+        &[],
+        4,
+        &mut rng(),
+    );
+    assert_eq!(*n.checkpoint(), own);
+    let own_log = n.log_entries().unwrap().to_vec();
+    let other = cp(
+        state_of(&[cmd(7, 1, 700)]),
+        Some(vec![timed(Entry::Cmd(cmd(7, 1, 700)), 2)]),
+        2,
+    );
+    n.step(
+        &vec![reply(Some(own_log.clone()), other, RState::NoReset); 3],
+        &[],
+        5,
+        &mut rng(),
+    );
+    assert_eq!(*n.checkpoint(), own, "equal W' leaves C_i alone");
+    assert_eq!(*n.shared_state(), *own.s);
+    assert_eq!(n.log_entries(), Some(own_log));
+}
+
+#[test]
+fn a_newer_checkpoint_carried_by_fewer_than_ell_replies_is_not_adopted() {
+    // Alg 6: with less than ℓ replies the node sets R_i := ⊥ and adopts nothing, however new
+    // the checkpoints in those replies are.
+    let mut n = node();
+    let replies = vec![reply(Some(seed_log()), window_checkpoint(5), RState::NoReset); 2];
+    n.step(&replies, &[], 4, &mut rng());
+    assert_eq!(n.reset_state(), RState::Bot);
+    assert_eq!(*n.checkpoint(), genesis());
+    assert_eq!(*n.shared_state(), SharedState::default());
+}
+
+#[test]
+fn a_tie_on_the_largest_window_resolves_to_the_last_tied_reply() {
+    let a = cmd(1, 1, 77);
+    let b = cmd(2, 1, 88);
+    let cp_a = cp(state_of(&[a]), Some(vec![timed(Entry::Cmd(a), 2)]), 4);
+    let cp_b = cp(state_of(&[b]), Some(vec![timed(Entry::Cmd(b), 2)]), 4);
+    let older = cp(state_of(&[]), Some(Vec::new()), 2);
+    for (replies, last_tied, expected) in [
+        (
+            vec![
+                reply(None, cp_a.clone(), RState::NoReset),
+                reply(None, cp_b.clone(), RState::NoReset),
+                reply(None, older.clone(), RState::NoReset),
+            ],
+            1,
+            &cp_b,
+        ),
+        (
+            vec![
+                reply(None, cp_b.clone(), RState::NoReset),
+                reply(None, cp_a.clone(), RState::NoReset),
+                reply(None, cp_a.clone(), RState::NoReset),
+            ],
+            2,
+            &cp_a,
+        ),
+    ] {
+        assert_eq!(latest_checkpoint_index(&replies), last_tied);
+        let mut n = node();
+        n.step(&replies, &[], 3, &mut rng());
+        assert_eq!(n.checkpoint(), expected);
+        assert!(Arc::ptr_eq(&n.checkpoint_shared(), &replies[last_tied].c_j));
+    }
 }
 
 #[test]
@@ -330,7 +487,7 @@ fn first_end_window_mints_window_one_and_rollback_cascades_through_recommit() {
 
 #[test]
 fn rollback_then_recommit_cascade_completes_in_one_boundary() {
-    // The known trap: a server entering the boundary in Reset with
+    // The KB-flagged trap: a server entering the boundary in Reset with
     // P ≠ ⊥ rolls back (step 1) AND falls through into step 2 in the SAME
     // call — commit P, strip, fresh checkpoint, exit NoReset. An if/else-if
     // reading would exit in Reset with log = P, adding a full window to
@@ -433,26 +590,22 @@ fn boundary_validation_reports_bounded_stamped_diagnostics_without_mutating() {
     assert_eq!(violation.first_mismatch, 0);
     assert_eq!(violation.expected, Some(expected));
     assert_eq!(violation.actual, Some(actual));
-    assert!(!violation.command_prefix_ok);
     assert_eq!(n.log_entries(), before_log);
     assert_eq!(*n.shared_state(), before_state);
     assert_eq!(*n.checkpoint(), before_checkpoint);
 }
 
 #[test]
-fn boundary_validation_distinguishes_stamp_only_and_short_log_mismatches() {
+fn boundary_validation_accepts_a_stamp_only_difference_and_rejects_a_short_log() {
     let a = cmd(1, 1, 77);
     let stamp_only = forked_node(vec![timed(Entry::Cmd(a), 9)]);
-    let stamp = stamp_only.validate_boundary().expect_err("stamp mismatch");
-    assert_eq!(stamp.first_mismatch, 0);
-    assert!(stamp.command_prefix_ok);
+    assert_valid_boundary_is_read_only(&stamp_only);
 
     let short = forked_node(Vec::new());
     let short = short.validate_boundary().expect_err("short log");
     assert_eq!(short.first_mismatch, 0);
     assert_eq!(short.expected, Some(timed(Entry::Cmd(a), 2)));
     assert_eq!(short.actual, None);
-    assert!(!short.command_prefix_ok);
 }
 
 #[test]
@@ -609,6 +762,33 @@ fn skip_boundary_stale_node_in_reset_does_not_restore_the_skipped_p() {
         n.log_entries(),
         None,
         "L_i is not rolled back to the skipped P"
+    );
+}
+
+// "Never commits" holds for the skipping node only: it still answers with its stale C_i (R_i = reset
+// is not ⊥), and a peer with an older W adopts it as an ordinary newer checkpoint.
+#[test]
+fn a_stale_checkpoint_is_still_served_and_an_older_peer_adopts_and_commits_it() {
+    let skipper = skipped_node();
+    assert!(skipper.stale_checkpoint(), "precondition: C_i is stale");
+    let served = skipper.answer().expect("R_i = reset answers");
+    assert!(Arc::ptr_eq(&served.c_j, &skipper.checkpoint_shared()));
+
+    let mut peer = node();
+    peer.step(&vec![served; 3], &[], 21, &mut rng());
+    assert_eq!(
+        peer.checkpoint().w,
+        1,
+        "the older peer adopts the stale C_i"
+    );
+    assert!(!peer.stale_checkpoint(), "adoption clears the mark");
+
+    peer.end_window(2, 30);
+    assert_eq!(peer.checkpoint().w, 2, "the adopter mints the next window");
+    assert_eq!(
+        peer.shared_state().logical_len(),
+        skipper.shared_state().logical_len() + 1,
+        "and commits the P the skipper never commits"
     );
 }
 
@@ -1576,6 +1756,31 @@ fn sharing_refuses_a_checkpoint_of_another_window() {
     n.share_checkpoint(&std::sync::Arc::new(theirs));
 }
 
+/// A Null bumps sn(c) without extending S, so two states of equal length and equal executed
+/// entries can still disagree on the sn map that the client rule reads.
+#[test]
+#[should_panic(expected = "share_checkpoint over unequal committed sequence numbers")]
+fn sharing_refuses_a_checkpoint_with_another_sn_map() {
+    let (mine, _) = h1_pair();
+    let mut n = node();
+    n.step(
+        &vec![reply(Some(seed_log()), mine, RState::NoReset); 3],
+        &[],
+        4,
+        &mut rng(),
+    );
+    let (a, b, c) = (cmd(1, 1, 11), cmd(2, 1, 22), cmd(3, 1, 33));
+    let bumped = SharedState::from_entries(
+        [a, b, c].iter().map(|x| Entry::Cmd(*x)).collect(),
+        [(1, 1), (2, 1), (3, 2)].into(),
+    );
+    n.share_checkpoint(&std::sync::Arc::new(cp(
+        bumped,
+        n.checkpoint().p.clone(),
+        4,
+    )));
+}
+
 /// The input no digest covers: a fork signature is computed over (S, P, W) and
 /// says nothing about whether §5 is mounted, so a mixed fleet — a caller
 /// convention this type does not enforce — could otherwise lose the layer
@@ -1596,6 +1801,40 @@ fn sharing_refuses_a_checkpoint_across_the_certificate_gate() {
         "anti-vacuity: this node must be carrying the layer"
     );
     theirs.certs = None;
+    n.share_checkpoint(&std::sync::Arc::new(theirs));
+}
+
+/// A digest-keyed caller proves (S, P, W) equal; two states of equal length and sn map that
+/// differ in one executed entry are what a hash collision would hand over.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "share_checkpoint over states whose retained entries differ")]
+fn sharing_refuses_a_checkpoint_whose_executed_content_differs() {
+    let (mine, _) = h1_pair();
+    let mut n = node();
+    n.step(
+        &vec![reply(Some(seed_log()), mine, RState::NoReset); 3],
+        &[],
+        4,
+        &mut rng(),
+    );
+    let (a, b, forged) = (cmd(1, 1, 11), cmd(2, 1, 22), cmd(3, 1, 34));
+    let theirs = cp(state_of(&[a, b, forged]), n.checkpoint().p.clone(), 4);
+    n.share_checkpoint(&std::sync::Arc::new(theirs));
+}
+
+#[test]
+#[should_panic(expected = "share_checkpoint over unequal §5 forests")]
+fn sharing_refuses_a_checkpoint_with_another_certificate_forest() {
+    let (mine, mut theirs) = h1_pair();
+    let mut n = node();
+    n.step(
+        &vec![reply(Some(seed_log()), mine, RState::NoReset); 3],
+        &[],
+        4,
+        &mut rng(),
+    );
+    held_mut(&mut theirs).append(&Entry::Cmd(cmd(9, 1, 99)));
     n.share_checkpoint(&std::sync::Arc::new(theirs));
 }
 
@@ -1756,8 +1995,75 @@ fn skip_commits_a_respread_command_in_p_once() {
     assert_eq!(skips, 1);
 }
 
+/// Adopts a checkpoint whose P holds client 1's sn 2 while S has no commit of client 1.
+fn adopt_an_sn_gap() -> RecoveryNode {
+    let adopted = Checkpoint {
+        s: SharedState::default().into(),
+        p: Some(vec![timed(Entry::Cmd(cmd(1, 2, 78)), 3)]),
+        w: 2,
+        certs: None,
+    };
+    let mut n =
+        RecoveryNode::new(Config::default(), T, false).with_repeated_commit(RepeatedCommit::Skip);
+    n.step(
+        &vec![reply(Some(seed_log()), adopted, RState::NoReset); 3],
+        &[],
+        4,
+        &mut rng(),
+    );
+    n
+}
+
+#[test]
+fn skip_refuses_an_out_of_sn_order_p_at_the_boundary_and_keeps_the_checkpoint() {
+    let mut n = adopt_an_sn_gap();
+    let before = n.checkpoint_shared();
+    n.end_window(3, 30);
+    assert_eq!(
+        n.sn_order_violation(),
+        Some(OutOfSnOrder {
+            client: 1,
+            sn: 2,
+            committed_sn: 0
+        })
+    );
+    assert_eq!(
+        n.shared_state(),
+        &SharedState::default(),
+        "S_i is unchanged"
+    );
+    assert!(
+        Arc::ptr_eq(&n.checkpoint_shared(), &before),
+        "no checkpoint is minted"
+    );
+}
+
+#[test]
+#[should_panic(expected = "refused an out-of-sn-order commit")]
+fn a_recovery_node_that_refused_a_commit_is_not_stepped_again() {
+    let mut n = adopt_an_sn_gap();
+    n.end_window(3, 30);
+    n.step(&[], &[], 31, &mut rng());
+}
+
 #[test]
 #[should_panic(expected = "not combined with the §5 certificate layer")]
 fn skip_refuses_a_node_that_mounts_certificates() {
     let _ = node().with_repeated_commit(RepeatedCommit::Skip);
+}
+
+// An adopting node takes P' over into L_i stamps included (Alg 6 "If W' > W"), so two checkpoints whose P
+// differ only in stamps are not interchangeable and `==` keeps them apart.
+#[test]
+fn checkpoint_equality_compares_p_with_its_stamps() {
+    let x = Entry::Cmd(cmd(1, 1, 7));
+    let at = |round| {
+        cp(
+            SharedState::default(),
+            Some(vec![timed(x.clone(), round)]),
+            3,
+        )
+    };
+    assert_eq!(at(32), at(32));
+    assert_ne!(at(32), at(33));
 }

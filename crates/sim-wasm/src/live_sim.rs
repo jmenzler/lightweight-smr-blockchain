@@ -1,4 +1,4 @@
-use crate::helpers::recorded_schedule;
+use crate::helpers::{check_fraction, error_json, recorded_schedule};
 use sim::spec::ScenarioSpec;
 use sim::{RoundStatus, Scenario, SimState, Trace, run_traced_report};
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -31,6 +31,7 @@ fn strip_targets_when_large(trace: &mut Trace) {
 }
 
 /// Stepwise simulator session whose recorded history replays byte-identical via `run_scenario_json`.
+/// The blocking fraction is chosen interactively each round, so a session is not a 1-late adversary run.
 #[wasm_bindgen]
 pub struct LiveSim {
     state: SimState,
@@ -78,13 +79,18 @@ impl LiveSim {
         })
     }
 
-    /// Advance one round at `fraction` blocking; no-op once absorbed so the replay length matches.
+    /// Advance one round at `fraction` blocking (an error JSON outside [0, 1]); no-op once absorbed so the replay length matches.
     pub fn step(&mut self, fraction: f64) -> String {
+        if let Err(error) = check_fraction(fraction) {
+            return error_json(error);
+        }
         let count = self.state.blocked_count(fraction);
         let background_count = self.state.blocked_count(self.background);
         if let Some(last) = self.last
             && (last.all_undecided
-                || (last.agreed.is_some() && last.all_hold && count == 0 && background_count == 0))
+                || self
+                    .state
+                    .is_absorbed(&last, count == 0 && background_count == 0))
         {
             return self.status_json(&last, true);
         }

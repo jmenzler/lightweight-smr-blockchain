@@ -80,6 +80,69 @@ fn distinct_seeds_diverge() {
     assert_ne!(run(&a), run(&b), "seed must matter");
 }
 
+/// Holders (non-⊥ servers) after rounds 1, 2 and 3, engine harness vs sim, over a seed sweep
+/// with blocking. The tiers draw from different streams, so trajectories differ per seed; the
+/// per-round holder-count distributions must agree.
+#[test]
+fn blocked_run_holder_counts_match_sim() {
+    let (n, seeds, rounds) = (32usize, 150u64, [0usize, 1, 2]);
+    let cases = [
+        (
+            r#"{"kind":"fresh_per_round","fraction":0.1}"#,
+            sim::BlockSchedule::FreshPerRound { fraction: 0.1 },
+        ),
+        (
+            r#"{"kind":"fresh_per_round","fraction":0.25}"#,
+            sim::BlockSchedule::FreshPerRound { fraction: 0.25 },
+        ),
+        (
+            r#"{"kind":"permanent","fraction":0.2}"#,
+            sim::BlockSchedule::Permanent { fraction: 0.2 },
+        ),
+    ];
+    for (schedule_json, schedule) in cases {
+        let mut engine: Vec<Vec<f64>> = vec![Vec::new(); rounds.len()];
+        let mut simulated: Vec<Vec<f64>> = vec![Vec::new(); rounds.len()];
+        for seed in 0..seeds {
+            let spec = NodeRunSpec::from_json(&format!(
+                r#"{{"scenario":{{"median":{{"n":{n},"seed":{seed},"k":6,"ell":3,
+                    "init":{{"kind":"distinct"}},"max_rounds":6,
+                    "schedule":{schedule_json}}}}},"sync":"timer"}}"#
+            ))
+            .expect("spec");
+            let records = run(&spec);
+            let (_, trace) = sim::run_traced(&sim::Scenario {
+                n,
+                seed,
+                cfg: protocol::Config::default(),
+                init: sim::Init::Distinct,
+                max_rounds: 6,
+                schedule: schedule.clone(),
+                partition: None,
+            });
+            for (slot, &r) in rounds.iter().enumerate() {
+                engine[slot].push(values_at(&records, r).iter().flatten().count() as f64);
+                simulated[slot].push(trace.rounds[r].states.iter().flatten().count() as f64);
+            }
+        }
+        let mean_var = |v: &[f64]| {
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            let var = v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64;
+            (m, var)
+        };
+        for (slot, &r) in rounds.iter().enumerate() {
+            let (me, ve) = mean_var(&engine[slot]);
+            let (ms, vs) = mean_var(&simulated[slot]);
+            let se = (ve / seeds as f64 + vs / seeds as f64).sqrt().max(1e-9);
+            assert!(
+                (me - ms).abs() <= 5.0 * se,
+                "{schedule_json}, after round {}: engine mean {me:.2} vs sim mean {ms:.2} holders (SE {se:.2})",
+                r + 1
+            );
+        }
+    }
+}
+
 /// Convergence round under the sim's rule: first round of holder-unanimity
 /// that persists to the horizon; None if never (or extinct).
 fn convergence_round(records: &[Vec<RoundRecord>]) -> Option<usize> {
@@ -141,7 +204,7 @@ fn convergence_distribution_matches_sim_at_n64() {
 
     // Two-sample KS statistic, coarse tolerance (200 vs 200 → crit ≈ 0.163
     // at α=0.01; we allow 0.2 — this is a rehearsal gate, the real E7 test
-    // uses its own fixed statistics).
+    // is preregistered with its own statistics).
     let ks = {
         let mut a = engine_rounds.clone();
         let mut b = sim_rounds.clone();

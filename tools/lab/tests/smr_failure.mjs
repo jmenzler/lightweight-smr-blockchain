@@ -1,7 +1,10 @@
+// Run from the repository root: node --experimental-vm-modules tools/lab/tests/smr_failure.mjs
+// (the flag is required: the lab modules are loaded through node:vm).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import { Element } from './dom-stub.mjs';
 
 const root = path.resolve(import.meta.dirname, '../../..');
 const lab = path.join(root, 'tools/lab');
@@ -20,6 +23,16 @@ const failure = {
     actual: null,
     command_prefix_ok: false,
   },
+};
+const regressionFailure = {
+  ...failure,
+  phase: 'ExecutedRegression',
+  violation: { previous_len: 52, len: 47 },
+};
+const snOrderFailure = {
+  ...failure,
+  phase: 'OutOfSnOrderCommit',
+  violation: { client: 5, sn: 3, committed_sn: 1 },
 };
 const failedTerminal = {
   Failed: {
@@ -54,50 +67,14 @@ const report = (tag, failed = false) => ({
   tag,
   metrics: failed ? Array.from({ length: 100 }, (_, i) => metric(i + 1)) : [],
   commands: [],
-  terminal: failed ? failedTerminal : 'MaxRounds',
+  terminal: failed ? failedTerminal : { Ran: { rounds: 200 } },
   safety_ok: true,
   ...(failed ? {
-    failure,
+    failure: { regression: regressionFailure, sn_order: snOrderFailure }[failed] ?? failure,
     recovery: { fork_ok: true, rounds: Array.from({ length: 100 }, (_, i) => recoveryRow(i + 1)) },
   } : {}),
 });
 const certs = () => ({ servers: [], committed: [], clients: [], merges_last_step: [], roots_consistent: true });
-
-class Element {
-  constructor(id = '') {
-    this.id = id;
-    this.value = '';
-    this.textContent = '';
-    this.innerHTML = '';
-    this.children = [];
-    this.listeners = {};
-    this.dataset = {};
-    this.clientWidth = 0;
-    this.clientHeight = 0;
-    this.classes = new Set();
-    this.classList = {
-      add: (...xs) => xs.forEach(x => this.classes.add(x)),
-      remove: (...xs) => xs.forEach(x => this.classes.delete(x)),
-      contains: x => this.classes.has(x),
-      toggle: (x, on = !this.classes.has(x)) => {
-        on ? this.classes.add(x) : this.classes.delete(x);
-        return on;
-      },
-    };
-    this.queries = new Map();
-  }
-  addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
-  dispatchEvent(event) { for (const fn of this.listeners[event.type] || []) fn(event); }
-  click() { this.dispatchEvent({ type: 'click', target: this, stopPropagation() {} }); }
-  querySelector(query) {
-    if (!this.queries.has(query)) this.queries.set(query, new Element(query));
-    return this.queries.get(query);
-  }
-  querySelectorAll() { return []; }
-  appendChild(child) { this.children.push(child); return child; }
-  getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 }; }
-  remove() {}
-}
 
 function workerApi(owner) {
   let panic = null;
@@ -137,9 +114,15 @@ function workerApi(owner) {
             round++;
             fractions.push(fraction);
             failed = owner.liveFailsAt === round;
-            return JSON.stringify({ round, failure: failed ? failure : null, absorbed: false, dead: null, nodes: [], blocked: [], spreading: [] });
+            const dead = owner.liveDeadAt !== null && round >= owner.liveDeadAt ? owner.liveDeadAt : null;
+            return JSON.stringify({ round, failure: failed ? failure : null, absorbed: false, dead, nodes: [], blocked: [], spreading: [] });
           },
           report_json() { counts.report++; return JSON.stringify(report(`live-${spec.seed}-r${round}`, failed)); },
+          report_delta_json() {
+            counts.delta++;
+            const { metrics, commands, ...summary } = report(`live-${spec.seed}-r${round}`);
+            return JSON.stringify({ rounds_from: owner.badDelta ? 5 : 0, metrics, rec_rows_from: 0, rec_rows: [], summary, len: 0, inserted: [], changed: [], appended: [] });
+          },
           export_scenario() {
             counts.export++;
             return JSON.stringify({ ...spec, max_rounds: round, schedule: { kind: 'per_round_fractions', fractions: [...fractions] } });
@@ -166,18 +149,25 @@ async function setup() {
   };
   for (const [id, value] of Object.entries({
     smrN: '598', smrSeed: '1', smrSigma: '1', smrMax: '200', smrBeta: '10',
-    smrT: '8', smrTw: '20', smrLiveMode: 'fresh', smrArrRate: '',
+    smrT: '8', smrTw: '20', smrStrategy: 'fresh', smrArrRate: '',
     smrAuditScope: 'all', smrSlider: '30', smrSpeed: '1',
   })) $(id).value = value;
   $('smrAbort').classList.add('hidden');
   const S = { engine: 'loading', view: 'smr', live: null };
   const downloads = [];
+  const drawer = { open: false };
   const workers = [];
   const timers = new Map();
   let timerId = 0;
+  const lists = new Map([['#smrSpeed button', ['1', 'max'].map(speed => {
+    const b = new Element('speed-' + speed);
+    b.dataset.speed = speed;
+    return b;
+  })]]);
+  const windowListeners = {};
   const document = {
     getElementById: $,
-    querySelectorAll: () => [],
+    querySelectorAll: query => lists.get(query) ?? [],
     addEventListener() {},
     createElement: tag => new Element(tag),
     createElementNS: (_, tag) => new Element(tag),
@@ -185,7 +175,7 @@ async function setup() {
   const context = vm.createContext({
     console,
     document,
-    window: { devicePixelRatio: 1, addEventListener() {} },
+    window: { devicePixelRatio: 1, addEventListener: (type, fn) => (windowListeners[type] ??= []).push(fn) },
     Event: class { constructor(type) { this.type = type; } },
     setTimeout: fn => { const id = ++timerId; timers.set(id, fn); return id; },
     clearTimeout: id => timers.delete(id),
@@ -198,11 +188,13 @@ async function setup() {
       this.batchFailed = false;
       this.failedRelease = false;
       this.liveFailsAt = null;
+      this.liveDeadAt = null;
       this.panic = null;
+      this.badDelta = false;
       this.hold = false;
       this.held = [];
       this.lastSpec = null;
-      this.calls = { report: 0, export: 0, certs: 0, chain: 0, mutate: 0, detail: 0 };
+      this.calls = { report: 0, delta: 0, export: 0, certs: 0, chain: 0, mutate: 0, detail: 0 };
       workers.push(this);
       const workerContext = vm.createContext({
         self: { location: { search: '' } },
@@ -239,12 +231,18 @@ async function setup() {
     'smr-certs.js': {
       onCertsSnapshot() {}, onChainSnapshot() {}, freezeChain() {},
       useEntrySelect() {}, resetCertsDrawer() {}, onVerifyTallies() {},
+      markCertsLoading() {}, endCertsLoading() {},
     },
-    'smr-timeline.js': { drawTimeline() {}, useSpreadCurves() {} },
+    'smr-viewport.js': { renderViewport() {}, resetViewport() {} },
+    'smr-drawer.js': {
+      renderDrawer() {}, resetDrawer() {}, useBlockDrawerOpen() {}, blockDrawerOpen: () => drawer.open,
+    },
     'render.js': { update() {}, draw() {}, setView() {} },
     'trace.js': { loadTrace() {} },
-    'live.js': { onLiveRound() {}, updateLivePlayBtn() {} },
+    'live.js': { onBatchDone() {}, onLiveReady() {}, onLiveRound() {}, onLiveScenario() {}, onLiveTraceJson() {} },
     'controls.js': {},
+    'tooltip.js': {},
+    'chrome.js': {},
     'spill.js': { onSpillReady() {}, onSpillChain() {} },
   };
   const modules = new Map();
@@ -264,16 +262,45 @@ async function setup() {
   await main.evaluate();
   const flush = async () => { for (let i = 0; i < 16; i++) await Promise.resolve(); };
   await flush();
-  return { S, $, downloads, workers, timers, flush };
+  const key = k => {
+    const event = { key: k, target: { tagName: 'BODY' }, prevented: false, preventDefault() { this.prevented = true; } };
+    for (const fn of windowListeners.keydown || []) fn(event);
+    return event;
+  };
+  return { S, $, lists, key, downloads, drawer, workers, timers, flush, smr: modules.get('smr.js').namespace };
 }
 
 const hidden = element => element.classList.contains('hidden');
+const batchSpec = (overrides = {}) => ({
+  n: 598, seed: 1, k: 6, ell: 3, sigma: 1, proto: { kind: 'compact', t_commit_rounds: 8 },
+  injections: [], max_rounds: 200, schedule: { kind: 'fresh_per_round', fraction: 0.1 }, ...overrides,
+});
+const recoverySpec = (overrides = {}) => batchSpec({ proto: { kind: 'recovery', t_window_rounds: 20, resend_until_acked: true }, ...overrides });
+
+{
+  const h = await setup();
+  h.workers[0].batchFailed = 'regression';
+  h.smr.runSpecBatch(batchSpec());
+  await h.flush();
+  assert.match(h.$('smrAbort').innerHTML, /executed length fell from 52 to 47/);
+  assert.doesNotMatch(h.$('smrAbort').innerHTML, /undefined/);
+}
+
+{
+  const h = await setup();
+  h.workers[0].batchFailed = 'sn_order';
+  h.smr.runSpecBatch(batchSpec());
+  await h.flush();
+  assert.match(h.$('smrAbort').innerHTML, /client 5 committed sn 3 while its committed sn was 1/);
+  assert.doesNotMatch(h.$('smrAbort').innerHTML, /before mutating boundary/);
+  assert.doesNotMatch(h.$('smrAbort').innerHTML, /undefined/);
+}
 
 {
   const h = await setup();
   const worker = h.workers[0];
   worker.batchFailed = true;
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(batchSpec());
   await h.flush();
   assert.equal(worker.terminated, false, 'typed batch failure keeps the worker');
   assert.equal(h.workers.length, 1, 'typed batch failure does not respawn');
@@ -281,6 +308,7 @@ const hidden = element => element.classList.contains('hidden');
   assert.equal(h.S.smr.scenario.seed, 1);
   assert.match(h.$('smrStatus').textContent, /FAILED.*attempted 100.*completed 99.*observed 100/i);
   assert.equal(hidden(h.$('smrAbort')), false);
+  assert.match(h.$('smrAbort').innerHTML, /prefix 47, log 119, first mismatch 41/);
 
   h.$('smrSeed').value = '99';
   h.$('smrExportSpec').click();
@@ -292,12 +320,9 @@ const hidden = element => element.classList.contains('hidden');
 {
   const h = await setup();
   const worker = h.workers[0];
-  h.S.smr.proto = 'recovery';
-  h.S.smr.ack = true;
-  h.$('smrTw').value = '20';
   worker.batchFailed = true;
   worker.hold = true;
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(recoverySpec());
   await h.flush();
 
   h.S.smr.proto = 'compact';
@@ -307,9 +332,8 @@ const hidden = element => element.classList.contains('hidden');
   await h.flush();
 
   assert.equal(h.S.smr.proto, 'compact', 'failed display must not overwrite editable next-run config');
-  assert.match(h.$('smrSumChip').textContent, /n=598.*seed 1.*recovery T=20/);
-  assert.equal(hidden(h.$('smrTimelineBox')), false, 'captured recovery panels stay visible');
-  assert.equal(hidden(h.$('smrSpreadBox')), true, 'compact panels do not replace failed recovery panels');
+  assert.match(h.$('smrSumChip').textContent, /598 servers.*recovery.*T 20.*seed 1/);
+  assert.equal(hidden(h.$('smrRecChips')), false, 'recovery readout is chosen by the captured protocol, not the edited form');
 
   h.$('smrSeed').value = '77';
   h.$('smrExportSpec').click();
@@ -318,22 +342,21 @@ const hidden = element => element.classList.contains('hidden');
   assert.equal(h.downloads.at(-1).data.proto.t_window_rounds, 20);
 
   worker.batchFailed = false;
-  h.$('smrRunBtn').click();
+  h.$('smrStartBtn').click();
   await h.flush();
   assert.equal(worker.lastSpec.seed, 77, 'explicit next run uses edited form');
   assert.equal(worker.lastSpec.proto.kind, 'compact');
-  assert.equal(h.S.smr.report.tag, 'batch-77');
+  assert.equal(h.S.smr.report.tag, 'live-77-r0');
   assert.equal(hidden(h.$('smrAbort')), true);
 }
 
 {
   const h = await setup();
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(batchSpec());
   await h.flush();
   assert.equal(h.S.smr.report.tag, 'batch-1');
-  h.$('smrSeed').value = '2';
   h.workers[0].batchFailed = true;
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(batchSpec({ seed: 2 }));
   await h.flush();
   assert.equal(h.S.smr.report.tag, 'batch-2', 'new failed report replaces prior success');
   assert.equal(h.S.smr.report.failure.node, 7);
@@ -343,7 +366,7 @@ const hidden = element => element.classList.contains('hidden');
   const h = await setup();
   const worker = h.workers[0];
   worker.liveFailsAt = 2;
-  h.$('smrLiveBtn').click();
+  h.$('smrStartBtn').click();
   await h.flush();
   h.$('smrSlider').value = '30';
   h.$('smrStepBtn').click();
@@ -354,19 +377,20 @@ const hidden = element => element.classList.contains('hidden');
 
   assert.equal(h.S.smr.live, null, 'failed live session cannot resume');
   assert.equal(JSON.stringify(h.S.smr.scenario.schedule.fractions), '[0.3,0.4]');
-  assert.equal(worker.calls.certs, 2, 'failure step skips certificate read');
-  assert.equal(worker.calls.chain, 2, 'failure step skips chain read');
-  assert.equal(worker.calls.report, 3, 'initial and both step reports are retained');
+  assert.equal(worker.calls.certs, 0, 'a closed drawer reads no certificates');
+  assert.equal(worker.calls.chain, 0, 'a closed drawer reads no chain');
+  assert.equal(worker.calls.delta, 2, 'the initial report and the first step arrive as deltas');
+  assert.equal(worker.calls.report, 1, 'only the failing step builds a full report');
   assert.equal(worker.calls.export, 1, 'failed replay captured exactly once');
   assert.equal(h.workers.length, 1, 'typed live failure does not respawn');
   assert.equal(h.timers.size, 0, 'failed session leaves no autoplay callback');
 
   h.$('smrSeed').value = '88';
-  h.$('smrExportSpecLive').click();
+  h.$('smrExportSpec').click();
   assert.equal(JSON.stringify(h.downloads.at(-1).data.schedule.fractions), '[0.3,0.4]');
 
   worker.liveFailsAt = null;
-  h.$('smrLiveBtn').click();
+  h.$('smrStartBtn').click();
   await h.flush();
   assert.ok(h.S.smr.live, 'explicit new session starts cleanly');
   assert.equal(hidden(h.$('smrAbort')), true, 'new session clears failure banner');
@@ -376,7 +400,7 @@ const hidden = element => element.classList.contains('hidden');
   const h = await setup();
   const worker = h.workers[0];
   worker.liveFailsAt = 2;
-  h.$('smrLiveBtn').click();
+  h.$('smrStartBtn').click();
   await h.flush();
   h.$('smrPlayBtn').click();
   await h.flush();
@@ -390,7 +414,7 @@ const hidden = element => element.classList.contains('hidden');
   h.timers.clear();
 
   worker.liveFailsAt = null;
-  h.$('smrLiveBtn').click();
+  h.$('smrStartBtn').click();
   await h.flush();
   assert.equal(h.S.smr.lastStatus, null);
   assert.equal(h.S.smr.live.playing, false);
@@ -406,13 +430,10 @@ const hidden = element => element.classList.contains('hidden');
 {
   const h = await setup();
   const worker = h.workers[0];
-  h.S.smr.proto = 'recovery';
-  h.S.smr.ack = true;
-  h.$('smrTw').value = '20';
   worker.batchFailed = true;
   worker.failedRelease = true;
   worker.hold = true;
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(recoverySpec());
   await h.flush();
   worker.release();
   await h.flush();
@@ -423,12 +444,141 @@ const hidden = element => element.classList.contains('hidden');
 
 {
   const h = await setup();
+  const worker = h.workers[0];
+  worker.liveFailsAt = 3;
+  h.$('smrStartBtn').click();
+  await h.flush();
+  assert.equal(worker.calls.certs, 0, 'a new session reads no certificates');
+  h.drawer.open = true;
+  h.$('smrStepBtn').click();
+  await h.flush();
+  h.$('smrStepBtn').click();
+  await h.flush();
+  assert.equal(worker.calls.certs, 2, 'with the block drawer open every step reads the certificates');
+  assert.equal(worker.calls.chain, 0, 'a certificate session has no chain feed');
+  h.$('smrStepBtn').click();
+  await h.flush();
+  assert.equal(h.S.smr.live, null);
+  assert.equal(worker.calls.certs, 2, 'the failing step skips the certificate read');
+  assert.equal(worker.calls.chain, 0, 'the failing step skips the chain read');
+}
+
+{
+  const h = await setup();
+  const worker = h.workers[0];
+  h.$('smrStartBtn').click();
+  await h.flush();
+  const seen = () => worker.outbox.at(-1);
+  worker.postMessage({ type: 'smr-live-step', fraction: 0.1, wantCerts: false, wantChain: true });
+  await h.flush();
+  assert.equal(worker.calls.chain, 1, 'wantChain reads the chain delta');
+  assert.equal(worker.calls.certs, 0);
+  assert.ok(seen().chain && seen().certs === undefined);
+  worker.postMessage({ type: 'smr-live-feeds', wantCerts: true, wantChain: false });
+  await h.flush();
+  assert.equal(seen().type, 'smr-feeds');
+  assert.equal(worker.calls.certs, 1, 'the drawer-open request reads the certificates');
+  assert.equal(worker.calls.chain, 1);
+  worker.postMessage({ type: 'smr-live-step', fraction: 0.1 });
+  await h.flush();
+  assert.equal(worker.calls.certs + worker.calls.chain, 2, 'a step without flags reads neither');
+}
+
+{
+  const h = await setup();
+  const worker = h.workers[0];
+  h.$('smrStartBtn').click();
+  await h.flush();
+  h.$('smrStepBtn').click();
+  await h.flush();
+  assert.equal(h.S.smr.report.tag, 'live-1-r1', 'the step delta rebuilt the report');
+  h.$('smrExportReport').click();
+  await h.flush();
+  assert.equal(worker.calls.report, 1, 'a live export asks the engine for its report');
+  assert.equal(h.downloads.at(-1).data.tag, 'live-1-r1');
+
+  worker.badDelta = true;
+  h.$('smrStepBtn').click();
+  await h.flush();
+  assert.equal(h.S.smr.live, null, 'a delta that does not fit ends the session');
+  assert.equal(hidden(h.$('smrAbort')), false);
+  assert.match(h.$('smrAbort').innerHTML, /lost sync.*starts at round 5, the page holds 0/);
+  assert.equal(h.S.smr.report.tag, 'live-1-r1', 'the last good report stays on screen');
+}
+
+{
+  const h = await setup();
   const oldWorker = h.workers[0];
   oldWorker.panic = 'unexpected panic';
-  h.$('smrRunBtn').click();
+  h.smr.runSpecBatch(batchSpec());
   await h.flush();
   assert.equal(oldWorker.terminated, true);
   assert.equal(h.workers.length, 2, 'unexpected panic still respawns');
 }
 
 console.log('smr failure adapter tests passed');
+
+const PLAY_CONTROLS = ['smrPlayBtn', 'smrStepBtn', 'smrJumpBtn'];
+function assertStopped(h, text, label) {
+  assert.equal(h.S.smr.live, null);
+  assert.equal(h.$('smrStatus').textContent, text);
+  assert.match(h.$('smrLiveRound').textContent, label);
+  for (const id of PLAY_CONTROLS) assert.equal(h.$(id).disabled, true, `${id} greys out`);
+  for (const b of h.lists.get('#smrSpeed button')) assert.equal(b.disabled, true, 'speed greys out');
+  assert.ok(h.$('smrPlayBtn').dataset.tip.startsWith(text), 'the greyed Play says why');
+  assert.equal(hidden(h.$('smrNewBtn')), false, 'New run stays');
+  assert.equal(h.$('smrExportBtn').disabled, undefined, 'Export stays');
+  h.$('smrStatus').textContent = 'verify: something else';
+  const e = h.key(' ');
+  assert.ok(e.prevented, 'space on a stopped run is handled');
+  assert.match(h.$('smrStatus').textContent, new RegExp('^' + text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + ' · New run starts another'));
+  assert.ok(h.$('smrStatus').classes.has('flash'), 'the reminder flashes');
+}
+
+{
+  const h = await setup();
+  h.$('smrMax').value = '3';
+  h.$('smrStartBtn').click();
+  await h.flush();
+  assert.equal(h.$('smrPlayBtn').disabled, false);
+  assert.equal(h.$('smrPlayBtn').dataset.tip, undefined, 'a running session has no end tooltip');
+  for (let i = 0; i < 3; i++) { h.$('smrStepBtn').click(); await h.flush(); }
+  assertStopped(h, 'finished · 3/3 rounds', /round 3\/3 · finished/);
+
+  h.$('smrNewBtn').click();
+  h.$('smrMax').value = '200';
+  h.$('smrStartBtn').click();
+  await h.flush();
+  assert.equal(h.S.smr.end, null, 'a new session clears the end state');
+  assert.equal(h.$('smrPlayBtn').dataset.tip, undefined);
+  for (const b of h.lists.get('#smrSpeed button')) assert.equal(b.disabled, false);
+}
+
+{
+  const h = await setup();
+  h.workers[0].liveDeadAt = 2;
+  h.$('smrStartBtn').click();
+  await h.flush();
+  for (let i = 0; i < 2; i++) { h.$('smrStepBtn').click(); await h.flush(); }
+  assertStopped(h, '⚠ finished · every server ⊥ at round 2/200 — nothing can recover', /round 2\/200 · all ⊥/);
+}
+
+{
+  const h = await setup();
+  h.$('smrStartBtn').click();
+  await h.flush();
+  h.$('smrStepBtn').click();
+  await h.flush();
+  h.$('smrEndBtn').click();
+  assertStopped(h, 'ended · stopped at round 1/200 by End', /round 1\/200 · ended/);
+}
+
+{
+  const h = await setup();
+  h.smr.runSpecBatch(batchSpec());
+  await h.flush();
+  assertStopped(h, 'finished · 200/200 rounds', /round 200\/200 · finished/);
+}
+
+console.log('smr end-state tests passed');
+

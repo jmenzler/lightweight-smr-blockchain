@@ -170,3 +170,88 @@ fn with_undecided_applies_inner_init_over_the_useful_subset() {
     let bots = init.iter().filter(|v| v.is_none()).count();
     assert_eq!((zeros, ones, bots), (30, 30, 40));
 }
+
+fn valued_count(n: usize, u: f64) -> usize {
+    let init = Init::WithUndecided {
+        useful_fraction: u,
+        inner: Box::new(Init::Split { fraction: 0.5 }),
+    };
+    initial(n, 1, init).iter().filter(|s| s.is_some()).count()
+}
+
+fn zero_count(n: usize, f: f64) -> usize {
+    initial(n, 1, Init::Split { fraction: f })
+        .iter()
+        .filter(|s| **s == Some(0))
+        .count()
+}
+
+// ceil(pct/100 * n) in exact integer arithmetic
+fn exact_ceil(pct: usize, n: usize) -> usize {
+    (pct * n).div_ceil(100)
+}
+
+#[test]
+fn with_undecided_valued_count_is_exact_ceil() {
+    for (pct, n) in [
+        (55, 100),
+        (14, 50),
+        (7, 100),
+        (56, 100),
+        (28, 100),
+        (55, 200),
+        (34, 10000),
+    ] {
+        let u = pct as f64 / 100.0;
+        assert_eq!(
+            valued_count(n, u),
+            exact_ceil(pct, n),
+            "u = {pct}/100, n = {n}"
+        );
+    }
+}
+
+#[test]
+fn split_zero_count_is_exact() {
+    for (pct, n) in [(55, 100), (7, 100), (14, 50), (55, 200)] {
+        let f = pct as f64 / 100.0;
+        assert_eq!(
+            zero_count(n, f),
+            exact_ceil(pct, n),
+            "f = {pct}/100, n = {n}"
+        );
+    }
+}
+
+#[test]
+fn initial_fractions_match_exact_rational_scan() {
+    let mut bad = Vec::new();
+    for n in [50usize, 100, 200, 1000] {
+        for pct in 0..=100usize {
+            let f = pct as f64 / 100.0;
+            let want = exact_ceil(pct, n);
+            let (v, z) = (valued_count(n, f), zero_count(n, f));
+            if v != want || z != want {
+                bad.push(format!(
+                    "(n={n}, {pct}%): valued {v}, zeros {z}, exact {want}"
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} init counts deviate from exact: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(5)]
+    );
+}
+
+// The product i·values/n must not wrap where usize is 32 bits wide (the lab runs on wasm32).
+#[test]
+fn even_split_does_not_overflow_the_product() {
+    use rand::SeedableRng;
+    let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(0);
+    let init = Init::EvenSplit { values: 1 << 40 };
+    let value = sim::initial_state(&init, 1 << 40, 1 << 41, &mut rng);
+    assert_eq!(value, Some(1 << 39));
+}

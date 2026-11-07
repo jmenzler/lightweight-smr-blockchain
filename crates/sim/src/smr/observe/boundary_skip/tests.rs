@@ -48,3 +48,32 @@ fn a_second_skip_by_the_same_node_is_a_second_episode() {
     assert_eq!(tally.last_round(), Some(52));
     assert_eq!(tally.max_rejoin_rounds(), Some(4));
 }
+
+#[test]
+fn a_skip_at_the_final_round_had_no_round_to_adopt_and_is_not_unrejoined() {
+    let mut tally = BoundarySkipTally::new(3);
+    tally.observe([true, false, false], 26);
+    tally.observe([true, true, false], 52);
+    assert_eq!(tally.events(), 2);
+    assert_eq!(tally.unrejoined(), 1);
+    assert_eq!(tally.horizon_skips(), 1);
+}
+
+#[test]
+fn the_longest_stale_spell_includes_nodes_that_never_adopt() {
+    let mut tally = BoundarySkipTally::new(2);
+    tally.observe([true, true], 10);
+    tally.observe([false, true], 12);
+    tally.observe([false, true], 30);
+    assert_eq!(tally.max_rejoin_rounds(), Some(2));
+    assert_eq!(tally.longest_stale_rounds(), Some(20));
+}
+
+#[test]
+fn an_older_open_episode_is_not_hidden_by_a_later_skip() {
+    let mut tally = BoundarySkipTally::new(2);
+    tally.observe([true, false], 10);
+    tally.observe([true, true], 40);
+    assert_eq!(tally.last_round(), Some(40));
+    assert_eq!(tally.longest_stale_rounds(), Some(30));
+}

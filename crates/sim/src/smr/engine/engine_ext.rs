@@ -50,6 +50,7 @@ impl SmrState {
                 let outcome = if mask[target] {
                     AttemptOutcome::TargetBlocked
                 } else {
+                    t.injected_round = Some(round);
                     t.delivered_round = Some(round);
                     delivered.push((target, t.op));
                     AttemptOutcome::Delivered
@@ -124,6 +125,7 @@ impl SmrState {
             max_log_len: post.iter().flatten().map(|l| l.len()).max().unwrap_or(0) as u32,
             min_executed_len: 0,
             max_executed_len: 0,
+            useful_executed: None,
             arrivals,
             lcp_len: lcp_over(post.iter().flatten().copied()),
         };

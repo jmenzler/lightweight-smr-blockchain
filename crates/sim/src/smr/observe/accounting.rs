@@ -27,6 +27,8 @@ pub struct Accounting {
     /// Occupancy of bytes already charged in `node.log.*`; kept out of `rows` to avoid double-counting.
     pub log_len_bytes: u64,
     pub perm_len_bytes: u64,
+    /// False for compact, whose node, log and checkpoint rows are not walked.
+    pub walked_nodes: bool,
 }
 
 impl Accounting {
@@ -76,7 +78,7 @@ fn map_bytes<K, V>(len: usize) -> u64 {
 }
 
 fn chain_bytes(s: &StoredCommand) -> u64 {
-    (s.chain.capacity() * HASH) as u64
+    (s.chain.len() * HASH) as u64
 }
 
 fn cert_bytes(certs: Option<&ServerCertState>, clients: &[u32]) -> (u64, u64, usize) {
@@ -119,14 +121,59 @@ fn state_bytes(state: &protocol::compact::SharedState) -> (u64, u64) {
 }
 
 impl SmrState {
-    /// Retained bytes by category; recovery engine only.
+    /// Observer and tracker rows, every engine but extended.
+    fn observer_rows(&self, add: &mut impl FnMut(&'static str, u64)) {
+        add("observer.canonical", self.checker.canonical().heap_bytes());
+        add("observer.exec_dup", self.exec_dup.heap_bytes());
+        add("observer.retired_samples", self.retired.heap_bytes());
+        add(
+            "observer.metrics_rows",
+            (self.metrics.capacity() * size_of::<SmrRoundMetrics>()) as u64,
+        );
+        match &self.rec {
+            Some(rec) => {
+                add("observer.rec_rows", rec.heap_bytes_rows());
+                add("observer.indexes", rec.heap_bytes_indexes());
+                add("observer.lineage", rec.heap_bytes_lineage());
+            }
+            None => add("observer.indexes", self.canon_index.heap_bytes()),
+        }
+        for t in &self.trackers {
+            add(
+                "tracker.spread",
+                (t.spread.capacity() * size_of::<SpreadPoint>()) as u64,
+            );
+            add(
+                "tracker.attempts",
+                (t.attempts.capacity() * size_of::<DeliveryAttempt>()) as u64,
+            );
+            add(
+                "tracker.amp_receivers",
+                (t.amp_receivers.capacity() * size_of::<u32>()) as u64,
+            );
+        }
+    }
+
+    /// Retained bytes by category: the full walk for recovery, observer and tracker rows only
+    /// for compact.
     pub fn memory_accounting(&self) -> Option<Accounting> {
-        let SmrNodes::Rec(nodes) = &self.nodes else {
-            return None;
+        let nodes = match &self.nodes {
+            SmrNodes::Rec(nodes) => nodes,
+            SmrNodes::Comp(nodes) => {
+                let mut acc = Accounting {
+                    round: self.round,
+                    nodes: nodes.len(),
+                    ..Default::default()
+                };
+                self.observer_rows(&mut |key, bytes| *acc.rows.entry(key).or_default() += bytes);
+                return Some(acc);
+            }
+            SmrNodes::Ext(_) => return None,
         };
         let mut acc = Accounting {
             round: self.round,
             nodes: nodes.len(),
+            walked_nodes: true,
             ..Default::default()
         };
         let mut add = |key: &'static str, bytes: u64| {
@@ -259,30 +306,7 @@ impl SmrState {
         acc.log_len_bytes = log_len_bytes;
         acc.perm_len_bytes = perm_len_bytes;
 
-        add("observer.canonical", self.checker.canonical().heap_bytes());
-        add(
-            "observer.metrics_rows",
-            (self.metrics.capacity() * size_of::<SmrRoundMetrics>()) as u64,
-        );
-        if let Some(rec) = &self.rec {
-            add("observer.rec_rows", rec.heap_bytes_rows());
-            add("observer.indexes", rec.heap_bytes_indexes());
-            add("observer.lineage", rec.heap_bytes_lineage());
-        }
-        for t in &self.trackers {
-            add(
-                "tracker.spread",
-                (t.spread.capacity() * size_of::<SpreadPoint>()) as u64,
-            );
-            add(
-                "tracker.attempts",
-                (t.attempts.capacity() * size_of::<DeliveryAttempt>()) as u64,
-            );
-            add(
-                "tracker.amp_receivers",
-                (t.amp_receivers.capacity() * size_of::<u32>()) as u64,
-            );
-        }
+        self.observer_rows(&mut add);
 
         let n = nodes.len() as u64;
         let k = self.cfg.k as u64;

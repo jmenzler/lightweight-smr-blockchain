@@ -9,6 +9,7 @@ use fixtures::{
 };
 use oracle::{LabeledSequence, OracleError, median_sequence};
 use protocol::compact::{ClientCommand, CompactNode, CompactReply, Entry, Timed};
+use protocol::merge::{StampTie, UnionStamp};
 use protocol::recovery::{RState, RecoveryNode, RecoveryReply};
 use protocol::{Config, LogNode};
 use rand::SeedableRng;
@@ -394,47 +395,66 @@ fn recovery_reply_handles_remain_logically_immutable_across_boundary_commit() {
     assert_eq!(sender.log_entries(), Some(vec![timed(Entry::Nop(3), 3)]));
 }
 
+// Sensitivity check for DET-1 (A5.OPEN.5): under the command-only key the recipient takes the
+// command median; the default key reads round stamps and orders this fixture otherwise.
 #[test]
-#[ignore = "interpretation-dependent pending timed-order ruling"]
-fn inherited_command_order_compact() {
+fn command_only_median_alternative_compact() {
     let fixture = compact_donors();
     assert_logs_and_uncommitted(&fixture);
     assert_eq!(median_for_logs(&fixture), REQUIRED_PREFIX);
 
-    let mut recipient = CompactNode::new(Config::default(), fixtures::T_NO_COMMIT);
-    recipient.step_chosen(&fixture.replies, &[], 4, Some(&[0, 1, 2]));
-    let commands = bare(
-        &recipient
-            .log_entries()
-            .expect("three reachable replies keep the recipient log-bearing"),
-    );
+    let recipient_commands = |stamp: StampTie| {
+        let mut recipient = CompactNode::new(Config::default(), fixtures::T_NO_COMMIT)
+            .with_merge_policy(stamp, UnionStamp::FirstSighting);
+        recipient.step_chosen(&fixture.replies, &[], 4, Some(&[0, 1, 2]));
+        bare(
+            &recipient
+                .log_entries()
+                .expect("three reachable replies keep the recipient log-bearing"),
+        )
+    };
 
-    assert_eq!(
-        commands.get(..REQUIRED_PREFIX.len()),
-        Some(REQUIRED_PREFIX.as_slice()),
-        "command-median recipient prefix; current output {commands:?}"
+    assert_command_only_prefix_and_default_differs(
+        &recipient_commands(StampTie::CommandsOnly),
+        &recipient_commands(StampTie::IncludeRound),
     );
 }
 
+// As above, for Alg 6's inherited extended median rule.
 #[test]
-#[ignore = "interpretation-dependent pending timed-order ruling"]
-fn inherited_command_order_recovery() {
+fn command_only_median_alternative_recovery() {
     let fixture = recovery_donors();
     assert_logs_and_uncommitted(&fixture);
     assert_eq!(median_for_logs(&fixture), REQUIRED_PREFIX);
 
-    let mut recipient = RecoveryNode::new(Config::default(), fixtures::T_NO_COMMIT, false);
-    recipient.step_chosen(&fixture.replies, &[], Some(&[0, 1, 2]));
-    let commands = bare(
-        &recipient
-            .log_entries()
-            .expect("three reachable log replies keep the recipient log-bearing"),
-    );
+    let recipient_commands = |stamp: StampTie| {
+        let mut recipient = RecoveryNode::new(Config::default(), fixtures::T_NO_COMMIT, false)
+            .with_merge_policy(stamp, UnionStamp::FirstSighting);
+        recipient.step_chosen(&fixture.replies, &[], Some(&[0, 1, 2]));
+        bare(
+            &recipient
+                .log_entries()
+                .expect("three reachable log replies keep the recipient log-bearing"),
+        )
+    };
 
+    assert_command_only_prefix_and_default_differs(
+        &recipient_commands(StampTie::CommandsOnly),
+        &recipient_commands(StampTie::IncludeRound),
+    );
+}
+
+fn assert_command_only_prefix_and_default_differs(command_only: &[Entry], default: &[Entry]) {
+    let required = Some(REQUIRED_PREFIX.as_slice());
     assert_eq!(
-        commands.get(..REQUIRED_PREFIX.len()),
-        Some(REQUIRED_PREFIX.as_slice()),
-        "command-median recipient prefix; current output {commands:?}"
+        command_only.get(..REQUIRED_PREFIX.len()),
+        required,
+        "command-median recipient prefix; output {command_only:?}"
+    );
+    assert_ne!(
+        default.get(..REQUIRED_PREFIX.len()),
+        required,
+        "the fixture no longer separates the two keys; default output {default:?}"
     );
 }
 

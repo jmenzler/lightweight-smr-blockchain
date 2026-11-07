@@ -18,6 +18,7 @@ pub struct LogNode {
 impl LogNode {
     /// "Initially, L_i = (x₀) for all i"
     pub fn new(x0: Command, cfg: Config) -> Self {
+        cfg.assert_valid();
         LogNode {
             l_i: Some(Arc::new(vec![x0])),
             cfg,
@@ -56,6 +57,7 @@ impl LogNode {
                 .map(|j| &replies[j])
                 .collect();
             // Alg 3: "server i sets L_i := L'_i ∘ L̄"
+            // DETERMINIZED: [DET-12] L̄ is the sorted M in order, then the appends in the driver's order
             m.sort_unstable_by(|a, b| a[..].cmp(&b[..]));
             let l_prime = m[self.cfg.ell / 2];
             let mut l_i = l_prime.as_ref().clone();

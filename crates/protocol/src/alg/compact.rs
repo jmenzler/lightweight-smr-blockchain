@@ -6,7 +6,7 @@ use crate::chunked::ChunkSeq;
 use crate::merge::{StampTie, UnionStamp, median_merge};
 pub use crate::support::log::Log;
 use crate::support::shared_state::{CLONE_SITE_COMPACT_COW_APPEND, cow_state};
-pub use crate::support::shared_state::{RepeatedCommit, SharedState};
+pub use crate::support::shared_state::{OutOfSnOrder, RepeatedCommit, SharedState};
 use rand::Rng;
 use rand::seq::index::sample;
 use std::collections::BTreeSet;
@@ -26,6 +26,7 @@ pub struct ClientCommand {
 }
 
 /// A log slot: a client command, the null command ⊥, or a no-op filler (x₀, x_d).
+// DETERMINIZED: [DET-10] the derived order is the paper's K order: Cmd < Null < Nop, commands by (client, sn, op)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Entry {
@@ -101,11 +102,14 @@ pub struct CompactNode {
     repeated_commit: RepeatedCommit,
     /// Entries the execute-once state machine left out; each marks an upstream agreement failure.
     repeat_skips: u64,
+    /// A commit the execute-once state machine refused; the node is final from then on.
+    sn_order_violation: Option<OutOfSnOrder>,
 }
 
 impl CompactNode {
     /// S_i starts as s₀ and L_i as the seed command x₀.
     pub fn new(cfg: Config, t: u64) -> Self {
+        cfg.assert_valid();
         CompactNode {
             s_i: Arc::new(SharedState::default()),
             l_i: Some(Log::from_entries(vec![Timed {
@@ -118,6 +122,7 @@ impl CompactNode {
             union_stamp: UnionStamp::FirstSighting,
             repeated_commit: RepeatedCommit::Execute,
             repeat_skips: 0,
+            sn_order_violation: None,
         }
     }
 
@@ -142,7 +147,7 @@ impl CompactNode {
         let sn_c = self.sn(x.client);
         // Alg 5: "if L_i ≠ ⊥, sn(x) = sn(c) + 1 and x ∉ L_i"
         if let Some(l_i) = &self.l_i
-            && x.sn == sn_c + 1
+            && sn_c.checked_add(1) == Some(x.sn)
             && !l_i.entries().iter().any(|t| t.entry == Entry::Cmd(*x))
         {
             return Triage::Amplify;
@@ -198,6 +203,10 @@ impl CompactNode {
         round: u64,
         m: Option<&[usize]>,
     ) {
+        assert!(
+            self.sn_order_violation.is_none(),
+            "a node that refused an out-of-sn-order commit is not stepped again"
+        );
         let b_i = self.b_i();
         assert_eq!(
             m.is_some(),
@@ -224,6 +233,7 @@ impl CompactNode {
         // Alg 5: "i sets L_i := L'_i ∘ L̄"
         // DETERMINIZED: [DET-1] the median comparator reads the round stamp (stamp_tie)
         // DETERMINIZED: [DET-2] a repeated command keeps its first-seen stamp (union_stamp)
+        // DETERMINIZED: [DET-12] L̄ is the sorted M in order, then the appends in the driver's order
         let mut l_i = median_merge(
             m.iter().map(|r| &r.l_j),
             self.cfg.ell,
@@ -241,8 +251,9 @@ impl CompactNode {
         // Alg 5: "i determines the largest prefix P_i of L_i"
         let p_i = aged_prefix_len(l_i.entries().iter(), round, self.t);
         // Alg 5: "i commits the commands in P_i in the given order on S_i, removes P_i from L_i"
-        self.commit(l_i.entries(), p_i);
-        self.l_i = Some(l_i.remove_prefix(p_i, x_d(round)));
+        if self.commit(l_i.entries(), p_i) {
+            self.l_i = Some(l_i.remove_prefix(p_i, x_d(round)));
+        }
     }
 
     // Alg 5: "if i receives less than ℓ replies"
@@ -258,13 +269,24 @@ impl CompactNode {
             self.s_i = Arc::clone(s_j);
         }
         let p_j = aged_prefix_len(r.l_j.entries().iter(), round, self.t);
+        // DETERMINIZED: [DET-13] "the updates" include executing that reply's aged prefix, unfiltered
         self.commit(r.l_j.entries(), p_j);
     }
 
     /// Executes the first `p` entries of `log` on S_i in order; x₀ and x_d change nothing.
-    fn commit(&mut self, log: &ChunkSeq<Timed>, p: usize) {
+    /// Returns false iff the execute-once state machine refused the whole prefix.
+    fn commit(&mut self, log: &ChunkSeq<Timed>, p: usize) -> bool {
         if log.iter().take(p).all(|t| matches!(t.entry, Entry::Nop(_))) {
-            return;
+            return true;
+        }
+        // EXTENSION: [EXT-3] an sn gap in P refuses the whole commit: no entry of P runs; an adopted S_j stays adopted
+        if self.repeated_commit == RepeatedCommit::Skip
+            && let Err(gap) = self
+                .s_i
+                .check_sn_order(log.iter().take(p).map(|t| &t.entry))
+        {
+            self.sn_order_violation = Some(gap);
+            return false;
         }
         let s_i = cow_state(&mut self.s_i, CLONE_SITE_COMPACT_COW_APPEND);
         for t in log.iter().take(p) {
@@ -273,10 +295,12 @@ impl CompactNode {
                 self.repeat_skips += 1;
             }
         }
+        true
     }
 }
 
 /// The dummy command x_d appended to an emptied log; it changes no state.
+// DETERMINIZED: [DET-11] x_d is Nop(round) stamped with the current round, so it ages like a command and sorts above commands
 pub(crate) fn x_d(round: u64) -> Timed {
     Timed {
         entry: Entry::Nop(round),

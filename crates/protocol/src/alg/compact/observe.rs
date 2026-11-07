@@ -1,6 +1,6 @@
 //! Read-only views a driver or observer takes of a compact node, and memory upkeep; no box step runs here.
 
-use super::{CompactNode, Log, SharedState, Timed};
+use super::{CompactNode, Log, OutOfSnOrder, SharedState, Timed};
 use crate::chunked::ChunkSeq;
 use crate::support::shared_state::{CLONE_SITE_COMPACT_COW_FORGET, cow_state};
 use std::sync::Arc;
@@ -16,6 +16,11 @@ impl CompactNode {
 
     pub fn repeat_skips(&self) -> u64 {
         self.repeat_skips
+    }
+
+    /// The commit the execute-once state machine refused; a driver ends the run on it.
+    pub fn sn_order_violation(&self) -> Option<OutOfSnOrder> {
+        self.sn_order_violation
     }
 
     /// Drops executed history below `upto`; S_i's logical content is unchanged.

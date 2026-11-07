@@ -30,8 +30,13 @@ pub fn shadow_yaml_with(
         );
     }
     let n = spec.n();
-    let stop_ms = (spec.max_rounds() as u64 + STOP_SLACK_ROUNDS) * spec.round_ms;
     let barrier = spec.sync == SyncMode::Barrier;
+    let rounds = spec.max_rounds() as u64;
+    // a barrier round also pays one coordinator round trip, and the timer grid starts start_offset_ms late;
+    // the built-in 1_gbit_switch (latency_ms 0) is a self-loop of 1 ms, so a hop never costs less than that
+    let hop_ms = spec.network.latency_ms.max(1);
+    let barrier_ms = if barrier { rounds * 2 * hop_ms } else { 0 };
+    let stop_ms = (rounds + STOP_SLACK_ROUNDS) * spec.round_ms + spec.start_offset_ms + barrier_ms;
     let smr = matches!(spec.scenario, ScenarioKind::Smr(_));
 
     let mut yaml = String::new();
@@ -81,8 +86,9 @@ pub fn shadow_yaml_with(
     if barrier {
         yaml.push_str("  coordinator:\n    network_node_id: 0\n    processes:\n");
         yaml.push_str(&format!("    - path: {bin_prefix}coordinator\n"));
+        let observers = if smr { " --observers 1" } else { "" };
         yaml.push_str(&format!(
-            "      args: --port {COORD_PORT} --n {n} --rounds {}\n",
+            "      args: --port {COORD_PORT} --n {n} --rounds {}{observers}\n",
             spec.max_rounds()
         ));
         yaml.push_str("      expected_final_state:\n        exited: 0\n");
@@ -91,7 +97,7 @@ pub fn shadow_yaml_with(
         yaml.push_str("  client:\n    network_node_id: 0\n    processes:\n");
         yaml.push_str(&format!("    - path: {bin_prefix}client_driver\n"));
         yaml.push_str(&format!(
-            "      args: --spec {run_prefix}spec.json --peers {run_prefix}peers.txt\n"
+            "      args: --spec {run_prefix}spec.json --peers {run_prefix}peers.txt{coord_arg}\n"
         ));
         yaml.push_str("      expected_final_state:\n        exited: 0\n");
     }

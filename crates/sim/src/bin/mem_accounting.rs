@@ -79,6 +79,14 @@ fn report_peak(peak: &Accounting, live: u64) {
         mib(live),
         100.0 * total as f64 / live as f64
     );
+    if !peak.walked_nodes {
+        println!(
+            "  compact: node, log and checkpoint rows are not walked — observer and tracker \
+             rows only, so the walk covers far less of the live heap than for recovery"
+        );
+        print_rows(peak);
+        return;
+    }
     println!(
         "  sharing: {} distinct checkpoints, {} distinct logs (of {} nodes) — \
          every checkpoint.* row below is PER FORK CLASS, not per node",
@@ -156,6 +164,11 @@ fn report_peak(peak: &Accounting, live: u64) {
             size_of::<u32>(),
         );
     }
+    print_rows(peak);
+}
+
+fn print_rows(peak: &Accounting) {
+    let total = peak.retained_total();
     println!("  {:<28} {:>12} {:>8}", "category", "MiB", "share");
     for (name, bytes) in peak.ranked() {
         if bytes == 0 {
@@ -225,7 +238,10 @@ fn main() {
         }
         rearm_peak();
     });
-    assert!(!samples.is_empty(), "no accounting samples — recovery only");
+    assert!(
+        !samples.is_empty(),
+        "no accounting samples — extended is not accounted"
+    );
     println!(
         "terminal={:?} safety_ok={} commands={} pool_peak_in_flight={:?}",
         report.terminal,
@@ -284,11 +300,13 @@ fn main() {
         mib(worst_bytes),
         worst + 1
     );
-    println!(
-        "  predicted by the two-generation overlap: node.log.entries + node.log.perm at the \
-         peak sample = {:.1} MiB",
-        mib(peak.log_capacity_bytes())
-    );
+    if peak.walked_nodes {
+        println!(
+            "  predicted by the two-generation overlap: node.log.entries + node.log.perm at the \
+             peak sample = {:.1} MiB",
+            mib(peak.log_capacity_bytes())
+        );
+    }
 
     let (interned, attempted) = protocol::recovery::state_intern_counts();
     if attempted > 0 {
@@ -419,6 +437,18 @@ fn main() {
             mib(s.rows.get("checkpoint.certs.windows").copied().unwrap_or(0)),
             s.distinct_clients,
             s.cert_stored_commands
+        );
+    }
+
+    println!("\nobserver trajectory (round, canonical KiB, indexes KiB, exec_dup KiB):");
+    let kib = |s: &Accounting, key| s.rows.get(key).copied().unwrap_or(0) as f64 / 1024.0;
+    for (s, _) in &samples {
+        println!(
+            "  {:>5} {:>10.1} {:>10.1} {:>10.1}",
+            s.round,
+            kib(s, "observer.canonical"),
+            kib(s, "observer.indexes"),
+            kib(s, "observer.exec_dup")
         );
     }
 }

@@ -210,3 +210,45 @@ fn skip_preserves_agreement_but_does_not_heal_a_disagreement() {
     assert_eq!(ahead.executed().to_vec(), vec![x.clone(), y.clone()]);
     assert_eq!(behind.executed().to_vec(), vec![y, x]);
 }
+
+#[test]
+fn sn_order_check_names_the_first_skipped_sn() {
+    let s = SharedState::default();
+    let entries = [cmd(7, 1, 70), cmd(7, 3, 73), cmd(7, 5, 75)];
+    assert_eq!(
+        s.check_sn_order(entries.iter()),
+        Err(OutOfSnOrder {
+            client: 7,
+            sn: 3,
+            committed_sn: 1
+        })
+    );
+}
+
+#[test]
+fn sn_order_check_accepts_in_order_commits_repeats_and_bots() {
+    let s = SharedState::default();
+    let entries = [
+        cmd(7, 1, 70),
+        cmd(8, 1, 80),
+        cmd(7, 2, 71),
+        cmd(7, 1, 70),
+        bot(8, 2),
+        Entry::Nop(4),
+    ];
+    assert_eq!(s.check_sn_order(entries.iter()), Ok(()));
+}
+
+#[test]
+fn sn_order_check_starts_from_the_committed_sn() {
+    let s = committed(&[cmd(7, 1, 70), cmd(7, 2, 71)], RepeatedCommit::Skip);
+    assert_eq!(s.check_sn_order([cmd(7, 3, 73)].iter()), Ok(()));
+    assert_eq!(
+        s.check_sn_order([bot(7, 4)].iter()),
+        Err(OutOfSnOrder {
+            client: 7,
+            sn: 4,
+            committed_sn: 2
+        })
+    );
+}

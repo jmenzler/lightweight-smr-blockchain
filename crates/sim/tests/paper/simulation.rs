@@ -41,7 +41,7 @@ fn scenario_config_drives_the_fanout() {
 fn converges_to_agreement_from_random_init() {
     let out = run(&base(100, 1, Init::UniformRandom { k: 5 }));
     match out {
-        Outcome::Agreement { value: _, rounds } => assert!(rounds > 0),
+        Outcome::Agreement { rounds, .. } => assert!(rounds > 0),
         other => panic!("expected agreement, got {other:?}"),
     }
 }
@@ -184,20 +184,18 @@ fn unanimity_among_holders_is_not_absorbing_while_undecided_remain() {
 }
 
 #[test]
-fn transient_unanimity_during_collapse_is_not_agreement() {
+fn transient_unanimity_during_collapse_is_not_survival() {
     // At 30% blocking the population is subcritical (E[replies] < ell) and dies.
-    // Mid-collapse the few surviving holders can transiently share one value;
-    // that must not count as agreement — the run must end AllUndecided.
+    // Mid-collapse the few surviving holders transiently share one value: that is
+    // Def 1.2 agreement (on a vanishing population), but availability is lost.
     let out = run(&blocked(
         1000,
         49,
         BlockSchedule::FreshPerRound { fraction: 0.30 },
         200,
     ));
-    assert!(
-        matches!(out, Outcome::AllUndecided { .. }),
-        "expected death spiral, got {out:?}"
-    );
+    assert!(!out.survived(), "got {out:?}");
+    assert_eq!(out.extinction_round(), Some(6), "got {out:?}");
 }
 
 #[test]
@@ -236,7 +234,7 @@ fn permanent_blocking_at_three_tenths_death_spirals() {
         BlockSchedule::Permanent { fraction: 0.30 },
         500,
     ));
-    assert!(matches!(out, Outcome::AllUndecided { .. }), "got {out:?}");
+    assert!(out.extinction_round().is_some(), "got {out:?}");
 }
 
 #[test]
@@ -249,4 +247,21 @@ fn permanent_blocking_at_two_tenths_survives() {
         500,
     ));
     assert!(matches!(out, Outcome::Agreement { .. }), "got {out:?}");
+}
+
+#[test]
+fn even_split_values_match_exact_arithmetic_where_the_product_exceeds_32_bits() {
+    // i · values overflows a 32-bit usize (the wasm32 target) from n = values = 65 536 on; the
+    // initial value of server i must still be ⌊i · values / n⌋ computed without overflow.
+    use rand::SeedableRng;
+    let (n, values) = (70_000usize, 70_000usize);
+    let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(0);
+    for i in [0usize, 1, 65_535, 65_536, 69_999] {
+        let exact = (i as u128 * values as u128 / n as u128) as u64;
+        assert_eq!(
+            sim::initial_state(&Init::EvenSplit { values }, i, n, &mut rng),
+            Some(exact),
+            "server {i}"
+        );
+    }
 }

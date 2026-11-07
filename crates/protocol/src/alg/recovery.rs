@@ -3,7 +3,9 @@
 
 use crate::Config;
 use crate::certificates::ServerCertState;
-use crate::compact::{ClientCommand, Entry, RepeatedCommit, SharedState, Timed};
+use crate::compact::{
+    ClientCommand, Entry, OutOfSnOrder, RepeatedCommit, SharedState, Timed, Triage,
+};
 use crate::log::Log;
 use crate::merge::{StampTie, UnionStamp};
 pub use crate::support::checkpoint::RecoveryPrefixViolation;
@@ -16,6 +18,8 @@ use std::sync::Arc;
 
 mod observe;
 mod sharing;
+#[cfg(test)]
+mod tests;
 
 use sharing::median_union;
 pub use sharing::state_intern_counts;
@@ -31,7 +35,8 @@ pub enum RState {
 /// What a node does at a boundary where P is not a prefix of L_i; Alg 6 has no branch for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefixMismatch {
-    /// Panic: the paper rules the case out w.h.p. (Lemma 6.7).
+    /// Panic: the paper rules the case out w.h.p. (Lemma 6.7). Only the no-reset path can reach
+    /// it; a same-W checkpoint fork that a rollback commits is a population check for drivers.
     #[default]
     Abort,
     /// Leave the boundary undone and wait to adopt a newer peer checkpoint.
@@ -48,6 +53,10 @@ pub struct Checkpoint {
     pub certs: Option<ServerCertState>,
 }
 
+/// Representation equality: P is compared with its round stamps, which an adopting node takes
+/// over into L_i and ages by. The paper's same-W identity (p. 35) reads P as commands only.
+/// Panics through `SharedState::eq` on equal-length states with different forget lines, so
+/// states held by different nodes are compared with `content_eq` or a fork signature.
 impl PartialEq for Checkpoint {
     fn eq(&self, other: &Self) -> bool {
         self.s == other.s && self.p == other.p && self.w == other.w
@@ -96,13 +105,16 @@ pub struct RecoveryNode {
     repeated_commit: RepeatedCommit,
     /// Entries the execute-once state machine left out; each marks an upstream agreement failure.
     repeat_skips: u64,
-    /// C_i's P was skipped at a boundary and must never commit; cleared by adoption.
+    /// This node never commits C_i's skipped P; cleared by adoption. C_i is still served to peers.
     stale_checkpoint: bool,
+    /// A boundary commit the execute-once state machine refused; the node is final from then on.
+    sn_order_violation: Option<OutOfSnOrder>,
 }
 
 impl RecoveryNode {
     /// S_i = s₀, L_i = [x₀], R_i = no-reset, C_i = (s₀, ⊥, 0). `certs` mounts the §5 layer.
     pub fn new(cfg: Config, t: u64, certs: bool) -> Self {
+        cfg.assert_valid();
         assert!(t >= 1, "T-window length must be at least 1");
         RecoveryNode {
             s_i: Arc::new(SharedState::default()),
@@ -125,6 +137,7 @@ impl RecoveryNode {
             repeated_commit: RepeatedCommit::Execute,
             repeat_skips: 0,
             stale_checkpoint: false,
+            sn_order_violation: None,
         }
     }
 
@@ -143,6 +156,18 @@ impl RecoveryNode {
         self
     }
 
+    /// The boundary commit the execute-once state machine refused; a driver ends the run on it.
+    pub fn sn_order_violation(&self) -> Option<OutOfSnOrder> {
+        self.sn_order_violation
+    }
+
+    fn assert_not_refused(&self) {
+        assert!(
+            self.sn_order_violation.is_none(),
+            "a node that refused an out-of-sn-order commit is not stepped again"
+        );
+    }
+
     pub fn with_merge_policy(mut self, stamp: StampTie, union: UnionStamp) -> Self {
         self.stamp_tie = stamp;
         self.union_stamp = union;
@@ -155,6 +180,36 @@ impl RecoveryNode {
             None => true,
             Some(l_i) => !l_i.entries().iter().any(|t| t.entry == Entry::Cmd(*x)),
         }
+    }
+
+    // Alg 5: "for every command x received from a client c"
+    /// §6 subsumes the §4 client sequence numbers in the state machine (p. 30).
+    // DETERMINIZED: [DET-17] a ⊥ server ignores client commands (Alg 5's guard); Alg 3 alone has none
+    pub fn on_client_command(&self, x: &ClientCommand) -> Triage {
+        // Every step that replaces S_i or C_i keeps their sn maps equal, so this read is not a choice.
+        debug_assert!(
+            self.s_i.sn_iter().eq(self.c_i.s.sn_iter()),
+            "S_i and C_i.S disagree on sn(c): a step replaced one without the other"
+        );
+        self.client_triage(x)
+    }
+
+    fn client_triage(&self, x: &ClientCommand) -> Triage {
+        // sn(c) is "assumed to be included in S_i" (Alg 5 box, p. 26).
+        let sn_c = self.s_i.sn_get(x.client).unwrap_or(0);
+        // Alg 5: "if L_i ≠ ⊥, sn(x) = sn(c) + 1 and x ∉ L_i"
+        if let Some(l_i) = &self.l_i
+            && sn_c.checked_add(1) == Some(x.sn)
+            && !l_i.entries().iter().any(|t| t.entry == Entry::Cmd(*x))
+        {
+            return Triage::Amplify;
+        }
+        // Alg 5: "if L_i ≠ ⊥ and sn(x) = sn(c)"
+        if self.l_i.is_some() && x.sn == sn_c {
+            return Triage::AckCommitted;
+        }
+        // Alg 5: "otherwise, i ignores x"
+        Triage::Ignore
     }
 
     // Alg 6: "If a request was received from server j and R_i ≠ ⊥"
@@ -200,6 +255,7 @@ impl RecoveryNode {
         appends: &[(ClientCommand, u64)],
         m: Option<&[usize]>,
     ) {
+        self.assert_not_refused();
         // DETERMINIZED: [DET-7] the Alg 3 merge runs first; adoption below overwrites L_i
         self.extended_median_rule(replies, appends, m);
         if replies.len() >= self.cfg.ell {
@@ -229,6 +285,7 @@ impl RecoveryNode {
             // Alg 3: "server i sets L_i := L'_i ∘ L̄"
             // DETERMINIZED: [DET-1] the median comparator reads the round stamp (stamp_tie)
             // DETERMINIZED: [DET-2] a repeated command keeps its first-seen stamp (union_stamp)
+            // DETERMINIZED: [DET-12] L̄ is the sorted M in order, then the appends in the driver's order
             Some(m) => Some(median_union(
                 &logs,
                 m,
@@ -245,14 +302,14 @@ impl RecoveryNode {
     // Alg 6: "If at least ℓ replies were received"
     fn at_least_ell_replies(&mut self, replies: &[RecoveryReply]) {
         // Alg 6: "If no-reset was received in one reply"
-        // DEVIATION: [DEV-1] any no-reset reply wins, as in the box; Def 3.5 would subsample ℓ
+        // DETERMINIZED: [DET-16] any no-reset reply wins, as in the box; Def 3.5 would subsample ℓ
         self.r_i = if replies.iter().any(|rep| rep.r_j == RState::NoReset) {
             RState::NoReset
         } else {
             RState::Reset
         };
         // Alg 6: "let C' = (S', P', W') be the received checkpoint with largest W'"
-        let c_prime = latest_checkpoint(replies);
+        let c_prime = &replies[latest_checkpoint_index(replies)].c_j;
         // Alg 6: "If W' > W"
         if c_prime.w > self.c_i.w {
             self.s_i = Arc::clone(&c_prime.s);
@@ -281,6 +338,7 @@ impl RecoveryNode {
         round: u64,
         equal_peer: Option<&Arc<Checkpoint>>,
     ) {
+        self.assert_not_refused();
         // DEVIATION: [DEV-3] opt-in: a P that does not prefix L_i skips boundaries, L_i := ⊥, until adoption
         if self.skips_boundary() {
             self.stale_checkpoint = true;
@@ -298,8 +356,14 @@ impl RecoveryNode {
                 // P = ⊥ (the genesis checkpoint) commits nothing.
                 let p = self.c_i.p.as_deref().unwrap_or(&[]);
                 assert_prefix(p, l_i.entries(), round);
-                // EXTENSION: [EXT-3] opt-in execute-once state machine at the boundary commit
-                self.repeat_skips += execute_prefix(&mut self.s_i, p, self.repeated_commit);
+                // EXTENSION: [EXT-3] opt-in execute-once state machine at the boundary commit; an sn gap in P stops the boundary here
+                match execute_prefix(&mut self.s_i, p, self.repeated_commit) {
+                    Ok(skipped) => self.repeat_skips += skipped,
+                    Err(gap) => {
+                        self.sn_order_violation = Some(gap);
+                        return;
+                    }
+                }
                 strip_prefix(l_i, p.len(), round);
                 // Alg 6: "make new checkpoint C_i := (S_i, P_i, W')"
                 let p_i = aged_prefix(&l_i.entries().to_vec(), round, self.t);
@@ -338,12 +402,13 @@ impl RecoveryNode {
     }
 }
 
-/// C' = (S', P', W'): the received checkpoint with the largest window number W'.
-fn latest_checkpoint(replies: &[RecoveryReply]) -> &Arc<Checkpoint> {
+/// The reply holding C' = (S', P', W'), the received checkpoint with the largest window number W'.
+pub fn latest_checkpoint_index(replies: &[RecoveryReply]) -> usize {
     // DETERMINIZED: [DET-6] ties on the largest W' go to the LAST reply (max_by_key)
     replies
         .iter()
-        .map(|rep| &rep.c_j)
-        .max_by_key(|c| c.w)
+        .enumerate()
+        .max_by_key(|(_, rep)| rep.c_j.w)
+        .map(|(index, _)| index)
         .expect("at least ell replies")
 }

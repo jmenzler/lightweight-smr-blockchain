@@ -26,7 +26,10 @@ pub struct GridSpec {
     pub ladder: Vec<LadderRung>,
 }
 
-/// Contiguous two-component partition (first s·n ids in component 0); pair only with id-independent inits.
+/// Contiguous two-component partition (first s·n ids in component 0). With an id-contiguous init
+/// (split, even_split, distinct, with_undecided) a component starts with its own values; that
+/// aligned start is a legitimate control, while uniform_random or weighted give a start
+/// independent of the partition.
 pub fn split_partition(s: f64, n: usize) -> Vec<u32> {
     let first = (s * n as f64).round() as usize;
     (0..n).map(|i| u32::from(i >= first)).collect()
@@ -52,11 +55,24 @@ pub struct RowKey {
     pub seed: u64,
 }
 
-/// Fixed nesting: pairs -> ladder -> betas -> useful_fractions -> horizons -> splits -> seeds.
-pub fn expand(spec: &GridSpec) -> Result<Vec<(RowKey, Scenario)>, String> {
-    if spec.ladder.is_empty() {
+fn check_ladder(ladder: &[LadderRung]) -> Result<(), String> {
+    if ladder.is_empty() {
         return Err("ladder must have at least one rung".into());
     }
+    for rung in ladder {
+        if rung.seed_base.checked_add(rung.seed_count).is_none() {
+            return Err(format!(
+                "ladder rung n={}: seeds {} + {} overflow u64",
+                rung.n, rung.seed_base, rung.seed_count
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fixed nesting: pairs -> ladder -> betas -> useful_fractions -> horizons -> splits -> seeds.
+pub fn expand(spec: &GridSpec) -> Result<Vec<(RowKey, Scenario)>, String> {
+    check_ladder(&spec.ladder)?;
     if spec.splits.is_some() && spec.base.partition.is_some() {
         return Err("splits axis over an explicit base partition is ambiguous — drop one".into());
     }
@@ -64,11 +80,11 @@ pub fn expand(spec: &GridSpec) -> Result<Vec<(RowKey, Scenario)>, String> {
         match spec.base.schedule {
             Some(ScheduleSpec::FreshPerRound { .. })
             | Some(ScheduleSpec::Permanent { .. })
-            | Some(ScheduleSpec::Adaptive1Late { .. })
+            | Some(ScheduleSpec::Adaptive0Late { .. })
             | Some(ScheduleSpec::AdaptiveAlphaLate { .. }) => {}
             _ => {
                 return Err(
-                    "betas axis requires a fresh_per_round or permanent base schedule (adaptive_1late is Alg-1 only)".into(),
+                    "betas axis requires a fresh_per_round or permanent base schedule (adaptive_0late is Alg-1 only)".into(),
                 );
             }
         }
@@ -124,8 +140,8 @@ pub fn expand(spec: &GridSpec) -> Result<Vec<(RowKey, Scenario)>, String> {
                                         Some(ScheduleSpec::Permanent { .. }) => {
                                             ScheduleSpec::Permanent { fraction: b }
                                         }
-                                        Some(ScheduleSpec::Adaptive1Late { policy, .. }) => {
-                                            ScheduleSpec::Adaptive1Late {
+                                        Some(ScheduleSpec::Adaptive0Late { policy, .. }) => {
+                                            ScheduleSpec::Adaptive0Late {
                                                 fraction: b,
                                                 policy,
                                             }
@@ -186,16 +202,21 @@ fn report_progress(exp: &str, done: usize, total: usize) {
 
 pub const CSV_HEADER: &str = "exp,k,ell,n,beta,useful_fraction,horizon,split,seed,outcome,rounds";
 
+/// Three decimals; a value finer than that prints in full, so distinct grid points never share a cell.
 pub(crate) fn fmt_opt(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.3}")).unwrap_or_default()
+    v.map(|x| {
+        let fixed = format!("{x:.3}");
+        if fixed.parse::<f64>() == Ok(x) {
+            fixed
+        } else {
+            x.to_string()
+        }
+    })
+    .unwrap_or_default()
 }
 
 pub(crate) fn alg1_row(exp: &str, key: &RowKey, outcome: &Outcome) -> String {
-    let (label, rounds) = match outcome {
-        Outcome::Agreement { rounds, .. } => ("agreement", *rounds),
-        Outcome::AllUndecided { rounds } => ("died", *rounds),
-        Outcome::NoConvergence { rounds } => ("censored", *rounds),
-    };
+    let (label, rounds) = outcome.label();
     format!(
         "{},{},{},{},{},{},{},{},{},{label},{rounds}\n",
         exp,
@@ -302,7 +323,7 @@ pub fn run_grid_streaming(
     )
 }
 
-use crate::smr::{CommandReport, CommandStatus, Proto, SmrReport, SmrScenario, SmrTerminal};
+use crate::smr::{Proto, RunFailurePhase, SmrScenario, SmrSummary, SmrTerminal};
 use crate::spec::{ProtoSpec, SmrScenarioSpec, TrafficSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,9 +364,7 @@ pub struct SmrRowKey {
 
 /// Fixed nesting: pairs -> ladder -> betas -> sigmas -> rates -> t_commits -> horizons -> splits -> seeds.
 pub fn expand_smr(spec: &SmrGridSpec) -> Result<Vec<(SmrRowKey, SmrScenario)>, String> {
-    if spec.ladder.is_empty() {
-        return Err("ladder must have at least one rung".into());
-    }
+    check_ladder(&spec.ladder)?;
     if spec.splits.is_some() && spec.base.partition.is_some() {
         return Err("splits axis over an explicit base partition is ambiguous — drop one".into());
     }
@@ -466,61 +485,138 @@ pub fn expand_smr(spec: &SmrGridSpec) -> Result<Vec<(SmrRowKey, SmrScenario)>, S
     Ok(points)
 }
 
-pub const SMR_CSV_HEADER: &str = "exp,k,ell,n,beta,sigma,rate,t_commit,horizon,split,seed,terminal,rounds,commands,complete,pending,dead,mean_te,safety,recovered_round,fork_ok,rollbacks_total,te_n,te_unsettled,te_p50,te_p90,te_p99,te_max,abort_kind";
+/// `lat_*`: paper latency (p. 7), from `injected_round` (first receipt by a non-blocked server,
+/// pp. 7, 19, even one that ignores the command) to the landmark named in `lat_end`; a command
+/// never injected has no paper latency and is in neither `lat_n` nor `lat_unsettled`, so the two
+/// need not sum to `commands`. `client_lat_*`: from `injection_round` (the client's first scheduled
+/// attempt) to where its client stops resending: the commit ack (compact; recovery with
+/// `resend_until_acked`), the global executed latch (recovery without it) or `prefix_fixed`
+/// (extended). Both blocks follow `summarize_latency`'s window and censoring rule; quantiles can
+/// read `inf`. Extended's `prefix_fixed` is Lemma 3.8's identical-prefix landmark, never earlier
+/// than Def 1.3's same-index agreement, so its latencies bound Def 1.3 latency from above.
+/// `min_useful` is the fewest useful servers in any round and `useful_ge_n4` whether that stayed
+/// at least n/4 (Theorem 5's hypothesis). `halt_round` and `halt_kind` fill only on a `halted`
+/// row, where `rounds` is the halt round too.
+pub const SMR_CSV_HEADER: &str = "exp,k,ell,n,beta,sigma,rate,t_commit,horizon,split,seed,terminal,rounds,commands,complete,pending,dead,lat_mean,safety,recovered_round,fork_ok,rollbacks_total,lat_end,lat_n,lat_unsettled,lat_p50,lat_p90,lat_p99,lat_max,client_lat_mean,client_lat_n,client_lat_unsettled,client_lat_p50,client_lat_p90,client_lat_p99,client_lat_max,abort_kind,strong_safety_violation_rounds,strong_safety_first_violation,strong_safety_boundary_violations,strong_safety_boundary_first_violation,retractions,retraction_rewrites,first_retraction_round,commit_fork_round,min_useful,useful_ge_n4,halt_round,halt_kind";
 
-fn nearest_rank(sorted: &[usize], p: f64) -> usize {
-    let idx = (p * sorted.len() as f64).ceil().max(1.0) as usize - 1;
-    sorted[idx]
+/// Columns after `abort_kind`: Def 1.4 / Def 1.5 counters and recovery's commit-path checkpoint
+/// fork, blank where a tier does not measure them.
+const SMR_COLS_AFTER_ABORT_KIND: usize = 8;
+
+/// `min_useful` and `useful_ge_n4`, after the `SMR_COLS_AFTER_ABORT_KIND` columns.
+const SMR_USEFUL_COLS: usize = 2;
+
+/// `halt_round` and `halt_kind`, last: set only on a `halted` row.
+const SMR_HALT_COLS: usize = 2;
+
+fn paper_end_name(proto: Proto) -> &'static str {
+    match proto {
+        Proto::Extended => "prefix_fixed",
+        Proto::Compact { .. } => "committed",
+        Proto::Recovery { .. } => "executed",
+    }
 }
 
-// Each proto records only its own landmark, so the earliest present one is its settlement round.
-fn settled_round(c: &CommandReport) -> Option<usize> {
-    [
-        c.prefix_fixed_round,
-        c.committed_ack_round,
-        c.executed_round,
-    ]
-    .into_iter()
-    .flatten()
-    .min()
+struct LatencySummary {
+    mean: String,
+    n: usize,
+    unsettled: usize,
+    p50: String,
+    p90: String,
+    p99: String,
+    max: String,
 }
 
-// Horizon window: without it a short-horizon arm censors its own tail and flatters p99.
-fn settlement_ages(report: &SmrReport, proto: Proto, rounds: usize) -> (Vec<usize>, usize) {
-    let cutoff = match proto {
-        Proto::Compact { t_commit_rounds } => rounds.saturating_sub(5 * t_commit_rounds as usize),
-        _ => rounds,
+/// Window: with `slowest` the largest latency settled anywhere in the run, only commands whose
+/// origin is at most `rounds − slowest` enter, since a later one could settle as slowly and still
+/// fall past the horizon. Censoring: an in-window command that never settled counts as +∞ in the
+/// nearest-rank quantiles (printed `inf`) and in `unsettled`; `mean` and `n` cover the settled ones.
+fn summarize_latency<I>(samples: I, rounds: usize) -> LatencySummary
+where
+    I: IntoIterator<Item = (usize, Option<usize>)>,
+    I::IntoIter: Clone,
+{
+    let samples = samples.into_iter();
+    let age = |origin: usize, end: usize| {
+        end.checked_sub(origin)
+            .expect("a latency end landmark precedes its origin")
     };
-    let in_window: Vec<_> = report
-        .commands
-        .iter()
-        .filter(|c| c.injection_round <= cutoff)
-        .collect();
-    let mut ages: Vec<usize> = in_window
-        .iter()
-        .filter(|c| c.status == CommandStatus::Complete)
-        .filter_map(|c| settled_round(c).map(|r| r - c.injection_round))
-        .collect();
+    let slowest = samples
+        .clone()
+        .filter_map(|(o, end)| end.map(|e| age(o, e)))
+        .max()
+        .unwrap_or(0);
+    let cutoff = rounds.saturating_sub(slowest);
+    let mut total = 0;
+    let mut ages: Vec<usize> = Vec::new();
+    for (o, end) in samples.filter(|&(o, _)| o <= cutoff) {
+        total += 1;
+        if let Some(e) = end {
+            ages.push(age(o, e));
+        }
+    }
     ages.sort_unstable();
-    let unsettled = in_window.len() - ages.len();
-    (ages, unsettled)
+    let unsettled = total - ages.len();
+    // Unsettled commands rank after every settled one.
+    let rank = |p: f64| {
+        if total == 0 {
+            return String::new();
+        }
+        let idx = (p * total as f64).ceil().max(1.0) as usize - 1;
+        ages.get(idx)
+            .map_or_else(|| "inf".to_string(), usize::to_string)
+    };
+    LatencySummary {
+        mean: if ages.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{:.2}",
+                ages.iter().sum::<usize>() as f64 / ages.len() as f64
+            )
+        },
+        n: ages.len(),
+        unsettled,
+        p50: rank(0.50),
+        p90: rank(0.90),
+        p99: rank(0.99),
+        max: rank(1.0),
+    }
 }
 
 // Sub-floor and loaded recovery grids reach this assert by design; recorded as an outcome.
 const STRIP_ABORT_MARKER: &str = "P must be a prefix of L";
-const MONO_ABORT_MARKER: &str = "executed sequence regressed";
+
+// Panics a valid spec can reach by design, each recorded as an abort row of the paired kind.
+const CAPTURED_ABORTS: [(&str, AbortKind); 2] = [
+    (STRIP_ABORT_MARKER, AbortKind::Prefix),
+    (crate::smr::POOL_EXHAUSTED_MARKER, AbortKind::Pool),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortKind {
     Prefix,
     Mono,
+    SnOrder,
+    /// Every pool client was in flight when an arrival needed one.
+    Pool,
 }
 
 impl AbortKind {
+    pub fn of_failure(phase: RunFailurePhase) -> Self {
+        match phase {
+            RunFailurePhase::BoundaryPreflight => Self::Prefix,
+            RunFailurePhase::ExecutedRegression => Self::Mono,
+            RunFailurePhase::OutOfSnOrderCommit => Self::SnOrder,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Prefix => "prefix",
             Self::Mono => "mono",
+            Self::SnOrder => "sn_order",
+            Self::Pool => "pool",
         }
     }
 }
@@ -531,16 +627,15 @@ pub struct StripAbort {
     pub kind: AbortKind,
 }
 
-fn is_captured_abort(msg: &str) -> bool {
-    msg.contains(STRIP_ABORT_MARKER) || msg.contains(MONO_ABORT_MARKER)
+fn captured_kind(msg: &str) -> Option<AbortKind> {
+    CAPTURED_ABORTS
+        .iter()
+        .find(|(marker, _)| msg.contains(marker))
+        .map(|&(_, kind)| kind)
 }
 
-fn abort_kind(msg: &str) -> AbortKind {
-    if msg.contains(MONO_ABORT_MARKER) {
-        AbortKind::Mono
-    } else {
-        AbortKind::Prefix
-    }
+fn is_captured_abort(msg: &str) -> bool {
+    captured_kind(msg).is_some()
 }
 
 fn parse_abort_round(msg: &str) -> Option<usize> {
@@ -555,7 +650,7 @@ fn parse_abort_round(msg: &str) -> Option<usize> {
     None
 }
 
-/// Run `f`, turning a boundary-strip or growth-regression abort into `Err`; other panics resume.
+/// Run `f`, turning a panic that a valid spec reaches by design into `Err`; other panics resume.
 pub fn capture_strip_abort<R>(f: impl FnOnce() -> R) -> Result<R, StripAbort> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(value) => Ok(value),
@@ -564,10 +659,11 @@ pub fn capture_strip_abort<R>(f: impl FnOnce() -> R) -> Result<R, StripAbort> {
                 .downcast_ref::<&'static str>()
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .filter(|m| is_captured_abort(m))
-                .map(|m| StripAbort {
-                    round: parse_abort_round(m),
-                    kind: abort_kind(m),
+                .and_then(|m| {
+                    captured_kind(m).map(|kind| StripAbort {
+                        round: parse_abort_round(m),
+                        kind,
+                    })
                 });
             match abort {
                 Some(a) => Err(a),
@@ -609,79 +705,94 @@ fn smr_key_cols(exp: &str, key: &SmrRowKey) -> String {
 const SMR_COLS_BEFORE_REPORT: usize = 13;
 
 fn smr_abort_row(exp: &str, key: &SmrRowKey, abort: &StripAbort) -> String {
-    let report_cols = SMR_CSV_HEADER.split(',').count() - SMR_COLS_BEFORE_REPORT - 1;
+    let trailing = SMR_COLS_AFTER_ABORT_KIND + SMR_USEFUL_COLS + SMR_HALT_COLS;
+    let report_cols = SMR_CSV_HEADER.split(',').count() - SMR_COLS_BEFORE_REPORT - 1 - trailing;
     format!(
-        "{},abort,{}{},{}",
+        "{},abort,{}{},{}{}",
         smr_key_cols(exp, key),
         abort.round.map(|r| r.to_string()).unwrap_or_default(),
         ",".repeat(report_cols),
         abort.kind.as_str(),
+        ",".repeat(trailing),
     )
 }
 
-fn smr_row(exp: &str, key: &SmrRowKey, proto: Proto, report: &SmrReport) -> String {
-    let (terminal, rounds) = match report.terminal {
-        SmrTerminal::Ran { rounds } => ("ran", rounds),
-        SmrTerminal::Dead { round } => ("dead", round),
+/// The `SMR_COLS_AFTER_ABORT_KIND` cells: what the tier's committed-sequence oracles counted.
+fn oracle_cols(proto: Proto, report: &SmrSummary) -> String {
+    let opt = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_default();
+    let recovery = matches!(proto, Proto::Recovery { .. });
+    match proto {
+        Proto::Extended => ",".repeat(SMR_COLS_AFTER_ABORT_KIND - 1),
+        Proto::Compact { .. } | Proto::Recovery { .. } => format!(
+            "{},{},{},{},{},{},{},{}",
+            report.strong_safety_violation_rounds,
+            opt(report.strong_safety_first_violation),
+            if recovery {
+                report.strong_safety_boundary_violations.to_string()
+            } else {
+                String::new()
+            },
+            opt(report.strong_safety_boundary_first_violation),
+            report.retractions,
+            report.retraction_rewrites,
+            opt(report.first_retraction_round),
+            opt(report.recovery.as_ref().and_then(|r| r.commit_fork_round)),
+        ),
+    }
+}
+
+fn smr_row(exp: &str, key: &SmrRowKey, proto: Proto, report: &SmrSummary) -> String {
+    let (terminal, rounds, halt) = match report.terminal {
+        SmrTerminal::Ran { rounds } => ("ran", rounds, None),
+        SmrTerminal::Dead { round } => ("dead", round, None),
+        SmrTerminal::Halted { round, kind } => ("halted", round, Some((round, kind))),
         SmrTerminal::Failed { .. } => panic!("failed reports must use the abort row"),
     };
-    let count = |s: CommandStatus| report.commands.iter().filter(|c| c.status == s).count();
-    let (complete, pending, dead) = (
-        count(CommandStatus::Complete),
-        count(CommandStatus::Pending),
-        count(CommandStatus::Dead),
+    let commands = &report.commands;
+    let (complete, pending, dead) = (commands.complete, commands.pending, commands.dead);
+    let (lat, client_lat) = (
+        summarize_latency(commands.paper.iter(), rounds),
+        summarize_latency(commands.client.iter(), rounds),
     );
-    let tes: Vec<usize> = report
-        .commands
-        .iter()
-        .filter(|c| c.status == CommandStatus::Complete)
-        .filter_map(|c| c.prefix_fixed_round.map(|r| r - c.injection_round))
-        .collect();
-    let mean_te = if tes.is_empty() {
-        String::new()
-    } else {
-        format!("{:.2}", tes.iter().sum::<usize>() as f64 / tes.len() as f64)
-    };
-    let recovered = match proto {
-        Proto::Recovery {
-            t_window_rounds, ..
-        } => report
-            .recovered_round(key.n, t_window_rounds)
-            .map(|r| r.to_string())
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
+    let recovered = report
+        .recovery
+        .as_ref()
+        .and_then(|rec| rec.recovered_round)
+        .map(|r| r.to_string())
+        .unwrap_or_default();
     let (fork_ok, rollbacks_total) = report
         .recovery
         .as_ref()
-        .map(|rec| {
-            (
-                rec.fork_ok.to_string(),
-                rec.rounds
-                    .iter()
-                    .map(|m| u64::from(m.rollbacks))
-                    .sum::<u64>()
-                    .to_string(),
-            )
-        })
+        .map(|rec| (rec.fork_ok.to_string(), rec.rollbacks_total.to_string()))
         .unwrap_or_default();
-    let (ages, te_unsettled) = settlement_ages(report, proto, rounds);
-    let (te_p50, te_p90, te_p99, te_max) = if ages.is_empty() {
-        (String::new(), String::new(), String::new(), String::new())
-    } else {
-        (
-            nearest_rank(&ages, 0.50).to_string(),
-            nearest_rank(&ages, 0.90).to_string(),
-            nearest_rank(&ages, 0.99).to_string(),
-            ages[ages.len() - 1].to_string(),
-        )
-    };
+    let min_useful = report.min_useful;
     format!(
-        "{},{terminal},{rounds},{},{complete},{pending},{dead},{mean_te},{},{recovered},{fork_ok},{rollbacks_total},{},{te_unsettled},{te_p50},{te_p90},{te_p99},{te_max},",
+        "{},{terminal},{rounds},{},{complete},{pending},{dead},{},{},{recovered},{fork_ok},{rollbacks_total},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,{},{},{},{},{}",
         smr_key_cols(exp, key),
-        report.commands.len(),
+        commands.commands,
+        lat.mean,
         report.safety_ok,
-        ages.len(),
+        paper_end_name(proto),
+        lat.n,
+        lat.unsettled,
+        lat.p50,
+        lat.p90,
+        lat.p99,
+        lat.max,
+        client_lat.mean,
+        client_lat.n,
+        client_lat.unsettled,
+        client_lat.p50,
+        client_lat.p90,
+        client_lat.p99,
+        client_lat.max,
+        oracle_cols(proto, report),
+        min_useful.map(|u| u.to_string()).unwrap_or_default(),
+        min_useful
+            .map(|u| (4 * u as usize >= key.n).to_string())
+            .unwrap_or_default(),
+        halt.map(|(round, _)| round.to_string()).unwrap_or_default(),
+        halt.map(|(_, kind)| kind.as_str()).unwrap_or_default(),
     )
 }
 
@@ -698,7 +809,7 @@ pub fn run_smr_grid_streaming(
         &points,
         ledger,
         partial,
-        |scenario| capture_strip_abort(|| crate::smr::run_smr_grid(scenario)),
+        |scenario| capture_strip_abort(|| crate::smr::run_smr_flat(scenario)),
         |key, scenario, report, part, ledger_path| {
             // Read off the run, not restated, so a row never claims an instrument it did not use.
             let extra = serde_json::json!({
@@ -716,17 +827,22 @@ pub fn run_smr_grid_streaming(
                     if let Some(failure) = &report.failure {
                         let abort = StripAbort {
                             round: Some(failure.attempted_round),
-                            kind: AbortKind::Prefix,
+                            kind: AbortKind::of_failure(failure.phase),
                         };
                         part.push_str(&smr_abort_row(&spec.exp, key, &abort));
                         if let Some(path) = ledger_path {
-                            runlog::log_smr_run_to(path, scenario, report, with_kind(abort.kind))
-                                .map_err(ledger_err)?;
+                            runlog::log_smr_summary_to(
+                                path,
+                                scenario,
+                                report,
+                                with_kind(abort.kind),
+                            )
+                            .map_err(ledger_err)?;
                         }
                     } else {
                         part.push_str(&smr_row(&spec.exp, key, scenario.proto, report));
                         if let Some(path) = ledger_path {
-                            runlog::log_smr_run_to(path, scenario, report, Some(extra.clone()))
+                            runlog::log_smr_summary_to(path, scenario, report, Some(extra.clone()))
                                 .map_err(ledger_err)?;
                         }
                     }
@@ -750,11 +866,37 @@ pub fn run_smr_grid_streaming(
     )
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+/// Told apart by `base`: `init` marks an Alg-1 grid, `proto` an SMR grid. A spec with neither (or
+/// both) is tried as each kind, and the error names both failures.
+#[derive(Debug, Clone)]
 pub enum AnySpec {
     Grid(GridSpec),
     Smr(SmrGridSpec),
+}
+
+impl<'de> Deserialize<'de> for AnySpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(d)?;
+        let base_has = |key: &str| value.get("base").is_some_and(|b| b.get(key).is_some());
+        let as_grid = || {
+            GridSpec::deserialize(&value)
+                .map(AnySpec::Grid)
+                .map_err(|e| format!("Alg-1 grid spec (base.init): {e}"))
+        };
+        let as_smr = || {
+            SmrGridSpec::deserialize(&value)
+                .map(AnySpec::Smr)
+                .map_err(|e| format!("SMR grid spec (base.proto): {e}"))
+        };
+        match (base_has("init"), base_has("proto")) {
+            (true, false) => as_grid(),
+            (false, true) => as_smr(),
+            _ => as_grid()
+                .or_else(|grid| as_smr().map_err(|smr| format!("neither {grid} nor {smr}"))),
+        }
+        .map_err(D::Error::custom)
+    }
 }
 
 pub fn grid_summary(csv: &str) -> Vec<String> {

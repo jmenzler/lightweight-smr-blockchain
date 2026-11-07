@@ -60,6 +60,11 @@ impl Log {
     /// Removes the first `n` entries and appends `x_d` if that empties the log. Copy-on-write:
     /// a clone an observer still holds keeps the unstripped content.
     pub(crate) fn strip_front(&mut self, n: usize, x_d: Timed) {
+        assert!(
+            n <= self.entries.len(),
+            "cannot strip {n} of {} entries",
+            self.entries.len()
+        );
         let entries = Arc::make_mut(&mut self.entries);
         let perm = Arc::make_mut(&mut self.perm);
         entries.drop_front(n);
@@ -127,6 +132,11 @@ impl MergedLog {
 
     /// Removes the first `n` entries, appends `x_d` if that empties the log, and seals it.
     pub fn remove_prefix(mut self, n: usize, x_d: Timed) -> Log {
+        assert!(
+            n <= self.entries.len(),
+            "cannot remove {n} of {} entries",
+            self.entries.len()
+        );
         self.entries.drop_front(n);
         let mut perm: Vec<u32> = if self.index_stale {
             sorted_perm(&self.entries)

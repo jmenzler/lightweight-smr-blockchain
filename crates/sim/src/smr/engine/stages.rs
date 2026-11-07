@@ -1,9 +1,12 @@
 //! World stages shared verbatim by the compact and recovery round steps; (b) and (d) stay per engine.
 
 use crate::same_component;
-use crate::smr::par_step_enabled;
 use crate::smr::tracker::CommandTracker;
-use protocol::compact::ClientCommand;
+use crate::smr::{
+    NodeGlance, RecStepInfo, RecoveryViolation, RunFailure, RunFailurePhase, SmrRoundMetrics,
+    SmrStepStatus, SpreadingCommand, blocked_ids, par_step_enabled,
+};
+use protocol::compact::{ClientCommand, OutOfSnOrder};
 use rand::Rng;
 use rand_chacha::ChaCha12Rng;
 
@@ -61,5 +64,42 @@ pub(in crate::smr) fn apply_all<N: Send>(
         for (i, node) in nodes.iter_mut().enumerate() {
             apply(i, node);
         }
+    }
+}
+
+/// The step status of a round that ends the run; the caller stores `failure`.
+pub(in crate::smr) fn failed_step(
+    failure: &RunFailure,
+    metrics: SmrRoundMetrics,
+    mask: &[bool],
+    nodes: Vec<NodeGlance>,
+    spreading: Vec<SpreadingCommand>,
+    rec: Option<RecStepInfo>,
+) -> SmrStepStatus {
+    SmrStepStatus {
+        round: failure.attempted_round,
+        metrics,
+        blocked: blocked_ids(mask),
+        nodes,
+        spreading,
+        dead: None,
+        failure: Some(failure.clone()),
+        rec,
+    }
+}
+
+/// A commit the execute-once state machine refused ends the run as a recorded failure in this round.
+pub(in crate::smr) fn sn_order_failure(node: usize, gap: OutOfSnOrder, round: usize) -> RunFailure {
+    RunFailure {
+        node: node as u32,
+        attempted_round: round,
+        completed_round: round - 1,
+        observed_round: round,
+        phase: RunFailurePhase::OutOfSnOrderCommit,
+        violation: RecoveryViolation::OutOfSnOrder {
+            client: gap.client,
+            sn: gap.sn,
+            committed_sn: gap.committed_sn,
+        },
     }
 }

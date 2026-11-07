@@ -138,9 +138,9 @@ fn a_command_in_two_non_median_logs_appears_once() {
     assert!(merged.contains(&timed(cmd(9, 9), 7)));
 }
 
-/// Paper reading: lex order is over commands, so three logs that differ only
-/// in stamp are a tie. Stable sample order, identity permutation: the middle
-/// input wins, not the middle stamp.
+/// The paper leaves the lex-order key open; both readings are admissible. Under the
+/// commands-only reading three logs that differ only in stamp are a tie. Stable
+/// sample order, identity permutation: the middle input wins, not the middle stamp.
 #[test]
 fn commands_only_median_ignores_stamp_rounds() {
     let picked = compact_merge_with(
@@ -189,6 +189,30 @@ fn recovery_commands_only_median_ignores_stamp_rounds() {
     )
     .expect("non-⊥");
     assert_eq!(picked, vec![timed(cmd(1, 1), 2)]);
+}
+
+/// Alg 5 takes the median L'_i whole, stamps included: an append re-sighting a median entry leaves it.
+#[test]
+fn last_sighting_leaves_a_median_entrys_stamp_to_an_append() {
+    let x = ClientCommand {
+        client: 9,
+        sn: 1,
+        op: 9,
+    };
+    let replies = compact_replies(vec![
+        vec![timed(Entry::Nop(0), 0), timed(Entry::Cmd(x), 1)];
+        3
+    ]);
+    let mut n = CompactNode::new(Config::default(), NO_AGING)
+        .with_merge_policy(StampTie::IncludeRound, UnionStamp::LastSighting);
+    n.step_chosen(&replies, &[(x, 5)], 5, Some(&[0, 1, 2]));
+    let stamp = n
+        .log_entries()
+        .expect("non-⊥")
+        .into_iter()
+        .find(|t| t.entry == Entry::Cmd(x))
+        .map(|t| t.round);
+    assert_eq!(stamp, Some(1));
 }
 
 #[test]
@@ -376,7 +400,7 @@ fn a_bot_compact_node_adopts_through_the_merge_by_handle() {
     n.step_chosen(&replies, &[], 1, Some(&[0, 1, 2]));
     assert!(
         Arc::ptr_eq(n.state_arc(), &donor),
-        "step-5 adoption must share the donor allocation, not copy it"
+        "state adoption on the ≥ ℓ path must share the donor allocation, not copy it"
     );
 }
 

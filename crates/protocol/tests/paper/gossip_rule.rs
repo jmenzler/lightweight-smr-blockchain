@@ -24,12 +24,17 @@ fn nodes_reply_with_their_current_value() {
     assert_eq!(non_holder().answer(), Some(X0));
 }
 
-#[test]
-fn adopts_x_when_any_reply_contains_it() {
-    // no ℓ-subsampling: a single x among many replies suffices
-    let mut n = non_holder();
-    n.step(&[X0, X0, X0, X0, X0, X], &mut rng());
-    assert_eq!(n.x_i(), Some(X));
+#[rstest]
+fn adopts_x_when_any_reply_contains_it(#[values(0, 1, 2, 3, 4, 5)] position: usize) {
+    // Alg 4: one reply carrying x among six suffices, at whichever position it arrives and
+    // whatever the generator draws: a gossip server takes no ℓ-subset of its replies.
+    let mut replies = [X0; 6];
+    replies[position] = X;
+    for seed in 0..200u64 {
+        let mut n = non_holder();
+        n.step(&replies, &mut ChaCha12Rng::seed_from_u64(seed));
+        assert_eq!(n.x_i(), Some(X), "x at position {position}, seed {seed}");
+    }
 }
 
 #[test]
@@ -65,4 +70,16 @@ fn below_ell_wins_even_if_x_present() {
     let mut n = non_holder();
     n.step(&[X, X], &mut rng());
     assert_eq!(n.x_i(), None);
+}
+
+#[rstest]
+#[case::own_value_outside_x_and_x0(99, X, X0)]
+#[case::x_equals_x0(X, X, X)]
+fn constructor_rejects_values_outside_the_alg4_state_space(
+    #[case] x_i: u64,
+    #[case] x: u64,
+    #[case] x0: u64,
+) {
+    let built = std::panic::catch_unwind(|| GossipNode::new(x_i, x, x0, Config::default()));
+    assert!(built.is_err());
 }

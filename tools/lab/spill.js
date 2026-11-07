@@ -14,6 +14,7 @@ import { S, $ } from './state.js';
 import { post } from './engine.js';
 import { onChainSnapshot, resetCertsDrawer } from './smr-certs.js';
 import { setView } from './render.js';
+import { openForest, closeDrawer, renderDrawer } from './smr-drawer.js';
 
 S.spill = null;
 
@@ -22,11 +23,11 @@ S.spill = null;
 // chart invites the reader to take absence for a measurement — which is the
 // one thing a viewer over a run that deliberately forgot must never do.
 const ABSENT = [
-  ['smrTimelineBox', 'Per-round timeline', 'a spill records T-window boundaries, not the rounds between them'],
-  ['smrNetBox', 'Node overview — log lengths, ⊥ and R states', 'per-round server state lives in the metrics CSV, not the spill'],
-  ['smrSpreadBox', 'Spread and position curves', 'lean runs release a command’s curve once it settles — nothing retains them'],
-  ['smrPrefixBox', 'Prefix agreement', 'it is a per-round ratio, and a spill holds no per-round state'],
-  ['smrBlocksBox', 'Blocked-server map', 'who was blocked in which round is schedule state, not committed history'],
+  ['smrViewport', 'Per-round timeline', 'a spill records T-window boundaries, not the rounds between them'],
+  ['smrNetBox', 'Servers — log lengths, ⊥ and R states', 'per-round server state lives in the metrics CSV, not the spill'],
+  ['smrViewport', 'Spread and position curves', 'lean runs release a command’s curve once it settles — nothing retains them'],
+  ['smrViewport', 'Prefix agreement', 'it is a per-round ratio, and a spill holds no per-round state'],
+  ['smrViewport', 'Blocked-server lane', 'who was blocked in which round is schedule state, not committed history'],
 ];
 
 /// Route a dropped or loaded file: a spill is JSONL, so a whole-file
@@ -54,6 +55,7 @@ export function onSpillReady(m) {
   resetCertsDrawer();
   S.smr.chain = null;
   setView('smr');
+  $('smrRun').classList.remove('hidden');
   $('spillPanel').classList.remove('hidden');
   $('smrCtl').classList.add('hidden');
   hideUnfeedable();
@@ -61,6 +63,7 @@ export function onSpillReady(m) {
   $('spillScrub').max = String(Math.max(0, out.boundaries.length - 1));
   $('spillScrub').value = String(S.spill.b);
   renderSpill();
+  openForest('canonical spill');
   requestChain();
 }
 
@@ -76,6 +79,7 @@ export function onSpillChain(m) {
   // boundary just happened when the viewer simply jumped to it.
   S.smr.chain = { m: chain.m, peaks: chain.peaks, merges: [], entries: chain.entries };
   onChainSnapshot(S.smr.chain);
+  renderDrawer();
 }
 
 function buildNodeOptions(n) {
@@ -148,7 +152,7 @@ let restore = null;
 function hideUnfeedable() {
   // The run form goes with them: opening a spill is entering a session, and a
   // form offering to start a new one on top of it is just noise.
-  const ids = [...ABSENT.map(([id]) => id), 'smrFormCard'];
+  const ids = [...new Set(ABSENT.map(([id]) => id)), 'smrFormCard'];
   restore = ids.map(id => [id, $(id).classList.contains('hidden')]);
   for (const id of ids) $(id).classList.add('hidden');
 }
@@ -180,6 +184,9 @@ $('spillCloseBtn').addEventListener('click', () => {
   $('spillPanel').classList.add('hidden');
   showUnfeedable();
   resetCertsDrawer();
+  closeDrawer();
+  if (!S.smr.ctx) $('smrRun').classList.add('hidden');
+  else $('smrCtl').classList.remove('hidden');
 });
 
 // Deep link: `?spill=<path served beside the lab>` opens one straight away.

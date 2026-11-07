@@ -22,6 +22,15 @@ fn scenario(n: usize, seed: u64, injections: Vec<Injection>) -> SmrScenario {
     }
 }
 
+fn inj(round: usize, client: u32, op: u64) -> Injection {
+    Injection {
+        round,
+        client,
+        op,
+        target: None,
+    }
+}
+
 #[test]
 fn blocked_round_makes_node_bot_then_recovers() {
     // Round 2 blocks node 0 only: it sends no requests, gets no replies,
@@ -77,6 +86,27 @@ fn unblocked_bottom_target_delivers_and_amplifies() {
         sim::smr::AttemptOutcome::Delivered
     );
     assert!(!command.amp_receivers.is_empty());
+    assert_eq!(
+        report.metrics[1].nonbot_logs, 0,
+        "node 0 draws no reply, so its own append request cannot keep a log (Alg 3 step 5)"
+    );
+}
+
+#[test]
+fn a_lone_server_draws_itself_k_times_and_keeps_its_log() {
+    // Targets are k independent uniform draws over all n servers, so with n = 1 all k replies are
+    // its own log. Excluding self or deduplicating targets would leave it below l replies.
+    for proto in [Proto::Extended, Proto::Compact { t_commit_rounds: 6 }] {
+        let mut s = scenario(1, 5, vec![inj(2, 1, 7)]);
+        s.proto = proto;
+        let report = run_smr(&s);
+        assert!(
+            report.metrics.iter().all(|m| m.nonbot_logs == 1),
+            "{proto:?}: the lone server fell to ⊥"
+        );
+        assert_eq!(report.commands[0].delivered_round, Some(2), "{proto:?}");
+        assert!(report.commands[0].all_logs_round.is_some(), "{proto:?}");
+    }
 }
 
 #[test]

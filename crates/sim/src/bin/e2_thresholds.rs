@@ -1,7 +1,7 @@
 //! Three-regime threshold bracket runner (Lemmas 2.1/2.2/2.3); run from the repo root with SIM_TRACE=off.
 
 use sim::runlog::run_logged;
-use sim::{BlockSchedule, Config, Init, Outcome, Scenario};
+use sim::{Availability, BlockSchedule, Config, Init, Outcome, Scenario};
 
 const SEEDS: u64 = 20;
 
@@ -54,17 +54,24 @@ impl Regime {
     }
 }
 
-fn hold_check(metrics_csv: &str, n: usize) -> Option<(usize, bool, u32)> {
-    let threshold = (3 * n).div_ceil(4) as u32;
-    let useful: Vec<u32> = std::fs::read_to_string(metrics_csv)
+fn useful_per_round(metrics_csv: &str) -> Vec<u32> {
+    std::fs::read_to_string(metrics_csv)
         .expect("metrics csv exists")
         .lines()
         .skip(1)
         .map(|l| l.split(',').nth(4).unwrap().parse().unwrap())
-        .collect();
+        .collect()
+}
+
+/// (round of the first crossing of 3n/4, whether useful stays above it, its minimum afterwards);
+/// `None` when it never crosses.
+fn hold_check(useful: &[u32], n: usize) -> Option<(usize, bool, u32)> {
+    let threshold = (3 * n).div_ceil(4) as u32;
     let crossing = useful.iter().position(|&u| u >= threshold)?;
-    let after = &useful[crossing..];
-    let min = *after.iter().min().expect("non-empty after crossing");
+    let min = *useful[crossing..]
+        .iter()
+        .min()
+        .expect("non-empty after crossing");
     Some((crossing + 1, min >= threshold, min))
 }
 
@@ -83,26 +90,40 @@ fn main() {
             let mut pass = 0;
             let mut death_rounds: Vec<usize> = Vec::new();
             let mut min_after_crossing: Vec<u32> = Vec::new();
+            let mut in_precondition = 0usize;
             for i in 0..SEEDS {
                 let scenario = regime.scenario(n, base + i);
                 let extra = serde_json::json!({ "exp": "E2", "regime": regime.label() });
                 let (outcome, metrics_path) = run_logged(&scenario, Some(extra));
                 let ok = match (regime, &outcome) {
-                    (Regime::Collapse, Outcome::AllUndecided { rounds }) => {
-                        death_rounds.push(*rounds);
-                        *rounds <= 30
+                    (Regime::Collapse | Regime::DeathSpiral, o) => {
+                        let limit = if regime == Regime::Collapse { 30 } else { 300 };
+                        o.extinction_round().is_some_and(|rounds| {
+                            death_rounds.push(rounds);
+                            rounds <= limit
+                        })
                     }
-                    (Regime::DeathSpiral, Outcome::AllUndecided { rounds }) => {
-                        death_rounds.push(*rounds);
-                        *rounds <= 300
-                    }
-                    (Regime::ConvergeHold, Outcome::Agreement { value, .. }) => {
+                    (
+                        Regime::ConvergeHold,
+                        Outcome::Agreement {
+                            value,
+                            availability: Availability::Held,
+                            ..
+                        },
+                    ) => {
                         assert!(*value < 2, "validity: value {value} not an input");
-                        let metrics = metrics_path.as_ref().expect("metrics_path recorded");
-                        let (_, held, min) =
-                            hold_check(metrics, n).expect("useful never crossed 3n/4");
-                        min_after_crossing.push(min);
-                        held
+                        let metrics = metrics_path
+                            .as_ref()
+                            .expect("E2 reads the run ledger's metrics CSV; unset SIM_RUNLOG=off");
+                        let useful = useful_per_round(metrics);
+                        in_precondition += usize::from(2 * useful[0] as usize >= n);
+                        match hold_check(&useful, n) {
+                            Some((_, held, min)) => {
+                                min_after_crossing.push(min);
+                                held
+                            }
+                            None => false,
+                        }
                     }
                     _ => false,
                 };
@@ -113,7 +134,8 @@ fn main() {
             let cell = format!("{} n={n}: {pass}/{SEEDS}", regime.label());
             let detail = if regime == Regime::ConvergeHold {
                 format!(
-                    "min useful after crossing: {:?} (3n/4 = {})",
+                    "min useful after crossing: {:?} (3n/4 = {}); round-1 useful >= n/2 \
+                     (Lemma 2.2's start) in {in_precondition} of the agreeing seeds",
                     min_after_crossing.iter().min(),
                     (3 * n).div_ceil(4)
                 )
@@ -141,5 +163,23 @@ fn main() {
     } else {
         println!("E2 FAIL — cells outside criteria: {failures:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hold_check;
+
+    #[test]
+    fn a_run_that_never_crosses_three_quarters_is_not_a_crash() {
+        assert_eq!(hold_check(&[500, 600, 700, 740], 1000), None);
+    }
+
+    #[test]
+    fn a_dip_after_the_crossing_fails_the_hold() {
+        assert_eq!(
+            hold_check(&[600, 760, 740, 800], 1000),
+            Some((2, false, 740))
+        );
     }
 }

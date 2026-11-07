@@ -1,6 +1,6 @@
 //! Golden shape test for the sim-side commands.json export — must match the
 //! node collector's shape exactly (crates/network-node/src/bin/collect.rs) so
-//! downstream analysis can load either side with one loader.
+//! analysis/e7_arm2b.py can load either side with one loader.
 
 use serde_json::Value;
 use sim::smr_commands::commands_json;

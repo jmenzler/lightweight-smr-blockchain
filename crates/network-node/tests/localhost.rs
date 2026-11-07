@@ -3,7 +3,7 @@
 //! `cargo test -p node --test localhost -- --ignored`
 
 use network_node::collect::aggregate;
-use network_node::record::RoundRecord;
+use network_node::record::{PostState, RoundRecord};
 use network_node::spec::NodeRunSpec;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -86,10 +86,21 @@ fn harvest(children: Vec<Child>) -> Vec<Vec<RoundRecord>> {
 /// late appends) are only required to vanish under Shadow's sim-time — on a
 /// contended dev machine they measure the machine, not the protocol.
 fn assert_semantic_gates(gates: &network_node::collect::Gates) {
-    assert!(gates.safety_ok, "strong safety (Def 1.4): {gates:?}");
+    assert!(gates.safety_ok, "executed-prefix consistency: {gates:?}");
     assert_eq!(gates.encode_err, 0, "encode faults: {gates:?}");
+    assert_eq!(gates.transport_err, 0, "transport faults: {gates:?}");
     assert_eq!(gates.dropped_past, 0, "past-round messages: {gates:?}");
     assert!(gates.rounds_consistent, "ragged round counts: {gates:?}");
+    assert_eq!(gates.client_lost, 0, "client transport faults: {gates:?}");
+    assert_eq!(
+        gates.client_starved, 0,
+        "starved client attempts: {gates:?}"
+    );
+    assert_eq!(gates.early_cli, 0, "early client commands: {gates:?}");
+    assert_eq!(
+        gates.cli_unreconciled, 0,
+        "client sends vs server counts: {gates:?}"
+    );
 }
 
 fn assert_clean_convergence(records: Vec<Vec<RoundRecord>>, spec_json: &str) {
@@ -112,7 +123,7 @@ fn timer_mode_converges_with_zero_gates() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-        + 800;
+        + 2500;
     let children = spawn_nodes(&spec, &peers, &[("--start-at-ms", start_at.to_string())]);
     let records = harvest(children);
     assert_clean_convergence(records, &std::fs::read_to_string(&spec).unwrap());
@@ -180,7 +191,7 @@ fn compact_smr_with_client_driver_commits_the_injection() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-        + 800;
+        + 2500;
     let extra = [("--start-at-ms", start_at.to_string())];
     let nodes = spawn_nodes(&spec_s, &peers_s, &extra);
     let mut client = Command::new(env!("CARGO_BIN_EXE_client_driver"));
@@ -200,9 +211,9 @@ fn compact_smr_with_client_driver_commits_the_injection() {
     let client_stdout = String::from_utf8(client_out.stdout).unwrap();
 
     let nspec = NodeRunSpec::from_json(&spec).unwrap();
-    let arrivals = vec![0u32; ROUNDS];
+    let client = network_node::collect::ClientLog::parse(&client_stdout).expect("client log");
     let out =
-        network_node::collect::aggregate_smr(&records, &nspec, Some(&arrivals)).expect("aggregate");
+        network_node::collect::aggregate_smr(&records, &nspec, Some(&client)).expect("aggregate");
     assert_semantic_gates(&out.gates);
     assert!(
         client_stdout.contains("\"terminal\":true"),
@@ -216,12 +227,17 @@ fn compact_smr_with_client_driver_commits_the_injection() {
         !client_stdout.contains("\"starved\":1"),
         "no client attempt may miss its round: {client_stdout}"
     );
-    // the tracked op must be executed (committed) on every node by the horizon
+    // the tracked op must be in the executed sequence (position < exec_len), not merely in the
+    // uncommitted log, on every node by the horizon
     for per_node in &records {
         let last = per_node.last().unwrap();
+        let PostState::Log { exec_len, .. } = last.post else {
+            panic!("log mode expected, got {:?}", last.post);
+        };
         assert!(
-            last.tracked[0].present,
-            "op 700 present everywhere at horizon"
+            last.tracked[0].pos.is_some_and(|p| p < exec_len),
+            "op 700 executed everywhere at horizon: pos {:?}, exec_len {exec_len}",
+            last.tracked[0].pos
         );
     }
 }
@@ -258,7 +274,7 @@ fn pinned_injection_reaches_only_its_target() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-        + 800;
+        + 2500;
     let nodes: Vec<Child> = (0..NPIN)
         .map(|id| {
             Command::new(env!("CARGO_BIN_EXE_node"))
@@ -298,9 +314,9 @@ fn pinned_injection_reaches_only_its_target() {
     );
 
     let nspec = NodeRunSpec::from_json(&spec).unwrap();
-    let arrivals = vec![0u32; ROUNDS];
+    let client = network_node::collect::ClientLog::parse(&client_stdout).expect("client log");
     let out =
-        network_node::collect::aggregate_smr(&records, &nspec, Some(&arrivals)).expect("aggregate");
+        network_node::collect::aggregate_smr(&records, &nspec, Some(&client)).expect("aggregate");
     assert_semantic_gates(&out.gates);
 
     let cli_recv_total: Vec<u32> = records

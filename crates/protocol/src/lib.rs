@@ -40,10 +40,22 @@ impl std::error::Error for InvalidConfig {}
 impl Config {
     /// Preconditions of Algorithm 1: k, ℓ > 1, k ≥ ℓ, ℓ odd.
     pub fn new(k: usize, ell: usize) -> Result<Self, InvalidConfig> {
-        if k > 1 && ell > 1 && k >= ell && ell % 2 == 1 {
-            Ok(Config { k, ell })
+        Config { k, ell }.check()
+    }
+
+    /// Re-checks the preconditions, which the public fields let a caller bypass.
+    pub fn check(self) -> Result<Self, InvalidConfig> {
+        if self.k > 1 && self.ell > 1 && self.k >= self.ell && self.ell % 2 == 1 {
+            Ok(self)
         } else {
             Err(InvalidConfig)
+        }
+    }
+
+    /// Node constructors call this so a forged config fails at construction.
+    pub(crate) fn assert_valid(self) {
+        if let Err(e) = self.check() {
+            panic!("{e}: got k = {}, ell = {}", self.k, self.ell);
         }
     }
 }

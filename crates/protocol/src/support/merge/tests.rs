@@ -416,3 +416,69 @@ fn two_holders_of_equal_content_can_carry_different_valid_indexes() {
         "the two holders' indexes differ, so which one is adopted is observable"
     );
 }
+
+/// Sorted M = [a@0], [a@0, x@1] (median), [b@0, x@3]; an append re-sights x at round 5.
+fn merge_resighting_a_median_entry(union: UnionStamp) -> Vec<Timed> {
+    let (a, b, x) = (cmd(1, 1, 1), cmd(2, 1, 2), cmd(3, 1, 3));
+    let logs = [
+        ChunkSeq::from_vec(vec![timed(a.clone(), 0)]),
+        ChunkSeq::from_vec(vec![timed(a.clone(), 0), timed(x.clone(), 1)]),
+        ChunkSeq::from_vec(vec![timed(b, 0), timed(x, 3)]),
+    ];
+    let perms: Vec<Vec<u32>> = logs.iter().map(sorted_perm).collect();
+    let chosen: Vec<Chosen<'_>> = logs
+        .iter()
+        .zip(&perms)
+        .enumerate()
+        .map(|(i, (l, p))| pick(l, p, i as u32))
+        .collect();
+    let appends = [(
+        ClientCommand {
+            client: 3,
+            sn: 1,
+            op: 3,
+        },
+        5,
+    )];
+    let (merged, _) = merge_onto_median(&chosen, 1, 0, &appends, union);
+    merged.to_vec()
+}
+
+#[test]
+fn every_union_stamp_keeps_the_median_whole_stamps_included() {
+    for union in [UnionStamp::FirstSighting, UnionStamp::LastSighting] {
+        let merged = merge_resighting_a_median_entry(union);
+        assert_eq!(
+            merged[..2],
+            [timed(cmd(1, 1, 1), 0), timed(cmd(3, 1, 3), 1)],
+            "{union:?} changed L'_i"
+        );
+    }
+}
+
+#[test]
+fn last_sighting_still_restamps_an_entry_of_l_bar() {
+    let (y, z) = (cmd(4, 1, 4), cmd(5, 1, 5));
+    let logs = [
+        ChunkSeq::from_vec(vec![timed(y.clone(), 2)]),
+        ChunkSeq::from_vec(vec![timed(z.clone(), 0)]),
+        ChunkSeq::from_vec(vec![timed(z.clone(), 0), timed(y.clone(), 6)]),
+    ];
+    let perms: Vec<Vec<u32>> = logs.iter().map(sorted_perm).collect();
+    let chosen: Vec<Chosen<'_>> = logs
+        .iter()
+        .zip(&perms)
+        .enumerate()
+        .map(|(i, (l, p))| pick(l, p, i as u32))
+        .collect();
+    let stamp_of_y = |union| {
+        let (merged, _) = merge_onto_median(&chosen, 1, 0, &[], union);
+        merged
+            .to_vec()
+            .into_iter()
+            .find(|t| t.entry == y)
+            .map(|t| t.round)
+    };
+    assert_eq!(stamp_of_y(UnionStamp::FirstSighting), Some(2));
+    assert_eq!(stamp_of_y(UnionStamp::LastSighting), Some(6));
+}

@@ -1,5 +1,6 @@
 //! Algorithm 1, the (k,ℓ)-median rule (p. 10), and Algorithm 2, the (k,ℓ,f)-rule (p. 14). Each
-//! bullet is marked `// Alg N: "<its opening words>"`, in the order of its box.
+//! bullet that runs here is marked `// Alg N: "<its opening words>"`, in the order of its box;
+//! the bullet that only sends the k requests is the driver's.
 
 use crate::{Config, Value};
 use rand::Rng;
@@ -22,6 +23,7 @@ pub struct MedianNode {
 impl MedianNode {
     /// "initially every server i stores an arbitrary value x_i ∈ K"
     pub fn new(x_i: Value, cfg: Config) -> Self {
+        cfg.assert_valid();
         MedianNode {
             x_i: Some(x_i),
             cfg,
@@ -30,6 +32,7 @@ impl MedianNode {
 
     /// A server that starts at ⊥ (the undecided state) and adopts a value on ≥ ℓ replies.
     pub fn new_undecided(cfg: Config) -> Self {
+        cfg.assert_valid();
         MedianNode { x_i: None, cfg }
     }
 
@@ -50,7 +53,8 @@ impl MedianNode {
         self.step_with(replies, rng, median);
     }
 
-    /// One round of Algorithm 2; `f` must be order-invariant and return one of its inputs.
+    /// One round of Algorithm 2. `f` must be order-invariant (not checked: it sees the ℓ replies
+    /// in draw order) and return one of its inputs (checked, panics otherwise).
     pub fn step_with<R, F>(&mut self, replies: &[Value], rng: &mut R, f: F)
     where
         R: Rng + ?Sized,
@@ -63,7 +67,10 @@ impl MedianNode {
                 .map(|j| replies[j])
                 .collect();
             let x = f(&s);
-            debug_assert!(s.contains(&x), "f violated validity");
+            assert!(
+                s.contains(&x),
+                "f violated validity: {x} is not among its inputs"
+            );
             self.x_i = Some(x);
         } else {
             // Alg 2: "if less than ℓ replies are received"

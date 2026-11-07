@@ -1,5 +1,6 @@
 use sim::smr::{
-    ClientModel, Injection, PrefixMismatch, Proto, RepeatedCommit, SmrScenario, amp_count,
+    ClientModel, Injection, PrefixMismatch, Proto, RepeatedCommit, SmrScenario, SmrState,
+    amp_count, auto_command,
 };
 use sim::{BlockSchedule, Config};
 
@@ -38,7 +39,63 @@ fn amp_count_is_ceil_sigma_log2_n() {
     assert_eq!(amp_count(5.0, 1000), 50); // 5 · 9.9658… → 50
     assert_eq!(amp_count(1.0, 1024), 10); // exact power of two
     assert_eq!(amp_count(2.0, 2), 2);
-    assert_eq!(amp_count(0.1, 2), 1, "at least one append request");
+    assert_eq!(
+        amp_count(1.0, 1),
+        1,
+        "log₂ 1 = 0 still sends one append request"
+    );
+    assert_eq!(
+        amp_count(16.6, 32768),
+        249,
+        "no float noise above an exact integer"
+    );
+    assert_eq!(amp_count(0.7, 1024), 7);
+}
+
+#[test]
+fn sigma_must_meet_alg_3_and_bound_the_append_fan_out() {
+    let with_sigma = |sigma: f64| {
+        let mut s = scenario(vec![]);
+        s.sigma = sigma;
+        s.validate()
+    };
+    assert!(with_sigma(1.0).is_ok());
+    assert!(with_sigma(0.5).is_err(), "Alg 3 B1 requires σ ≥ 1");
+    assert!(with_sigma(f64::NAN).is_err());
+    assert!(
+        with_sigma(1e30).is_err(),
+        "a saturating fan-out would never finish"
+    );
+}
+
+#[test]
+fn a_compact_commit_window_of_zero_rounds_is_rejected() {
+    let mut s = scenario(vec![]);
+    s.proto = Proto::Compact { t_commit_rounds: 0 };
+    assert!(s.validate().is_err());
+    s.proto = Proto::Compact { t_commit_rounds: 1 };
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+fn a_recovery_window_of_zero_rounds_is_rejected() {
+    let mut s = scenario(vec![]);
+    let recovery = |t_window_rounds| Proto::Recovery {
+        t_window_rounds,
+        resend_until_acked: true,
+        prefix_mismatch: PrefixMismatch::Abort,
+    };
+    s.proto = recovery(0);
+    let err = s.validate().expect_err("a recovery window of 0 rounds");
+    assert!(err.contains("t_window_rounds"), "{err}");
+    s.proto = recovery(1);
+    assert!(s.validate().is_ok());
+}
+
+#[test]
+#[should_panic(expected = "auto client overflow")]
+fn the_auto_client_namespace_does_not_wrap() {
+    let _ = auto_command(1 << 31);
 }
 
 #[test]
@@ -89,4 +146,56 @@ fn repeated_commit_skip_needs_a_compact_or_certless_recovery_node() {
     assert!(s.validate().is_ok());
     s.certs = true;
     assert!(s.validate().is_err(), "§5 would attest a skipped command");
+}
+
+#[test]
+fn scenario_validation_enforces_the_median_rule_preconditions() {
+    for (k, ell) in [(6, 0), (6, 1), (6, 4), (3, 5), (1, 1)] {
+        let mut s = scenario(vec![]);
+        s.cfg = Config { k, ell };
+        let err = s.validate().expect_err("forged (k, ell) must be rejected");
+        assert!(
+            err.contains("k, ell"),
+            "unhelpful message for ({k},{ell}): {err}"
+        );
+    }
+    let mut s = scenario(vec![]);
+    s.cfg = Config::new(3, 3).unwrap();
+    assert!(s.validate().is_ok());
+}
+
+fn live_state(injections: &[Injection]) -> SmrState {
+    SmrState::new(
+        16,
+        Config::default(),
+        Proto::Compact { t_commit_rounds: 6 },
+        1.0,
+        3,
+        injections,
+        &[],
+        ClientModel::Unique,
+        None,
+    )
+}
+
+#[test]
+fn a_live_injection_cannot_jump_ahead_of_a_scheduled_command_of_its_client() {
+    let mut state = live_state(&[inj(50, 5, 10)]);
+    assert!(
+        state.inject(5, 11, None).is_err(),
+        "replay numbers by round, so op 11 would be sn 1 there and sn 2 here"
+    );
+    assert!(
+        state.inject(6, 11, None).is_ok(),
+        "another client is unaffected"
+    );
+
+    let mut state = live_state(&[inj(1, 5, 10)]);
+    assert_eq!(state.inject(5, 11, None), Ok(1));
+    let replay = sim::smr::injection_sns(&state.injections());
+    assert_eq!(
+        replay,
+        vec![1, 2],
+        "the live numbering is the replay numbering"
+    );
 }

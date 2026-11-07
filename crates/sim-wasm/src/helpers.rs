@@ -1,5 +1,20 @@
 use sim::spec::ScheduleSpec;
 
+pub(crate) fn error_json(error: impl std::fmt::Display) -> String {
+    serde_json::json!({ "error": error.to_string() }).to_string()
+}
+
+/// Def 1.1 fixes beta in [0, 1]; the session must record only values the replay spec accepts.
+pub(crate) fn check_fraction(fraction: f64) -> Result<(), String> {
+    if (0.0..=1.0).contains(&fraction) {
+        Ok(())
+    } else {
+        Err(format!(
+            "blocking fraction must be within [0, 1], got {fraction}"
+        ))
+    }
+}
+
 pub(crate) fn recorded_schedule(sticky: bool, fractions: &[f64], background: f64) -> ScheduleSpec {
     let fractions = fractions.to_vec();
     if sticky {

@@ -1,6 +1,10 @@
 mod adaptive;
+mod disjoint;
+mod disjoint_vs_dp;
 mod init;
 mod mask_schedule;
+mod noise_controller;
+mod noise_controller_vs_dp;
 mod per_round_fractions;
 mod reply_memo_shares;
 mod sampling_moments;

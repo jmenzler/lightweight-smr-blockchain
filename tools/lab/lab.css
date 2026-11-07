@@ -73,7 +73,7 @@
   .liveVal { color: #f7768e; font-size: 11px; font-weight: 700; }
   .liveRound { color: #8b94a1; font-size: 11px; }
 
-/* --- SMR view (A2 shell layout) --- */
+/* --- SMR view (design: A2 shell — docs/superpowers/specs/2026-07-23-lab-gui-revamp-design.md) --- */
 #view-smr { display: none; flex: 1; min-width: 0; }
 #view-smr.on { display: flex; }
 .app[data-view="smr"] .transport { display: none; }
@@ -86,6 +86,7 @@
 .ctl .grp { display: flex; align-items: center; gap: 6px; }
 .ctl .sep { width: 1px; height: 20px; background: #262c34; }
 .roundLbl { color: #3dd6c4; font-weight: 700; font-size: 12px; }
+.roundLbl.ended { color: #c0caf5; border: 1px solid #3b4450; border-radius: 4px; padding: 1px 6px; }
 .betaWrap { display: flex; align-items: center; gap: 8px; }
 .betaWrap .bv { color: #f7768e; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .betaH { width: 130px; accent-color: #f7768e; }
@@ -299,5 +300,133 @@ line.edgeFlash { stroke: #3dd6c4; opacity: 1; stroke-width: 2; }
    an empty box invites the reader to take absence for a measurement. */
 .spillAbsent { margin: 2px 0 0; padding-left: 16px; color: #6f7986; font-size: 11px; line-height: 1.6; }
 .spillAbsent b { color: #8b95a3; font-weight: 600; }
-  .hostNote { text-decoration: none; }
-  .hostNote:hover { text-decoration: underline; }
+
+/* --- header: brand, mode switch, config line, host warning --- */
+.brand { font-weight: 700; font-size: 14px; letter-spacing: 0.02em; color: #eef2f6; white-space: nowrap; }
+.modeTabs { display: flex; gap: 18px; align-self: stretch; align-items: stretch; margin: -10px 0; }
+.mt { border: none; border-bottom: 2px solid transparent; background: transparent; color: #8b94a1; font-size: 13px; font-weight: 600; padding: 0 2px; cursor: pointer; }
+.mt:hover { color: #d7dce2; }
+.mt.on { color: #eef2f6; border-bottom-color: #3dd6c4; }
+.cfgWrap { position: relative; }
+.cfgLine { border: none; background: transparent; color: #8b94a1; font-size: 12px; cursor: pointer; padding: 4px 2px; }
+.cfgLine:hover { color: #d7dce2; }
+.cfgPop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 60; background: #171b21; border: 1px solid #2c343e; border-radius: 10px; padding: 12px 14px; min-width: 300px; box-shadow: 0 8px 24px rgba(0,0,0,.5); display: none; flex-direction: column; gap: 4px; font-size: 12px; }
+.cfgWrap:hover .cfgPop:not(.hidden), .cfgPop.open { display: flex; }
+.cfgRow { display: flex; justify-content: space-between; gap: 22px; }
+.cfgRow .k { color: #6f7986; }
+.cfgRow .v { color: #eef2f6; text-align: right; }
+.cfgEdit { align-self: flex-start; margin-top: 8px; }
+.warnIcon { color: #e0af68; font-size: 16px; cursor: help; }
+.subBar { display: flex; align-items: center; gap: 14px; padding: 7px 16px; border-bottom: 1px solid #262c34; background: #12161b; }
+.app[data-view="smr"] .subBar { display: none; }
+.tipBox { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; position: fixed; z-index: 200; display: none; max-width: 340px; background: #171b21; color: #d7dce2; border: 1px solid #2c343e; border-radius: 8px; padding: 7px 10px; font-size: 11px; line-height: 1.5; pointer-events: none; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+
+/* --- SMR toolbar: playback / stimulus / session --- */
+.ctl { align-items: flex-end; gap: 14px; padding: 8px 14px; }
+.cgrp { display: flex; flex-direction: column; gap: 4px; }
+.cgLabel { font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #565f6b; }
+.cgRow { display: flex; align-items: center; gap: 8px; }
+.ctl .sep { align-self: stretch; height: auto; }
+.btn:disabled { opacity: 0.4; cursor: default; border-color: #2c343e; color: #8b94a1; }
+.btnPlay { min-width: 78px; font-weight: 700; }
+.seg { display: inline-flex; border: 1px solid #2c343e; border-radius: 8px; overflow: hidden; }
+.seg button { border: none; border-right: 1px solid #2c343e; background: #1c222a; color: #8b94a1; font-size: 11px; font-weight: 600; padding: 6px 9px; cursor: pointer; }
+.seg button:last-child { border-right: none; }
+.seg button.on { background: #0d7c74; color: #fff; }
+.menu { min-width: 190px; padding: 6px; gap: 2px; }
+.menuItem { text-align: left; border: none; background: transparent; color: #d7dce2; font-size: 12px; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+.menuItem:hover:not(:disabled) { background: #1f2630; }
+.menuItem:disabled { color: #565f6b; cursor: default; }
+.strat { font-size: 11px; color: #8b94a1; border: 1px solid #2c343e; border-radius: 6px; padding: 3px 8px; }
+.cgrp.off .cgRow { opacity: 0.4; pointer-events: none; }
+#smrStimulus .bv { color: #f7768e; }
+.readout { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 4px 14px 0; flex: none; }
+.statusLine { padding: 2px 14px; font-size: 11px; color: #8b94a1; min-height: 16px; flex: none; }
+.statusLine.flash { animation: endFlash 0.7s ease-out; }
+@keyframes endFlash { from { color: #e0af68; background: #2a2412; } }
+.smrRun { display: flex; flex-direction: column; gap: 12px; }
+
+/* --- servers section --- */
+.srvHead { display: flex; align-items: center; gap: 10px; min-height: 22px; }
+.srvToggle { border: none; background: transparent; color: #6f7986; cursor: pointer; font-size: 12px; padding: 0 2px; }
+.srvToggle:hover { color: #d7dce2; }
+.srvStrip { width: 280px; height: 14px; flex: none; }
+.srvBody { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.srvNote { padding: 8px 2px; }
+
+/* --- viewport timeline --- */
+.vpWrap { display: flex; flex-direction: column; gap: 6px; }
+.vpOverview { display: block; width: 100%; cursor: pointer; }
+.vpLanes { position: relative; }
+.vpCanvas { display: block; width: 100%; cursor: crosshair; }
+.vpSpreadBtn { position: absolute; right: 60px; top: 1px; font-size: 10px; padding: 1px 8px; }
+.readoutLine { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 6px 2px 2px; font-size: 11px; color: #8b94a1; min-height: 18px; }
+.ro .roK { color: #6f7986; }
+.ro b { color: #eef2f6; font-weight: 600; }
+.ro b.cRed, .ro.cRed, .ro.cRed b { color: #f7768e; }
+.lgTeal { color: #3dd6c4; } .lgAmber { color: #e0af68; } .lgGrey { color: #8b94a1; } .lgRed { color: #f7768e; }
+.lawTip { font-size: 11px; color: #3dd6c4; cursor: help; }
+
+/* recovery status as plain words in the readout */
+.readout .recChip { border: none; background: transparent; padding: 0; border-radius: 0; font-size: 11px; color: #8b94a1; }
+.readout .recChip.ok { color: #3dd6c4; }
+.readout .recChip.warn { color: #e0af68; }
+.readout .recChip.alarm { color: #f7768e; background: transparent; font-weight: 700; }
+.readout .recChips { gap: 16px; }
+
+/* --- drawers --- */
+#smrDrawer { border: 1px solid #232932; border-radius: 8px; background: #12161b; padding: 10px 12px; gap: 10px; }
+.drawerHead { display: flex; align-items: center; gap: 12px; }
+.drawerTitle { font-size: 12px; color: #c9d2dd; }
+.bdChips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 150px; overflow-y: auto; padding: 4px 0; }
+.bdChip { background: #14181e; border: 1px solid #2c343e; border-radius: 6px; padding: 2px 7px; font-size: 10px; cursor: pointer; }
+.bdChip.on { box-shadow: 0 0 0 1px currentColor inset; }
+.bdChip:hover { filter: brightness(1.3); }
+.bdDim { font: 11px ui-monospace, Menlo, monospace; color: #565f6b; line-height: 1.5; }
+.bdProof { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; padding-top: 6px; }
+.bdProofViz { overflow-x: auto; max-width: 100%; }
+.bdSky { display: flex; gap: 3px; margin-bottom: 8px; }
+.bdSkyBar { height: 16px; background: #14181e; border: 1px solid #2c343e; border-radius: 3px; font: 9px ui-monospace, Menlo, monospace; color: #565f6b; text-align: center; line-height: 14px; }
+.bdSkyBar.on { border-color: #3dd6c4; color: #3dd6c4; background: #10312e; }
+.bdSteps { margin: 0; padding-left: 20px; font-size: 12px; color: #aeb6c0; line-height: 1.7; max-width: 520px; }
+.bdSteps li.bdDim { list-style: none; margin-left: -20px; }
+.bdCerts { margin-top: 10px; border-top: 1px solid #232932; padding-top: 8px; }
+.bdCertHead { display: flex; align-items: center; gap: 12px; }
+.bdCerts .certsCol { max-width: none; max-height: 300px; flex-direction: row; flex-wrap: wrap; align-items: flex-start; }
+.bdCerts .clCard { width: 320px; }
+.bdNote { padding: 8px 0; }
+.drBar { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+#drSpread { display: block; width: 100%; border: 1px solid #232932; border-radius: 8px; background: #14181e; }
+#bdForest .chainPanel { border: none; padding: 0; background: transparent; }
+
+.progHeadRow, .progRow { display: grid; grid-template-columns: 1fr 1fr 1fr 22px; gap: 6px; align-items: center; }
+.progHeadRow span { font-size: 10px; color: #565f6b; text-transform: uppercase; letter-spacing: 0.06em; }
+.progRow { margin-bottom: 4px; }
+.progRow .fInput { padding: 6px 7px; font-size: 12px; }
+
+/* --- About panel --- */
+.aboutPanel { position: fixed; inset: 0; z-index: 150; background: rgba(10,12,15,.72); display: flex; justify-content: center; padding: 40px 16px; overflow-y: auto; }
+.aboutBox { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; width: 720px; max-width: 100%; align-self: flex-start; background: #171b21; border: 1px solid #2c343e; border-radius: 12px; padding: 18px 22px; }
+.aboutHead { display: flex; align-items: center; margin-bottom: 10px; }
+.aboutBody h3 { margin: 22px 0 4px; font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #6f7986; border-top: 1px solid #232932; padding-top: 14px; }
+.aboutBody h3:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+.aboutBody h4 { margin: 12px 0 2px; font-size: 13px; color: #eef2f6; }
+.aboutBody p { margin: 3px 0; font-size: 12px; line-height: 1.6; color: #aeb6c0; }
+.aboutBody p b { color: #3dd6c4; font-weight: 600; margin-right: 4px; }
+
+/* --- single-value session page --- */
+.svNet { position: relative; height: 360px; border: 1px solid #232932; border-radius: 8px; background: #14181e; }
+#svNetBody { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+#svNetBody .drillPanel { max-width: 420px; }
+.dropHint { position: fixed; z-index: 180; }
+.app:not([data-view="single"]) .cfgSingle { display: none; }
+.app:not([data-view="smr"]) .cfgSmr { display: none; }
+#view-single.on { display: flex; }
+
+/* servers grid modes */
+.srvX { border: none; background: transparent; color: #8b94a1; cursor: pointer; font-size: 13px; padding: 0 4px; }
+.srvX:hover { color: #f7768e; }
+.ct:disabled { opacity: 0.35; cursor: default; }
+.sortBtn { border: 1px solid #2c343e; background: #1c222a; }
+.sortBtn.on { background: #3dd6c4; color: #0f1216; }
+#smrNetLegend { margin-left: auto; }

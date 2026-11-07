@@ -66,7 +66,18 @@ fn compact_barrier_yaml_adds_coordinator_and_client() {
         "SMR mode ships the client driver host"
     );
     assert!(yaml.contains("path: client_driver"));
-    assert!(yaml.contains("stop_time: 1500 ms"), "(10+5)·100ms");
+    assert!(
+        yaml.contains("stop_time: 1520 ms"),
+        "(10+5)·100 ms plus 10 round trips of 2·1 ms"
+    );
+    assert!(
+        yaml.contains("--n 3 --rounds 10 --observers 1"),
+        "the client driver is the coordinator's observer"
+    );
+    assert!(
+        yaml.contains("--peers peers.txt --coordinator coordinator:9100"),
+        "the client follows the nodes' rounds: {yaml}"
+    );
 }
 
 #[test]
@@ -113,5 +124,48 @@ fn jitter_is_rejected_loudly_until_implemented() {
     assert!(
         shadow_yaml(&spec).is_err(),
         "jitter shaping is not implemented — refuse, never silently drop"
+    );
+}
+
+#[test]
+fn stop_time_covers_the_start_offset_and_the_barrier_round_trips() {
+    let json = |sync: &str, extra: &str| {
+        format!(
+            r#"{{"scenario":{{"median":{{"n":3,"seed":1,"k":6,"ell":3,
+            "init":{{"kind":"distinct"}},"max_rounds":1000}}}},"sync":"{sync}","round_ms":100,
+            "network":{{"latency_ms":10}}{extra}}}"#
+        )
+    };
+    let stop = |spec: &str| {
+        let yaml = shadow_yaml(&NodeRunSpec::from_json(spec).unwrap()).unwrap();
+        yaml.lines()
+            .find(|l| l.contains("stop_time"))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        stop(&json("barrier", "")),
+        "stop_time: 120500 ms",
+        "(1000+5)·100 ms plus 1000 coordinator round trips of 2·10 ms"
+    );
+    assert_eq!(
+        stop(&json("timer", r#","start_offset_ms":700"#)),
+        "stop_time: 101200 ms",
+        "(1000+5)·100 ms plus the 700 ms start offset"
+    );
+}
+
+#[test]
+fn a_zero_latency_barrier_still_pays_shadows_one_ms_switch_hop() {
+    let spec = NodeRunSpec::from_json(
+        r#"{"scenario":{"median":{"n":3,"seed":1,"k":6,"ell":3,
+            "init":{"kind":"distinct"},"max_rounds":1000}},"sync":"barrier","round_ms":100}"#,
+    )
+    .unwrap();
+    let yaml = shadow_yaml(&spec).unwrap();
+    assert!(
+        yaml.contains("stop_time: 102500 ms"),
+        "(1000+5)·100 ms plus 1000 round trips of 2·1 ms:\n{yaml}"
     );
 }

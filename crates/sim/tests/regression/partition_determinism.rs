@@ -8,6 +8,8 @@ use sim::smr::{
 };
 use sim::{BlockSchedule, Config, Init, Scenario, run_traced};
 
+use crate::digest_fields;
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn fold(mut h: u64, s: &str) -> u64 {
@@ -29,8 +31,22 @@ fn alg1_digest(scenario: &Scenario) -> (usize, u64) {
 /// Shape counts beside the hash so a collapsed-to-nothing regression cannot
 /// hide behind a digest.
 fn smr_digest(report: &SmrReport) -> (usize, usize, u64) {
-    let json = serde_json::to_string(&report.commands).expect("commands serialize");
-    let metrics = serde_json::to_string(&report.metrics).expect("metrics serialize");
+    // Observer-derived landmarks are not part of the draw stream.
+    let commands: Vec<_> = report
+        .commands
+        .iter()
+        .cloned()
+        .map(|c| sim::smr::CommandReport {
+            committed_round: None,
+            injected_round: None,
+            index_agreed_round: None,
+            ..c
+        })
+        .collect();
+    let json = serde_json::to_string(&commands).expect("commands serialize");
+    let metrics = digest_fields::without_derived_fields(
+        &serde_json::to_string(&report.metrics).expect("metrics serialize"),
+    );
     (
         report.commands.len(),
         report.metrics.len(),
@@ -112,5 +128,5 @@ fn recovery_round_loop_stream_is_unchanged() {
         424_245,
         2,
     ));
-    assert_eq!(smr_digest(&report), (121, 60, 917_865_510_891_896_132));
+    assert_eq!(smr_digest(&report), (121, 60, 1_004_709_871_762_392_784));
 }

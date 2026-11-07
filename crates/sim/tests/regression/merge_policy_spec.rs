@@ -3,9 +3,11 @@
 use sim::smr::{SmrScenario, run_smr};
 use sim::spec::SmrScenarioSpec;
 
+use crate::digest_fields;
+
 const STICKY: &str = r#"{"kind":"per_round_sticky","fractions":[0,0,0,0,0,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6,0.6],"background":0.1}"#;
 const COMPACT: &str = r#"{"kind":"compact","t_commit_rounds":10}"#;
-const RECOVERY: &str = r#"{"kind":"recovery","t_window_rounds":10}"#;
+const RECOVERY: &str = r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#;
 
 fn spec_json(proto: &str, policy: Option<&str>) -> String {
     let policy = policy
@@ -32,31 +34,34 @@ fn fnv64(bytes: &[u8]) -> u64 {
 fn report_digest(json: &str) -> u64 {
     let report = run_smr(&scenario(json));
     fnv64(
-        serde_json::to_string(&report)
-            .expect("serializes")
+        digest_fields::without_derived_fields(&serde_json::to_string(&report).expect("serializes"))
             .as_bytes(),
     )
 }
 
-/// Goldens captured through the retired SIM_STAMP_TIE / SIM_UNION_STAMP env path.
+/// Goldens captured through the retired SIM_STAMP_TIE / SIM_UNION_STAMP env path; the recovery
+/// digests differ from those only in resends of an x already in L_i, which Alg 5 reports as ignored,
+/// and in `wedged_round`: this recovery cell's fleet is log-less on the genesis checkpoint from round 7.
+/// The `last_sighting` digests changed again once that policy stopped re-stamping entries of the
+/// median L'_i; the `first_sighting` ones did not move.
 #[test]
 fn spec_policy_reproduces_the_env_path_goldens() {
     let cases = [
-        (None, 0xf6a4_85b3_4a00_9b5a, 0xe648_5293_5b4e_0f9d),
+        (None, 0xf6a4_85b3_4a00_9b5a, 0x9374_1f39_3dcc_f9d3),
         (
             Some(r#"{"stamp_tie":"commands_only","union_stamp":"first_sighting"}"#),
             0x1bb5_f45b_ed6a_ec11,
-            0xd0fd_8bb0_5ac8_c5a0,
+            0x7ecf_3ad7_0ff0_ef54,
         ),
         (
             Some(r#"{"stamp_tie":"include_round","union_stamp":"last_sighting"}"#),
-            0xb9d4_f72d_d2fe_9f4f,
-            0x44b9_6ded_5c13_dd8e,
+            0xb76d_d0a9_c85b_d2c7,
+            0x411a_775b_b7d3_a4c6,
         ),
         (
             Some(r#"{"stamp_tie":"commands_only","union_stamp":"last_sighting"}"#),
-            0x136f_7f2e_8bee_a90c,
-            0x93b2_3c78_4e4f_4ebf,
+            0xb045_5df6_7728_86a7,
+            0xcea8_228d_4033_3272,
         ),
     ];
     for (policy, compact, recovery) in cases {

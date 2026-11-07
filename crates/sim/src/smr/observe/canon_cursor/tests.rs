@@ -35,7 +35,7 @@ fn canon_replay(canonical: &[Entry], entry: &Entry) {
                     canonical: &order,
                 };
                 assert_eq!(
-                    canon_lookup(idx.get(entry), s.executed()),
+                    canon_lookup(idx.get_from(entry, 0), s.executed()),
                     seen.front_scan(entry),
                     "cover {cover} len {len} frontier {frontier}"
                 );
@@ -65,7 +65,7 @@ fn a_hit_below_a_risen_offset_still_resolves() {
     let mut idx = EntryIndex::new();
     idx.extend_first(0, &ex);
     assert_eq!(
-        canon_lookup(idx.get(&cmd(5)), state(&ex, 2).executed()),
+        canon_lookup(idx.get_from(&cmd(5), 0), state(&ex, 2).executed()),
         Some(0)
     );
 }

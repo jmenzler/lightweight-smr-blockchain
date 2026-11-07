@@ -29,6 +29,7 @@ fn main() {
     for spec in &specs {
         let runs = spec.expand().unwrap_or_else(|e| panic!("{e}"));
         let (mut split, mut healed, mut mismatched) = (0usize, 0usize, 0usize);
+        let mut retracting = 0usize;
         for (scenario, opts) in &runs {
             let probe = probe_run(scenario, opts).unwrap_or_else(|e| panic!("{e}"));
             csv.push_str(&probe_row(&spec.exp, scenario, &probe));
@@ -49,6 +50,7 @@ fn main() {
             split += usize::from(probe.r_v.is_some());
             healed += usize::from(probe.transience.as_ref().is_some_and(|t| t.r_h.is_some()));
             mismatched += usize::from(probe.replay_ok == Some(false));
+            retracting += usize::from(probe.report.retractions > 0);
             records.push(serde_json::json!({
                 "exp": spec.exp,
                 "scenario": scenario,
@@ -56,7 +58,8 @@ fn main() {
             }));
         }
         eprintln!(
-            "{}: n={} T={:?} {}/{} split, {healed} healed, {mismatched} replay mismatches",
+            "{}: n={} T={:?} {}/{} split, {healed} back to consistency (by retracting executed \
+             commands), {retracting} with a Def 1.5 retraction, {mismatched} replay mismatches",
             spec.exp,
             spec.base.n,
             spec.base.proto,

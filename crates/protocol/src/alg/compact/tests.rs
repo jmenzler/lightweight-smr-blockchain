@@ -445,3 +445,130 @@ fn skip_executes_a_recommitted_command_once_on_both_commit_paths() {
     assert_eq!(executed.len(), 1, "{executed:?}");
     assert_eq!(skips, 2, "one skip per path");
 }
+
+/// Three replies whose aged prefix commits client 7's sn 2 before its sn 1.
+fn step_an_sn_gap(node: &mut CompactNode) {
+    step_an_sn_gap_serving(node, None);
+}
+
+/// As [`step_an_sn_gap`], every reply also carrying `s_j`.
+fn step_an_sn_gap_serving(node: &mut CompactNode, s_j: Option<Arc<SharedState>>) {
+    let log = |entries: &[Entry]| {
+        CompactReply::from_log(
+            Arc::new(ChunkSeq::from_vec(
+                entries
+                    .iter()
+                    .map(|e| Timed {
+                        entry: e.clone(),
+                        round: 0,
+                    })
+                    .collect(),
+            )),
+            s_j.clone(),
+        )
+    };
+    let (x1, x2) = (
+        ClientCommand {
+            client: 7,
+            sn: 1,
+            op: 71,
+        },
+        ClientCommand {
+            client: 7,
+            sn: 2,
+            op: 72,
+        },
+    );
+    let replies = vec![log(&[Entry::Nop(0), Entry::Cmd(x2), Entry::Cmd(x1)]); 3];
+    node.step_chosen(&replies, &[], 10, Some(&[0, 1, 2]));
+}
+
+#[test]
+fn skip_refuses_an_out_of_sn_order_commit_and_keeps_s_and_l() {
+    let mut node =
+        CompactNode::new(Config::default(), 5).with_repeated_commit(RepeatedCommit::Skip);
+    let log_before = node.log_entries();
+    step_an_sn_gap(&mut node);
+    assert_eq!(
+        node.sn_order_violation(),
+        Some(OutOfSnOrder {
+            client: 7,
+            sn: 2,
+            committed_sn: 0
+        })
+    );
+    assert!(node.s_i.executed().to_vec().is_empty(), "S_i is unchanged");
+    assert_eq!(node.log_entries(), log_before, "L_i is unchanged");
+    assert_eq!(node.repeat_skips(), 0);
+}
+
+// Box order (Alg 5, p. 26): "if b_i = 1 then i picks any reply S_j" precedes the commit, so a
+// refused commit leaves S_j adopted and executes no entry of P on it.
+#[test]
+fn skip_refusal_at_b_i_1_keeps_the_adopted_s_j_and_executes_nothing() {
+    let mut node =
+        CompactNode::new(Config::default(), 5).with_repeated_commit(RepeatedCommit::Skip);
+    node.step_chosen(&[], &[], 1, None);
+    assert!(node.b_i(), "fixture: L_i = ⊥ sets b_i = 1");
+    let s_j = Arc::new(SharedState::from_entries(
+        vec![Entry::Cmd(ClientCommand {
+            client: 9,
+            sn: 1,
+            op: 91,
+        })],
+        [(9, 1)].into(),
+    ));
+    step_an_sn_gap_serving(&mut node, Some(Arc::clone(&s_j)));
+    assert_eq!(
+        node.sn_order_violation(),
+        Some(OutOfSnOrder {
+            client: 7,
+            sn: 2,
+            committed_sn: 0
+        })
+    );
+    assert!(
+        Arc::ptr_eq(&node.s_i, &s_j),
+        "S_j stays adopted, unexecuted"
+    );
+    assert_eq!(
+        node.log_entries(),
+        None,
+        "L_i keeps its value from before the round"
+    );
+    assert_eq!(node.repeat_skips(), 0);
+}
+
+#[test]
+fn execute_commits_the_same_gap_as_the_box_prints() {
+    let mut node = CompactNode::new(Config::default(), 5);
+    step_an_sn_gap(&mut node);
+    assert_eq!(node.sn_order_violation(), None);
+    assert_eq!(node.s_i.executed().to_vec().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "refused an out-of-sn-order commit")]
+fn a_node_that_refused_a_commit_is_not_stepped_again() {
+    let mut node =
+        CompactNode::new(Config::default(), 5).with_repeated_commit(RepeatedCommit::Skip);
+    step_an_sn_gap(&mut node);
+    node.step_chosen(&[], &[], 11, None);
+}
+
+// sn(c) = u64::MAX has no successor, so no sn(x) is "sn(c) + 1"; the exact match still acks.
+#[test]
+fn client_rule_at_the_largest_sequence_number_acks_and_never_amplifies() {
+    let mut node = CompactNode::new(Config::default(), 5);
+    node.s_i = Arc::new(SharedState::from_entries(
+        Vec::new(),
+        [(2, u64::MAX)].into(),
+    ));
+    let x = |sn| ClientCommand {
+        client: 2,
+        sn,
+        op: 1,
+    };
+    assert_eq!(node.on_client_command(&x(u64::MAX)), Triage::AckCommitted);
+    assert_eq!(node.on_client_command(&x(0)), Triage::Ignore);
+}

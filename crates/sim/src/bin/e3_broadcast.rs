@@ -17,6 +17,7 @@ fn main() {
         for (n_idx, n) in NS.into_iter().enumerate() {
             let mut gs: Vec<f64> = Vec::new();
             let mut tbs: Vec<f64> = Vec::new();
+            let mut incomplete = 0usize;
             for i in 0..SEEDS {
                 let scenario = fresh_extended(
                     n,
@@ -29,8 +30,11 @@ fn main() {
                 let extra = serde_json::json!({ "exp": "E3", "arm": beta, "n": n });
                 let report = run_smr_logged(&scenario, Some(extra));
                 let cmd = &report.commands[0];
-                let delivered = cmd.delivered_round.expect("command delivers");
-                let all_logs = cmd.all_logs_round.expect("broadcast completes");
+                let (Some(delivered), Some(all_logs)) = (cmd.delivered_round, cmd.all_logs_round)
+                else {
+                    incomplete += 1;
+                    continue;
+                };
                 tbs.push((all_logs - delivered) as f64);
                 if let Some(g) = growth_window(cmd.spread.points(), C_WIN, n)
                     .and_then(|w| geometric_mean_growth(cmd.spread.points(), w))
@@ -42,13 +46,21 @@ fn main() {
             let conclusive = gs.len();
             let median = gs.get(conclusive / 2).copied();
             let above = gs.iter().filter(|&&g| g >= 1.5).count();
-            let mean_tb = tbs.iter().sum::<f64>() / tbs.len() as f64;
+            let mean_tb = if tbs.is_empty() {
+                f64::NAN
+            } else {
+                tbs.iter().sum::<f64>() / tbs.len() as f64
+            };
             mean_tbs.push(mean_tb);
             let cell = format!("beta={beta} n={n}");
             println!(
                 "{cell}: conclusive {conclusive}/{SEEDS}, G median {median:?}, \
-                 G>=1.5 {above}/{conclusive}, mean T_B {mean_tb:.2}"
+                 G>=1.5 {above}/{conclusive}, mean T_B {mean_tb:.2}, \
+                 never delivered or never in all logs {incomplete}/{SEEDS}"
             );
+            if tbs.is_empty() {
+                failures.push(format!("{cell}: no seed delivered and reached every log"));
+            }
             if conclusive < MIN_CONCLUSIVE {
                 println!("  -> descriptive (allowance: < {MIN_CONCLUSIVE} conclusive)");
             } else if !(median.expect("conclusive nonempty") >= 1.5

@@ -373,6 +373,28 @@ fn the_recovery_residency_is_flat_in_the_horizon() {
     );
 }
 
+#[test]
+fn two_runs_differing_only_in_a_parameter_spill_to_distinct_files() {
+    let spill_of = |tag: &str| {
+        let mut state = recovery_state(true);
+        state.scenario_tag = Some(tag.to_string());
+        for _ in 1..=40 {
+            state.draw_arrivals();
+            let mask = state.sample_mask(state.blocked_count(0.1));
+            state.step_masked(&mask);
+        }
+        state.finish_spill();
+        state.report().spill_path.expect(
+            "a lean recovery run must write a spill — unset SIM_SPILL and SIM_RUNLOG \
+             to run this test",
+        )
+    };
+    let (a, b) = (spill_of("aaaaaaaa"), spill_of("bbbbbbbb"));
+    assert_ne!(a, b);
+    assert!(a.ends_with("aaaaaaaa.jsonl"), "{a}");
+    assert!(b.ends_with("bbbbbbbb.jsonl"), "{b}");
+}
+
 fn compact_run_shape() -> SmrState {
     SmrState::new(
         32,
@@ -582,6 +604,49 @@ fn the_retained_tail_is_flat_in_the_horizon() {
     );
 }
 
+/// Canonical entries, indexed first positions and double-execution positions still held.
+fn observer_residency(state: &SmrState) -> [usize; 3] {
+    let index = match &state.rec {
+        Some(rec) => rec.canonical_pos_resident(),
+        None => state.canon_index.resident(),
+    };
+    [
+        state.checker.canonical().retained().len(),
+        index,
+        state.exec_dup.resident_positions(),
+    ]
+}
+
+fn assert_observer_flat(short: &SmrState, long: &SmrState) {
+    let (s, l) = (observer_residency(short), observer_residency(long));
+    assert!(
+        l[0] > 0 && l[1] > 0 && l[2] > 0,
+        "the long run released everything, so nothing was measured: {l:?}"
+    );
+    for (what, (s, l)) in ["canonical", "entry index", "exec-dup positions"]
+        .iter()
+        .zip(s.iter().zip(&l))
+    {
+        assert!(
+            *l < 2 * s,
+            "the observer's {what} grew with the horizon: {l} vs {s}"
+        );
+    }
+}
+
+#[test]
+fn the_compact_observer_is_flat_in_the_horizon() {
+    assert_observer_flat(&compact_run(true, 100, None), &compact_run(true, 300, None));
+}
+
+#[test]
+fn the_recovery_observer_is_flat_in_the_horizon() {
+    assert_observer_flat(
+        &recovery_run(true, 100, None),
+        &recovery_run(true, 300, None),
+    );
+}
+
 #[test]
 fn pool_sequence_numbers_run_one_two_three_per_client() {
     let state = loaded_pool_state(48, 200);
@@ -638,33 +703,6 @@ fn a_pool_client_never_has_two_commands_in_flight() {
 }
 
 #[test]
-fn a_pool_run_keeps_the_shared_bot_state_snapshot() {
-    let fresh = SmrState::new(
-        16,
-        Config::default(),
-        Proto::Compact { t_commit_rounds: 8 },
-        1.0,
-        7,
-        &[],
-        &[TrafficPhase {
-            from_round: 1,
-            arrivals_pmf: point_mass_pmf(2),
-        }],
-        ClientModel::Pool { clients: 48 },
-        None,
-    );
-    assert!(
-        !fresh.nulls_possible,
-        "no null is reachable at construction"
-    );
-    let stepped = loaded_pool_state(48, 40);
-    assert!(
-        !stepped.nulls_possible,
-        "minting pool arrivals must not make nulls reachable"
-    );
-}
-
-#[test]
 fn the_grid_runner_does_not_observe_the_census() {
     let scenario = SmrScenario {
         n: 16,
@@ -704,4 +742,23 @@ fn the_grid_runner_does_not_observe_the_census() {
             .any(|c| c.spread.observed().is_some_and(|v| !v.is_empty())),
         "the full runner observed nothing, so the pairing pins nothing"
     );
+}
+
+#[test]
+#[should_panic(
+    expected = "spill boundary write failed for seed 77 (/full/disk/smr.jsonl): spill write: no space"
+)]
+fn a_spill_write_error_names_the_run_the_file_and_the_way_out() {
+    spill_io_failure(
+        "boundary write",
+        77,
+        Some(std::path::Path::new("/full/disk/smr.jsonl")),
+        "spill write: no space",
+    );
+}
+
+#[test]
+#[should_panic(expected = "set SIM_SPILL=off")]
+fn a_spill_write_error_says_how_to_run_without_the_stream() {
+    spill_io_failure("create", 1, None, "no ledger directory");
 }

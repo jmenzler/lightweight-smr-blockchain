@@ -1,20 +1,51 @@
 //! §5 certificate driver harness: per-server cert state, commit acks, and Thm 6 verification.
 
-use protocol::certificates::{Certificate, ClientChains, MergeEvent, ServerCertState};
+use protocol::certificates::{Certificate, ClientChains, MergeEvent, MmrForest, ServerCertState};
 use protocol::compact::{ClientCommand, Entry};
+use protocol::recovery::Checkpoint;
 
 use crate::smr::{AttemptOutcome, SmrState};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub struct CertHarness {
-    servers: Vec<ServerCertState>,
+    servers: ServerCerts,
     fed: Vec<usize>,
+    bottom: Vec<bool>,
     clients: BTreeMap<u32, ClientChains>,
     sn_by_op: BTreeMap<u64, (u32, u64)>,
     last_merges: Vec<(usize, MergeEvent)>,
 }
 
-/// Verification tally: `covered` useful servers can judge the certificate, `accepted` of those.
+enum ServerCerts {
+    /// Built by appending each server's executed growth (compact, extended).
+    Replayed(Vec<ServerCertState>),
+    /// Read through each recovery server's checkpoint; a node replaces its checkpoint, never
+    /// mutates it, so a held one keeps the certs it was observed with.
+    Checkpointed(Vec<Arc<Checkpoint>>),
+}
+
+impl ServerCerts {
+    fn get(&self, i: usize) -> &ServerCertState {
+        match self {
+            Self::Replayed(states) => &states[i],
+            Self::Checkpointed(checkpoints) => checkpoints[i]
+                .certs
+                .as_ref()
+                .expect("a checkpointed harness holds cert-carrying checkpoints"),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Replayed(states) => states.len(),
+            Self::Checkpointed(checkpoints) => checkpoints.len(),
+        }
+    }
+}
+
+/// Verification tally: `covered` useful servers (Thm 6, p. 28: not blocked, L_i ≠ ⊥) are expected
+/// to verify the certificate, `accepted` of those did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyTally {
     pub covered: usize,
@@ -24,8 +55,9 @@ pub struct VerifyTally {
 impl CertHarness {
     pub fn new(n: usize) -> Self {
         Self {
-            servers: (0..n).map(|_| ServerCertState::new()).collect(),
+            servers: ServerCerts::Replayed((0..n).map(|_| ServerCertState::new()).collect()),
             fed: vec![0; n],
+            bottom: vec![false; n],
             clients: BTreeMap::new(),
             sn_by_op: BTreeMap::new(),
             last_merges: Vec::new(),
@@ -58,39 +90,53 @@ impl CertHarness {
         &self.clients[&client]
     }
 
-    /// Feed forests from executed growth and deliver acks; call once after every step.
+    /// Deliver the round's acks from the start-of-round forests, then feed this round's executed
+    /// growth; call once after every step.
     pub fn observe_round(&mut self, state: &SmrState) {
+        self.deliver_acks(state);
         self.last_merges.clear();
+        self.bottom = state.bottom_logs();
+        let ServerCerts::Replayed(servers) = &mut self.servers else {
+            panic!("observe_round on a harness fed by observe_round_rec");
+        };
         let executed = state.executed_seqs();
         for (i, seq) in executed.iter().enumerate() {
             if seq.len() < self.fed[i] {
                 // Cert state is a pure function of the executed sequence, so a rewritten sequence rebuilds by replay.
-                self.servers[i] = ServerCertState::new();
+                servers[i] = ServerCertState::new();
                 self.fed[i] = 0;
             }
             for entry in &seq[self.fed[i]..] {
-                let events = self.servers[i].append(entry);
+                let events = servers[i].append(entry);
                 self.last_merges.extend(events.into_iter().map(|e| (i, e)));
             }
             self.fed[i] = seq.len();
         }
-        self.deliver_acks(state);
     }
 
+    /// As [`Self::observe_round`]: acks read the start-of-round checkpoint certs, then the
+    /// end-of-round ones are installed.
     pub fn observe_round_rec(&mut self, state: &SmrState) {
-        self.last_merges.clear();
-        for i in 0..self.servers.len() {
-            let certs = state.checkpoint_certs(i).expect(
-                "recovery cert state is spec-gated; set certs: true in the scenario \
-                 (or build the state with SmrState::new_with_certs)",
-            );
-            self.fed[i] = certs.forest().len() as usize;
-            self.servers[i] = certs.clone();
-        }
         self.deliver_acks(state);
+        self.last_merges.clear();
+        self.bottom = state.bottom_logs();
+        let checkpoints = (0..self.servers.len())
+            .map(|i| {
+                state.checkpoint_certs(i).expect(
+                    "recovery cert state is spec-gated; set certs: true in the scenario \
+                     (or build the state with SmrState::new_with_certs)",
+                );
+                state
+                    .recovery_node(i)
+                    .expect("a checkpoint implies a recovery node")
+                    .checkpoint_shared()
+            })
+            .collect();
+        self.servers = ServerCerts::Checkpointed(checkpoints);
     }
 
-    // §5 p. 28: the ack comes from the one server whose triage acked, snapshotted at ack time.
+    // §5 p. 28: the ack comes from the one server whose triage acked, with that server's chain at
+    // reply time; Alg 5 replies before the round's commit, so the forests must not yet hold it.
     fn deliver_acks(&mut self, state: &SmrState) {
         let round = state.round();
         let report = state.report();
@@ -108,7 +154,7 @@ impl CertHarness {
                 .find(|a| a.round == round && a.outcome == AttemptOutcome::AckCommitted)
                 .map(|a| a.target as usize)
                 .expect("ack round implies an AckCommitted attempt");
-            let note = self.servers[acker].notification(client);
+            let note = self.servers.get(acker).notification(client);
             self.clients
                 .get_mut(&client)
                 .expect("client registered")
@@ -120,29 +166,32 @@ impl CertHarness {
         &self.last_merges
     }
 
-    pub fn server_states(&self) -> &[ServerCertState] {
-        &self.servers
+    pub fn servers(&self) -> impl Iterator<Item = &ServerCertState> {
+        (0..self.servers.len()).map(|i| self.servers.get(i))
     }
 
     pub fn clients_iter(&self) -> impl Iterator<Item = &ClientChains> {
         self.clients.values()
     }
 
+    /// Servers of equal length hold equal roots; servers of different length agree on their shared
+    /// leading peaks (`MmrForest::consistent_with`).
     pub fn roots_consistent(&self) -> bool {
-        let mut by_m: BTreeMap<usize, Vec<protocol::certificates::Hash>> = BTreeMap::new();
-        for (i, s) in self.servers.iter().enumerate() {
-            match by_m.get(&self.fed[i]) {
-                Some(roots) => {
-                    if *roots != s.forest().roots() {
-                        return false;
-                    }
-                }
+        let mut by_len: BTreeMap<u64, &MmrForest> = BTreeMap::new();
+        for server in self.servers() {
+            let forest = server.forest();
+            match by_len.get(&forest.len()) {
+                Some(rep) if rep.roots() != forest.roots() => return false,
+                Some(_) => {}
                 None => {
-                    by_m.insert(self.fed[i], s.forest().roots());
+                    by_len.insert(forest.len(), forest);
                 }
             }
         }
-        true
+        let reps: Vec<&MmrForest> = by_len.into_values().collect();
+        reps.iter()
+            .enumerate()
+            .all(|(i, a)| reps[i + 1..].iter().all(|b| a.consistent_with(b)))
     }
 
     pub fn verify_everywhere(&self, client: u32, cert: &Certificate, mask: &[bool]) -> VerifyTally {
@@ -150,15 +199,8 @@ impl CertHarness {
             covered: 0,
             accepted: 0,
         };
-        for (i, s) in self.servers.iter().enumerate() {
-            if mask[i] {
-                continue;
-            }
-            let covered = match cert {
-                Certificate::Chained { pos, .. } => self.fed[i] as u64 > *pos,
-                Certificate::Newest { .. } => s.last_two(client).is_some(),
-            };
-            if !covered {
+        for (i, s) in self.servers().enumerate() {
+            if mask[i] || self.bottom[i] {
                 continue;
             }
             tally.covered += 1;

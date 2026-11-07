@@ -12,7 +12,7 @@ use sim_wasm::{LiveSmr, SpillView};
 fn recovery_spec(n: usize, t_window: u64) -> String {
     format!(
         r#"{{"n":{n},"seed":11,"k":6,"ell":3,"sigma":5.0,
-            "proto":{{"kind":"recovery","t_window_rounds":{t_window}}},
+            "proto":{{"kind":"recovery","t_window_rounds":{t_window},"resend_until_acked":false}},
             "injections":[{{"round":2,"client":1,"op":7}}],
             "max_rounds":200,
             "traffic":{{"kind":"pmf","arrivals_pmf":[0.4,0.6]}},
@@ -294,9 +294,9 @@ fn certs_json_errors_on_recovery_without_ack_mode() {
 }
 
 #[test]
-fn exported_spec_round_trips_ack_mode_and_omits_it_when_off() {
-    // Provenance: a cert-bearing session must replay as one. The flag is
-    // skipped when off, so every pre-RQ11 recovery spec keeps its bytes.
+fn exported_spec_round_trips_ack_mode_in_both_settings() {
+    // Provenance: a cert-bearing session must replay as one. The client mode
+    // is a required spec field, so the export names it in both settings.
     let mut live = LiveSmr::new(&cert_spec(true)).expect("session");
     for _ in 0..12 {
         live.step(0.0);
@@ -321,10 +321,20 @@ fn exported_spec_round_trips_ack_mode_and_omits_it_when_off() {
     off.step(0.0);
     let exported: serde_json::Value =
         serde_json::from_str(&off.export_scenario()).expect("exported spec");
-    assert!(
-        exported["proto"]["resend_until_acked"].is_null(),
-        "an off flag must not appear in the exported spec at all"
+    assert_eq!(
+        exported["proto"]["resend_until_acked"],
+        serde_json::json!(false),
+        "an off flag is exported explicitly"
     );
+    let replayed: SmrScenarioSpec =
+        serde_json::from_value(exported).expect("exported spec re-parses");
+    assert!(matches!(
+        SmrScenario::try_from(replayed).expect("valid").proto,
+        sim::smr::Proto::Recovery {
+            resend_until_acked: false,
+            ..
+        }
+    ));
 }
 
 #[test]

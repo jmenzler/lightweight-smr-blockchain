@@ -56,6 +56,8 @@ pub struct NodeRunSpec {
     pub listen_port: u16,
     #[serde(default)]
     pub start_offset_ms: u64,
+    /// Cap on one frame including payload padding. A reply that exceeds it is not sent and counts as
+    /// `encode_err`; Alg 3 replies carry the whole log, so long or padded runs must raise it.
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: u32,
     /// Wire-level padding per command payload (cores stay u64).
@@ -105,7 +107,31 @@ impl NodeRunSpec {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Every server's initial value, drawn in node-id order from the run's own `"init"` stream (not
+    /// the sim's shared stream, so random inits differ from the sim's at the same seed).
+    pub fn initial_values(&self) -> Result<Vec<Option<u64>>, String> {
+        if let ScenarioKind::Gossip(g) = &self.scenario {
+            return Ok((0..g.n)
+                .map(|i| Some(if i < g.holders { g.x } else { g.x0 }))
+                .collect());
+        }
+        let scenario = self.value_scenario()?;
+        let mut init_rng = crate::rng::derive_rng(scenario.seed, "init", 0);
+        Ok((0..scenario.n)
+            .map(|i| sim::initial_state(&scenario.init, i, scenario.n, &mut init_rng))
+            .collect())
+    }
+
+    /// The value a gossip/priority run must spread: x, or the maximum initial value.
+    pub fn target_value(&self) -> Result<Option<u64>, String> {
+        match &self.scenario {
+            ScenarioKind::Gossip(g) => Ok(Some(g.x)),
+            ScenarioKind::Priority(_) => Ok(self.initial_values()?.into_iter().flatten().max()),
+            ScenarioKind::Median(_) | ScenarioKind::Smr(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if let Some(field) = self.unsupported_sim_field() {
             return Err(format!("{field} is not supported in networked mode"));
         }
@@ -135,6 +161,15 @@ impl NodeRunSpec {
             ScenarioKind::Smr(s) => {
                 sim::smr::SmrScenario::try_from(s.clone())?;
             }
+        }
+        if self.k() > usize::from(u16::MAX) {
+            return Err(format!(
+                "k = {} exceeds the u16 reply-slot width of the wire format",
+                self.k()
+            ));
+        }
+        if u32::try_from(self.n()).is_err() {
+            return Err("n exceeds the u32 node-id width of the wire format".to_string());
         }
         if self.round_ms == 0 {
             return Err("round_ms must be positive (CP-4 timer rounds)".to_string());
@@ -183,12 +218,21 @@ impl NodeRunSpec {
         if partition {
             return Some("partition");
         }
+        use sim::spec::ScheduleSpec as S;
+        // Exhaustive so a new schedule must decide here: the node precomputes masks without node state.
         match schedule {
-            Some(sim::spec::ScheduleSpec::Adaptive1Late { .. }) => Some("adaptive_1late schedule"),
-            Some(sim::spec::ScheduleSpec::AdaptiveAlphaLate { .. }) => {
-                Some("adaptive_alpha_late schedule")
-            }
-            _ => None,
+            None
+            | Some(
+                S::FreshPerRound { .. }
+                | S::Permanent { .. }
+                | S::Windows { .. }
+                | S::PerRoundFractions { .. }
+                | S::PerRoundSticky { .. }
+                | S::Disjoint { .. },
+            ) => None,
+            Some(S::Adaptive0Late { .. }) => Some("adaptive_0late schedule"),
+            Some(S::AdaptiveAlphaLate { .. }) => Some("adaptive_alpha_late schedule"),
+            Some(S::NoiseController { .. }) => Some("noise_controller schedule"),
         }
     }
 
@@ -197,6 +241,14 @@ impl NodeRunSpec {
             ScenarioKind::Median(s) | ScenarioKind::Priority(s) => s.n,
             ScenarioKind::Smr(s) => s.n,
             ScenarioKind::Gossip(s) => s.n,
+        }
+    }
+
+    fn k(&self) -> usize {
+        match &self.scenario {
+            ScenarioKind::Median(s) | ScenarioKind::Priority(s) => s.k,
+            ScenarioKind::Smr(s) => s.k,
+            ScenarioKind::Gossip(s) => s.k,
         }
     }
 

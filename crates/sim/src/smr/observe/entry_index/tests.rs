@@ -10,35 +10,15 @@ fn cmd(op: u64) -> Entry {
 }
 
 #[test]
-fn a_repeated_canonical_entry_is_reported_and_keeps_its_first_position() {
-    let mut idx = EntryIndex::new();
-    assert!(idx.extend_unique(0, &[cmd(1), cmd(2), cmd(1)]));
-    assert_eq!(idx.get(&cmd(1)), Some(0));
-    assert_eq!(idx.get(&cmd(2)), Some(1));
-}
-
-#[test]
-fn a_repeat_appearing_in_a_later_round_is_caught_too() {
-    let mut idx = EntryIndex::new();
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(2)]));
-    assert!(idx.extend_unique(0, &[cmd(1), cmd(2), cmd(3), cmd(2)]));
-    assert_eq!(idx.get(&cmd(3)), Some(2));
-}
-
-#[test]
-fn indexing_continues_past_a_repeat() {
-    let mut idx = EntryIndex::new();
-    assert!(idx.extend_unique(0, &[cmd(1), cmd(1), cmd(4)]));
-    assert_eq!(idx.get(&cmd(4)), Some(2));
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(1), cmd(4), cmd(5)]));
-}
-
-#[test]
 fn extend_first_indexes_the_first_occurrence_of_every_entry() {
     let mut idx = EntryIndex::new();
     idx.extend_first(0, &[cmd(1), cmd(2), cmd(1)]);
     assert_eq!(
-        (idx.get(&cmd(1)), idx.get(&cmd(2)), idx.get(&cmd(9))),
+        (
+            idx.get_from(&cmd(1), 0),
+            idx.get_from(&cmd(2), 0),
+            idx.get_from(&cmd(9), 0)
+        ),
         (Some(0), Some(1), None)
     );
 }
@@ -56,18 +36,13 @@ fn extending_boundary_by_boundary_answers_like_a_fresh_build() {
         let mut fresh = EntryIndex::new();
         fresh.extend_first(0, seq);
         for op in 1..=5 {
-            assert_eq!(extended.get(&cmd(op)), fresh.get(&cmd(op)), "op {op}");
+            assert_eq!(
+                extended.get_from(&cmd(op), 0),
+                fresh.get_from(&cmd(op), 0),
+                "op {op}"
+            );
         }
     }
-}
-
-#[test]
-fn re_covering_the_same_prefix_is_not_a_duplicate() {
-    let mut idx = EntryIndex::new();
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(2)]));
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(2)]));
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(2), cmd(3)]));
-    assert!(!idx.extend_unique(0, &[cmd(1), cmd(2), cmd(3)]));
 }
 
 #[test]
@@ -81,7 +56,54 @@ fn a_released_front_does_not_shift_the_positions_behind_it() {
     // Positions 2.. arrive with the front already dropped.
     released.extend_first(2, &whole[2..]);
     for op in 1..=5 {
-        assert_eq!(released.get(&cmd(op)), walked.get(&cmd(op)), "op {op}");
+        assert_eq!(
+            released.get_from(&cmd(op), 0),
+            walked.get_from(&cmd(op), 0),
+            "op {op}"
+        );
     }
-    assert_eq!(released.get(&cmd(5)), Some(4));
+    assert_eq!(released.get_from(&cmd(5), 0), Some(4));
+}
+
+#[test]
+fn positions_at_or_above_the_release_line_survive_it() {
+    let mut idx = EntryIndex::new();
+    idx.extend_first(0, &[cmd(1), cmd(2), cmd(3), cmd(4), cmd(5)]);
+    idx.release_to(2);
+    assert_eq!(idx.get_from(&cmd(3), 2), Some(2));
+    assert_eq!(idx.get_from(&cmd(5), 3), Some(4));
+    assert_eq!(idx.get_from(&cmd(9), 2), None);
+}
+
+#[test]
+#[should_panic(expected = "below the index's release line")]
+fn a_query_floor_below_the_release_line_fails_loudly() {
+    let mut idx = EntryIndex::new();
+    idx.extend_first(0, &[cmd(1), cmd(2), cmd(3)]);
+    idx.release_to(2);
+    idx.get_from(&cmd(3), 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "occurs below the query floor")]
+fn a_query_for_an_entry_below_its_floor_fails_in_tests() {
+    let mut idx = EntryIndex::new();
+    idx.extend_first(0, &[cmd(1), cmd(2), cmd(3)]);
+    idx.release_to(2);
+    idx.get_from(&cmd(1), 2);
+}
+
+#[test]
+fn released_positions_do_not_stay_resident() {
+    let mut idx = EntryIndex::new();
+    let seq: Vec<Entry> = (1..=2000).map(cmd).collect();
+    idx.extend_first(0, &seq);
+    let full = idx.heap_bytes();
+    idx.release_to(2000);
+    assert!(
+        idx.heap_bytes() < full / 10,
+        "released to the end, the index still holds {} of {full} bytes",
+        idx.heap_bytes()
+    );
 }

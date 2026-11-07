@@ -33,6 +33,42 @@ fn log_reply(entries: &[Entry], round: u64) -> CompactReply {
     )
 }
 
+// --- replying to requests (Algorithm 5, step 2) ---
+
+#[rstest]
+#[case::requester_healthy(false)]
+#[case::requester_recovering(true)]
+fn a_server_with_a_log_replies_with_it_and_attaches_its_state_iff_b_is_set(#[case] b_j: bool) {
+    // "if L_i ≠ ⊥ then for any request ... i sends L_i to j, and if b_j = 1 then also S_i"
+    let mut n = node();
+    n.step(
+        &vec![log_reply(&[Entry::Cmd(cmd(1, 1, 77))], 0); 3],
+        &[],
+        T,
+        &mut rng(),
+    );
+    let reply = n.answer(b_j).expect("L_i ≠ ⊥ answers");
+    assert_eq!(reply.l_j.entries().iter().count(), 1);
+    assert_eq!(
+        reply
+            .s_j
+            .as_ref()
+            .map(|s| s.untruncated().iter().cloned().collect::<Vec<_>>()),
+        b_j.then(|| vec![Entry::Cmd(cmd(1, 1, 77))]),
+        "S_i travels exactly when b_j = 1"
+    );
+}
+
+#[rstest]
+#[case::requester_healthy(false)]
+#[case::requester_recovering(true)]
+fn a_bottom_server_sends_no_reply(#[case] b_j: bool) {
+    let mut n = node();
+    n.step(&[], &[], 1, &mut rng());
+    assert_eq!(n.log_entries(), None);
+    assert_eq!(n.answer(b_j), None);
+}
+
 // --- client triage (Algorithm 5, step 1) ---
 
 #[rstest]
@@ -247,8 +283,17 @@ fn emptied_log_gets_a_dummy_command() {
         T,
         &mut rng(),
     );
-    let log = n.log_entries().unwrap();
-    assert!(!log.is_empty(), "log must never end a round empty");
+    // The command is aged (round T − 0 ≥ T), executes, and empties the log; the paper does not
+    // fix x_d, the implementation appends the no-op stamped with the current round.
+    assert_eq!(
+        n.shared_state().untruncated(),
+        vec![Entry::Cmd(cmd(1, 1, 77))]
+    );
+    assert_eq!(
+        n.log_entries().unwrap().to_vec(),
+        vec![timed(Entry::Nop(T), T)],
+        "the emptied log is exactly (x_d)"
+    );
 }
 
 #[test]
@@ -261,6 +306,101 @@ fn committed_command_acks_the_resending_client() {
         &mut rng(),
     );
     assert_eq!(n.on_client_command(&cmd(1, 1, 77)), Triage::AckCommitted);
+}
+
+/// Executes `entries` on a fresh node: three equal replies stamped 0, stepped at round T.
+fn node_that_committed(entries: &[Entry]) -> CompactNode {
+    let mut n = node();
+    n.step(&vec![log_reply(entries, 0); 3], &[], T, &mut rng());
+    n
+}
+
+#[test]
+fn a_stale_sequence_number_is_ignored_not_acked() {
+    let n = node_that_committed(&[Entry::Cmd(cmd(1, 1, 77)), Entry::Cmd(cmd(1, 2, 78))]);
+    assert_eq!(n.shared_state().sn_get(1), Some(2));
+    assert_eq!(n.on_client_command(&cmd(1, 1, 77)), Triage::Ignore);
+    assert_eq!(n.on_client_command(&cmd(1, 2, 78)), Triage::AckCommitted);
+}
+
+#[test]
+fn a_bot_server_does_not_ack_a_committed_sequence_number() {
+    let mut n = node_that_committed(&[Entry::Cmd(cmd(1, 1, 77))]);
+    assert_eq!(n.on_client_command(&cmd(1, 1, 77)), Triage::AckCommitted);
+    n.step(&[], &[], T + 1, &mut rng());
+    assert_eq!(n.shared_state().sn_get(1), Some(1));
+    assert_eq!(n.on_client_command(&cmd(1, 1, 77)), Triage::Ignore);
+}
+
+#[test]
+fn append_requests_are_lost_with_the_log_below_ell_replies() {
+    let mut n = node();
+    n.step(
+        &vec![log_reply(&[Entry::Cmd(cmd(1, 1, 1))], 0); 2],
+        &[(cmd(2, 1, 9), 1)],
+        1,
+        &mut rng(),
+    );
+    assert!(n.b_i(), "below ℓ replies the log is ⊥");
+    n.step(
+        &vec![log_reply(&[Entry::Cmd(cmd(1, 1, 1))], 0); 3],
+        &[],
+        2,
+        &mut rng(),
+    );
+    let logged: Vec<Entry> = n
+        .log_entries()
+        .unwrap()
+        .iter()
+        .map(|t| t.entry.clone())
+        .collect();
+    assert_eq!(
+        logged,
+        [Entry::Cmd(cmd(1, 1, 1))],
+        "the lost append must not resurface"
+    );
+}
+
+#[test]
+fn a_command_held_only_by_the_server_itself_is_dropped() {
+    // L̄ draws on the chosen replies and the appends; the server's own previous log counts only if it was drawn.
+    let mut n = node();
+    let seed_only = vec![log_reply(&[Entry::Nop(0)], 0); 3];
+    n.step(&seed_only, &[(cmd(1, 1, 5), 1)], 1, &mut rng());
+    assert!(
+        n.log_entries()
+            .unwrap()
+            .iter()
+            .any(|t| t.entry == Entry::Cmd(cmd(1, 1, 5)))
+    );
+    n.step(&seed_only, &[], 2, &mut rng());
+    assert!(
+        !n.log_entries()
+            .unwrap()
+            .iter()
+            .any(|t| t.entry == Entry::Cmd(cmd(1, 1, 5)))
+    );
+}
+
+/// Alg 5's client bullet tests `x ∉ L_i` by command, so a ⊥ for the slot does not stop x being accepted again.
+#[test]
+fn a_bot_for_the_slot_does_not_block_the_command_and_both_commit() {
+    let mut n = node();
+    let conflict = [
+        log_reply(&[Entry::Cmd(cmd(1, 1, 1))], 5),
+        log_reply(&[Entry::Cmd(cmd(1, 1, 2))], 5),
+        log_reply(&[Entry::Cmd(cmd(2, 1, 3))], 5),
+    ];
+    n.step(&conflict, &[], 6, &mut rng());
+    assert_eq!(n.on_client_command(&cmd(1, 1, 1)), Triage::Amplify);
+
+    let null = Entry::Null { client: 1, sn: 1 };
+    let n = node_that_committed(&[null, Entry::Cmd(cmd(1, 1, 7))]);
+    assert_eq!(
+        n.shared_state().untruncated(),
+        vec![Entry::Cmd(cmd(1, 1, 7))],
+        "x executes beside the ⊥ of its slot"
+    );
 }
 
 // --- duplicate replacement AFTER median-merge (step 4 order, box p.26) ---

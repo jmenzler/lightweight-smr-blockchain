@@ -1,4 +1,7 @@
-use sim::smr::{Proto, SmrScenario, SmrTerminal, TrafficPhase, run_smr_lean};
+use sim::smr::{
+    HaltKind, Proto, SmrScenario, SmrState, SmrTerminal, TrafficPhase, run_smr_lean,
+    run_smr_lean_observed,
+};
 use sim::{BlockSchedule, Config};
 
 fn split_brain_scenario(halt_on_violation: bool) -> SmrScenario {
@@ -29,28 +32,28 @@ fn split_brain_scenario(halt_on_violation: bool) -> SmrScenario {
 
 #[test]
 fn a_halting_run_ends_at_the_violation_with_the_same_latch() {
-    let full = run_smr_lean(&split_brain_scenario(false));
+    let mut latch = None;
+    let full = run_smr_lean_observed(&split_brain_scenario(false), &mut |state: &SmrState| {
+        if latch.is_none() && !state.safety_ok() {
+            latch = Some(state.round());
+        }
+    });
     assert!(!full.safety_ok, "the cell must split its brain");
-    let SmrTerminal::Ran {
-        rounds: full_rounds,
-    } = full.terminal
-    else {
-        panic!("full run must reach its horizon");
-    };
-    assert_eq!(full_rounds, 400);
+    assert_eq!(full.terminal, SmrTerminal::Ran { rounds: 400 });
+    let latch = latch.expect("the latch flipped");
+    assert!(latch < 400, "precondition: the split precedes the horizon");
 
     let halted = run_smr_lean(&split_brain_scenario(true));
     assert!(!halted.safety_ok, "halting must not change the latch");
-    let SmrTerminal::Ran {
-        rounds: halted_rounds,
-    } = halted.terminal
-    else {
-        panic!("a halted run still terminates as Ran");
-    };
-    assert!(
-        halted_rounds < full_rounds,
-        "halting run stopped at {halted_rounds}, expected before {full_rounds}"
+    assert_eq!(
+        halted.terminal,
+        SmrTerminal::Halted {
+            round: latch,
+            kind: HaltKind::Fork
+        },
+        "a halted run names its halt round and kind"
     );
+    assert_eq!(halted.metrics[..], full.metrics[..latch]);
 }
 
 #[test]

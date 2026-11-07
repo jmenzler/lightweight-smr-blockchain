@@ -33,12 +33,14 @@ enum Probe {
     Dup(u32),
 }
 
+/// `median_len` is |L'_i|: positions below it are the median's and keep their stamps (Alg 5 takes L'_i whole).
 fn apply_union_probe(
     merged: &mut ChunkSeq<Timed>,
     index: &mut PermIndex,
     entry: &Entry,
     round: u64,
     union: UnionStamp,
+    median_len: usize,
 ) {
     let probe = index.probe(entry, merged.len() as u32);
     debug_assert_eq!(
@@ -50,7 +52,7 @@ fn apply_union_probe(
             entry: entry.clone(),
             round,
         }),
-        Probe::Dup(place) if union == UnionStamp::LastSighting => {
+        Probe::Dup(place) if union == UnionStamp::LastSighting && place as usize >= median_len => {
             merged.make_mut_at(place as usize).round = round;
         }
         Probe::Dup(_) => {}
@@ -179,7 +181,7 @@ pub fn median_merge<'a>(
     MergedLog::new(log, index)
 }
 
-/// The `L'_i ∘ L̄` of step 4 in Algorithms 3 and 5 (Alg 6 runs Alg 3): seeds the median `chosen[at]`, then unions the chosen logs and `appends` onto it.
+/// The `L'_i ∘ L̄` of Alg 5 step 4, which Alg 6's Alg 3 step also runs, over timed entries: seeds the median `chosen[at]`, then unions the chosen logs and `appends` onto it. Alg 3 on bare commands is `LogNode::step`.
 pub fn merge_onto_median(
     chosen: &[Chosen<'_>],
     at: usize,
@@ -209,6 +211,7 @@ pub fn merge_onto_median(
 }
 
 /// The box's union from `from` on (below it every entry is the median's own); consumes the pre-union index.
+/// `merged` enters holding exactly the median L'_i.
 pub fn union_into(
     merged: &mut ChunkSeq<Timed>,
     chosen: &[Chosen<'_>],
@@ -217,6 +220,7 @@ pub fn union_into(
     mut index: PermIndex,
     union: UnionStamp,
 ) -> MergedIndex {
+    let median_len = merged.len();
     let mut probes = 0usize;
     let mut skipped = 0usize;
     for c in chosen {
@@ -228,13 +232,13 @@ pub fn union_into(
             .min(c.log.len().saturating_sub(from));
         for t in c.log.iter_at(at) {
             probes += 1;
-            apply_union_probe(merged, &mut index, &t.entry, t.round, union);
+            apply_union_probe(merged, &mut index, &t.entry, t.round, union, median_len);
         }
     }
     for (x, sent_round) in appends {
         probes += 1;
         let entry = Entry::Cmd(*x);
-        apply_union_probe(merged, &mut index, &entry, *sent_round, union);
+        apply_union_probe(merged, &mut index, &entry, *sent_round, union, median_len);
     }
     bump(&PROBE_ENTRIES, probes);
     bump(&SKIPPED_ENTRIES, skipped);
@@ -304,6 +308,11 @@ pub struct PermIndex {
 
 impl PermIndex {
     pub fn from_carried(log: &ChunkSeq<Timed>, perm: &[u32]) -> Self {
+        assert_eq!(
+            perm.len(),
+            log.len(),
+            "a carried index must name every position of its log once"
+        );
         bump(&GATHER_ENTRIES, perm.len());
         let live: Vec<&Entry> = log.iter().map(|t| &t.entry).collect();
         PermIndex {

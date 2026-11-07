@@ -1,6 +1,7 @@
 use sim::smr::{
-    ClientModel, CommandStatus, Injection, Proto, RecoveryFailurePhase, SmrReport, SmrScenario,
-    SmrState, SmrTerminal, Spill, TrafficPhase, run_smr, run_smr_lean, run_smr_observed,
+    ClientModel, CommandStatus, Injection, Proto, RecoveryViolation, RunFailurePhase, SmrReport,
+    SmrScenario, SmrState, SmrTerminal, Spill, TrafficPhase, run_smr, run_smr_lean,
+    run_smr_observed,
 };
 use sim::{BlockSchedule, Config};
 
@@ -51,7 +52,7 @@ fn failure_rounds(report: &SmrReport) -> (usize, usize, usize) {
             attempted_round,
             completed_round,
             observed_round,
-            phase: RecoveryFailurePhase::BoundaryPreflight,
+            phase: RunFailurePhase::BoundaryPreflight,
         } => (attempted_round, completed_round, observed_round),
         ref terminal => panic!("expected boundary-preflight failure, got {terminal:?}"),
     }
@@ -71,10 +72,17 @@ fn boundary_prefix_violation_becomes_a_typed_terminal_failure() {
     );
     let failure = report.failure.as_ref().expect("typed failure");
     assert_eq!(failure.node, 1);
-    assert_eq!(failure.violation.pre_len, 39);
-    assert_eq!(failure.violation.log_len, 114);
-    assert_eq!(failure.violation.first_mismatch, 33);
-    assert!(!failure.violation.command_prefix_ok);
+    let RecoveryViolation::Prefix(violation) = &failure.violation else {
+        panic!("a prefix violation: {:?}", failure.violation)
+    };
+    assert_eq!(violation.pre_len, 39);
+    assert_eq!(violation.log_len, 114);
+    assert_eq!(violation.first_mismatch, 33);
+    assert_ne!(
+        violation.expected.as_ref().map(|t| &t.entry),
+        violation.actual.as_ref().map(|t| &t.entry),
+        "a boundary failure is a command mismatch"
+    );
     assert_eq!(report.recovered_round(598, 20), None);
     assert!(
         report

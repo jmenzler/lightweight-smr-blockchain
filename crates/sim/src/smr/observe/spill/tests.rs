@@ -111,3 +111,49 @@ fn a_headerless_file_is_refused() {
     let a = boundary(1, &[cmd(1)], &[1, 1], &mut chain);
     assert!(Spill::parse(&a).is_err());
 }
+
+fn header() -> SpillHeader {
+    SpillHeader {
+        commit: "deadbeef".into(),
+        dirty: false,
+        seed: 7,
+        n: 2,
+        t_window: 10,
+        proto: "recovery".into(),
+    }
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("spill-names-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn runs_differing_only_in_a_swept_parameter_get_distinct_spill_names() {
+    let dir = scratch_dir("tags");
+    let a = SpillWriter::create_in(&dir, header(), "aaaaaaaa").expect("creates");
+    let b = SpillWriter::create_in(&dir, header(), "bbbbbbbb").expect("creates");
+    assert_ne!(a.path(), b.path());
+    assert!(
+        a.path()
+            .to_string_lossy()
+            .ends_with("-smr-n2-seed7-aaaaaaaa.jsonl")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_identical_name_is_never_overwritten() {
+    let dir = scratch_dir("collide");
+    let mut first = SpillWriter::create_in(&dir, header(), "cccccccc").expect("creates");
+    first.finish().expect("finishes");
+    let before = std::fs::read_to_string(first.path()).expect("reads");
+    let second = SpillWriter::create_in(&dir, header(), "cccccccc").expect("creates");
+    assert_ne!(first.path(), second.path());
+    assert_eq!(
+        std::fs::read_to_string(first.path()).expect("reads"),
+        before
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

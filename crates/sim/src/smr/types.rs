@@ -15,7 +15,6 @@ pub enum Proto {
     Recovery {
         t_window_rounds: u64,
         /// Resend past §6 commitment until a contacted server acks; changes the stage-(b) draw pattern.
-        #[serde(skip_serializing_if = "is_off")]
         resend_until_acked: bool,
         /// Boundary handling when P does not prefix L_i; `Abort` is the paper-faithful default.
         #[serde(skip_serializing_if = "is_abort", with = "PrefixMismatchWire")]
@@ -29,10 +28,6 @@ fn is_zero(count: &u64) -> bool {
 
 fn is_zero_usize(count: &usize) -> bool {
     *count == 0
-}
-
-fn is_off(flag: &bool) -> bool {
-    !*flag
 }
 
 /// Keeps the default off the wire so existing spec and ledger bytes stay byte-identical.
@@ -58,7 +53,8 @@ pub(crate) enum PrefixMismatchWire {
     SkipBoundary,
 }
 
-/// One client command: `client` resends `op` to servers from `round` on, until acked.
+/// One client command: `client` resends `op` to servers from `round` on, until its stop signal:
+/// the delivery signal (extended) or Alg 5's commit ack (compact, recovery without a global latch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Injection {
     pub round: usize,
@@ -76,7 +72,9 @@ pub const AUTO_OP_BASE: u64 = 1 << 40;
 /// The `j`-th auto arrival under the unique client model.
 pub fn auto_command(j: u64) -> protocol::compact::ClientCommand {
     protocol::compact::ClientCommand {
-        client: AUTO_CLIENT_BASE + u32::try_from(j).expect("auto client overflow"),
+        client: AUTO_CLIENT_BASE
+            .checked_add(u32::try_from(j).expect("auto client overflow"))
+            .expect("auto client overflow"),
         sn: 1,
         op: AUTO_OP_BASE + j,
     }
@@ -204,9 +202,23 @@ impl ManualBlock {
     }
 }
 
-/// ⌈σ·log₂ n⌉, floored at one; base 2 is this implementation's convention.
+/// Largest σ·log₂ n a scenario may request; bounds the append fan-out of one delivery.
+pub const MAX_APPEND_REQUESTS: f64 = 1_048_576.0;
+
+// A product this close above an integer is that integer with float noise (16.6 · 15 = 249.00000000000003).
+const AMP_SNAP: f64 = 1e-9;
+
+/// ⌈σ·log₂ n⌉ (Alg 3 B1, p. 20), floored at one; the paper leaves the log base open, so base 2 is
+/// this implementation's convention.
 pub fn amp_count(sigma: f64, n: usize) -> usize {
-    ((sigma * (n as f64).log2()).ceil() as usize).max(1)
+    let product = sigma * (n as f64).log2();
+    let nearest = product.round();
+    let ceil = if (product - nearest).abs() < AMP_SNAP {
+        nearest
+    } else {
+        product.ceil()
+    };
+    (ceil as usize).max(1)
 }
 
 /// Per-round observability counters for SMR runs (one CSV row each).
@@ -214,11 +226,16 @@ pub fn amp_count(sigma: f64, n: usize) -> usize {
 pub struct SmrRoundMetrics {
     pub nonbot_logs: u32,
     pub blocked: u32,
+    /// Useful at the round's start (p. 19): L_i ≠ ⊥ when the round began, not blocked in it. The
+    /// Def 1.4 counters read the round's end instead (`SmrReport::strong_safety_violation_rounds`).
     pub useful: u32,
     pub distinct_logs: u32,
     pub max_log_len: u32,
     pub min_executed_len: u32,
     pub max_executed_len: u32,
+    /// (min, max) executed length over the servers with L_i ≠ ⊥ in this row and not blocked; None if
+    /// there are none. A recovery window-end row is read before the pass.
+    pub useful_executed: Option<(u32, u32)>,
     pub arrivals: u32,
     /// Common prefix of non-⊥ logs (extended); compact uses min_executed_len.
     pub lcp_len: u32,
@@ -228,9 +245,13 @@ pub struct SmrRoundMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SpreadPoint {
     pub round: usize,
+    /// Useful servers whose log at the start of the round holds the command. Compact and recovery
+    /// read L_i only, not S_i, so once the command is committed the holders drop to 0 although the
+    /// useful servers executed it; the position stats below do include S_i.
     pub useful_holders: u32,
     pub useful_total: u32,
-    /// Post-step position stats across the logs holding the command; median is the lower median.
+    /// Post-step position stats across the logs holding the command; for an even count the median
+    /// is the upper one (index len/2 of the sorted positions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pos_min: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,7 +307,8 @@ pub struct DeliveryAttempt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum AttemptOutcome {
-    /// Extended/recovery: accepted by the server (the extended ack, p. 19).
+    /// Extended/recovery: accepted by a server. The delivery signal is a driver choice: §3 (pp. 19–20)
+    /// defines no acknowledgement, only that clients resend to random servers.
     Delivered,
     TargetBlocked,
     /// Recovery: the target was reachable but held no log (⊥).
@@ -310,13 +332,35 @@ pub struct CommandReport {
     pub client: u32,
     pub op: u64,
     pub injection_round: usize,
+    /// The paper's injection (pp. 7, 19): first round a non-blocked server received the command
+    /// from its client, whatever it then did with it (amplify, ack, or ignore it for L_i = ⊥, an
+    /// sn gap or a held copy). Paper latency (`lat_*`) counts from here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injected_round: Option<usize>,
+    /// First receipt that started the command's spread: a non-blocked server amplified it
+    /// (compact, recovery) or received it (extended, where it equals `injected_round`). The T_B
+    /// origin; a recovery rollback that discards the copy does not move it.
     pub delivered_round: Option<usize>,
-    /// T_B landmark.
+    /// T_B landmark: first round the command was in every non-⊥ log. A recovery rollback that
+    /// later drops it from every log does not clear it.
     pub all_logs_round: Option<usize>,
-    /// T_E landmark; T_M = prefix_fixed − all_logs.
+    /// Lemma 3.8's T_E landmark (p. 24), T_M = prefix_fixed − all_logs: the first round at whose
+    /// end every non-⊥ log (a superset of the useful servers) begins with one identical prefix
+    /// through x. Stricter than Def 1.3 agreement, never earlier than `index_agreed_round`.
     pub prefix_fixed_round: Option<usize>,
+    /// Def 1.3 (p. 6) read over the same logs: x at one index in every non-⊥ end-of-round log,
+    /// from this round on to the end of the run, the index constant throughout. The horizon
+    /// right-censors it: Def 1.3 asks for "after which", so every value is a lower bound on
+    /// persistence, and one equal to the run's last round (`SmrReport::metrics.len()`) rests on
+    /// a single observed round.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_agreed_round: Option<usize>,
     /// Compact: Alg 5 "if L_i ≠ ⊥ and sn(x) = sn(c)".
     pub committed_ack_round: Option<usize>,
+    /// Compact: first round at whose end every useful server (as for
+    /// `SmrReport::strong_safety_violation_rounds`) has executed the command (§1.2, p. 5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_round: Option<usize>,
     /// Recovery: first boundary round where every useful server executed the command (Lemma 6.8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executed_round: Option<usize>,
@@ -328,19 +372,42 @@ pub struct CommandReport {
     pub status: CommandStatus,
 }
 
+/// Which check ended the run; compact runs end only on `OutOfSnOrderCommit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum RecoveryFailurePhase {
+pub enum RunFailurePhase {
+    /// Recovery under `Abort`: P did not prefix L_i at a window end.
     BoundaryPreflight,
+    /// Lemma 6.9 (monotonicity): a server's executed sequence shrank.
+    ExecutedRegression,
+    /// The execute-once state machine (compact or recovery) refused a commit that skips an sn.
+    OutOfSnOrderCommit,
 }
 
+/// The broken condition; untagged, so a prefix violation serializes as before.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RecoveryFailure {
+#[serde(untagged)]
+pub enum RecoveryViolation {
+    Prefix(protocol::recovery::RecoveryPrefixViolation),
+    ExecutedRegression {
+        previous_len: u64,
+        len: u64,
+    },
+    OutOfSnOrder {
+        client: u32,
+        sn: u64,
+        committed_sn: u64,
+    },
+}
+
+/// A compact or recovery run ended as a recorded failure; serialized without the type name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunFailure {
     pub node: u32,
     pub attempted_round: usize,
     pub completed_round: usize,
     pub observed_round: usize,
-    pub phase: RecoveryFailurePhase,
-    pub violation: protocol::recovery::RecoveryPrefixViolation,
+    pub phase: RunFailurePhase,
+    pub violation: RecoveryViolation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -349,12 +416,31 @@ pub enum SmrTerminal {
     Ran { rounds: usize },
     /// Every log went ⊥; terminal, since no log-holding peer can ever reply again.
     Dead { round: usize },
+    /// `halt_on_violation` stopped the run after `round`. Not the fleet `wedged_round`.
+    Halted { round: usize, kind: HaltKind },
     Failed {
         attempted_round: usize,
         completed_round: usize,
         observed_round: usize,
-        phase: RecoveryFailurePhase,
+        phase: RunFailurePhase,
     },
+}
+
+/// Why a `halt_on_violation` run stopped. An executed-state shrink and a boundary prefix
+/// abort stay `Failed`, flag or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaltKind {
+    /// The no-fork latch `safety_ok` flipped: two servers' executed sequences diverged.
+    Fork,
+}
+
+impl HaltKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HaltKind::Fork => "fork",
+        }
+    }
 }
 
 impl SmrTerminal {
@@ -368,10 +454,41 @@ pub struct SmrReport {
     pub metrics: Vec<SmrRoundMetrics>,
     pub commands: Vec<CommandReport>,
     pub terminal: SmrTerminal,
+    /// No fork: at every check, all n executed sequences (⊥ and blocked servers included) were
+    /// prefixes of one order (compact and recovery). Not Def 1.4 Strong Safety, not Def 1.5
+    /// Monotonicity. Extended runs have no commit and no checker, so it stays `true` for them and
+    /// says nothing.
     pub safety_ok: bool,
-    /// First round an executed command repeated: per server in compact, in the canonical order in recovery.
+    /// First round some server's executed sequence held one (client, sn) twice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_dup_round: Option<usize>,
+    /// Def 1.5 Monotonicity (p. 8), per server: (server, observation) pairs whose executed
+    /// sequence was not an extension of that server's previous one. Compact observes at every
+    /// round end, recovery also after every between-window pass. 0 for extended.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retractions: u64,
+    /// The retractions that did not shorten the sequence: an executed prefix rewritten.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retraction_rewrites: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_retraction_round: Option<usize>,
+    /// Def 1.4 Strong Safety (p. 7), read as strict equality at every round end: rounds in
+    /// which two useful servers held different executed sequences. Useful, for this and every
+    /// other Def 1.4 counter in compact and recovery: L_i ≠ ⊥ after the round's step (recovery:
+    /// after the between-window pass when one runs) and not blocked in that round, read at the
+    /// round's end. The paper leaves the instant open and reads useful at the round's start
+    /// (pp. 10, 19) or as L_i ≠ ⊥ alone (p. 35). A useful server one commit behind the others
+    /// counts as well, so this is a lag count, not a fork count; forks are `safety_ok`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub strong_safety_violation_rounds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strong_safety_first_violation: Option<usize>,
+    /// Recovery: the same check at window ends only, after the pass, the instant Lemma 6.7
+    /// speaks about.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub strong_safety_boundary_violations: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strong_safety_boundary_first_violation: Option<usize>,
     /// Entries the execute-once state machine left out, summed over nodes; 0 unless it is on.
     #[serde(skip_serializing_if = "is_zero")]
     pub repeat_skips: u64,
@@ -385,31 +502,54 @@ pub struct SmrReport {
     /// Latest episode start; an open episode that started here is censored by the horizon.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_boundary_skip_round: Option<usize>,
-    /// Longest completed episode in rounds; open episodes count in `unrejoined_nodes`.
+    /// Longest completed episode in rounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_rejoin_rounds: Option<usize>,
+    /// Longest stale spell, completed or still open; a lower bound for an open one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longest_stale_rounds: Option<usize>,
+    /// Nodes still stale at the end after at least one round in which they could adopt.
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub unrejoined_nodes: usize,
+    /// Nodes that skipped in the final round: no round to adopt yet, so not counted as unrejoined.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub horizon_skip_nodes: usize,
+    /// First round from which no recovery node can ever hold a log again: every L_i = ⊥, every
+    /// checkpoint has one W (nothing to adopt), and each node is DEV-3-stale or holds P = ⊥ (its
+    /// rollback restores no log). The run still ends `Ran`; this is its liveness verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<RecoveryFailure>,
+    pub wedged_round: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RunFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_peak_in_flight: Option<u32>,
-    /// Provenance, not an observation: the one field lean and full runs of a seed differ on.
+    /// Provenance, not an observation. Lean and full runs of a seed also differ in what lean sheds:
+    /// the `attempts`, `amp_receivers` and `spread` of settled commands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spill_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecoveryReport {
-    /// Checkpoint-lineage fork oracle (Lemma 6.5/6.7).
+    /// Checkpoint-lineage fork oracle (Lemma 6.5/6.7); P is compared as commands, not stamps.
     pub fork_ok: bool,
+    /// Lemma 6.7 (p. 35) on the commit path: the first window end at which some W has two
+    /// distinct checkpoints (S, or P read as commands) that servers committed, at this window
+    /// end or earlier ones. Checkpoints no server commits, and the lineage across windows, are
+    /// `fork_ok`'s. A rollback commits the server's own P, which prefixes the L_i it restores, so
+    /// the node-local prefix check cannot see this. Dated under both prefix-mismatch policies;
+    /// neither stops on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_fork_round: Option<usize>,
     pub rounds: Vec<RecRoundMetrics>,
 }
 
 impl SmrReport {
-    /// Smallest boundary r* with reset == 0 and ≥ ⌈3n/4⌉ logs at every later boundary, executed lengths equal at r*.
+    /// Smallest window end r* whose useful servers hold one executed sequence after the pass
+    /// (`RecRoundMetrics::useful_agree`, Def 1.4), with reset == 0 and ≥ ⌈3n/4⌉ logs before the
+    /// pass at r* and every later window end; `None` for a failed run.
     pub fn recovered_round(&self, n: usize, t_window: u64) -> Option<usize> {
         if self.terminal.is_failed() {
             return None;
@@ -422,14 +562,13 @@ impl SmrReport {
         let clean =
             |b: usize| rec.rounds[b - 1].reset == 0 && self.metrics[b - 1].nonbot_logs >= floor;
         boundaries.iter().copied().find(|&r_star| {
-            let m = self.metrics[r_star - 1];
-            m.min_executed_len == m.max_executed_len
+            rec.rounds[r_star - 1].useful_agree == Some(true)
                 && boundaries.iter().all(|&b| b < r_star || clean(b))
         })
     }
 }
 
-/// Per-round recovery counters; the round-mT row is pre-boundary state.
+/// Per-round recovery counters; the round-mT row is pre-boundary state except `useful_agree`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct RecRoundMetrics {
     pub noreset: u32,
@@ -439,9 +578,13 @@ pub struct RecRoundMetrics {
     pub rollbacks: u32,
     pub max_checkpoint_window: u64,
     pub rollback_depth: u32,
-    /// Distinct (S, P) at the largest W after the boundary re-mint (Lemma 6.5/6.7).
+    /// Distinct (S, P) at the largest W after the boundary re-mint, P read as commands (Lemma 6.5/6.7).
     pub cp_fork_k: u32,
     pub max_cp_p_len: u32,
+    /// Def 1.4 Strong Safety at this round's end, after the between-window pass in a window-end
+    /// round: whether every useful server (see `SmrReport::strong_safety_violation_rounds`) holds
+    /// one executed sequence; `None` when no server is useful or the round ended the run.
+    pub useful_agree: Option<bool>,
 }
 
 /// Seed command x₀: lexicographically smallest, pinning position 0 of every log.
@@ -467,7 +610,7 @@ pub struct SmrStepStatus {
     pub spreading: Vec<SpreadingCommand>,
     pub dead: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<RecoveryFailure>,
+    pub failure: Option<RunFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rec: Option<RecStepInfo>,
 }

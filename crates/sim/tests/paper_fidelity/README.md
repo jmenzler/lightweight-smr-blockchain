@@ -2,7 +2,7 @@
 
 This integration target contains nine normally passing controls and one ordinary ignored desired-behavior assertion. The ignored test intentionally fails on the current simulator when invoked explicitly. It is bounded evidence for the named default-policy contract, not a second simulator or a universal equivalence proof.
 
-The target uses only public simulator interfaces and test-local literals. It has no runtime dependency on the audit scratchpad, Downloads, evidence files, wall-clock time, or test order.
+The target uses only public simulator interfaces and test-local literals. It has no runtime dependency on the paper reading notes (`docs/paper-spec/`), Downloads, evidence files, wall-clock time, or test order.
 
 ## Passing controls
 
@@ -13,7 +13,7 @@ The target uses only public simulator interfaces and test-local literals. It has
 | `control_unblocked_log_holder_delivers_and_amplifies_same_round` | The non-adaptation twin of the released-bottom case: a pinned, unblocked extended target enters round 2 with a log, delivers the unseen command, and records non-empty same-round amplification receivers. |
 | `compatibility_legacy_recovery_client_completes_without_ack_feedback` | The explicit legacy `resend_until_acked:false` workload still completes without any `AckCommitted` feedback. This preserves the legacy mode; it does not decide the omitted-field default. |
 | `control_small_recovery_full_and_lean_runs_match_logical_state` | A small ACK-enabled recovery run has identical terminal state, safety/failure state, per-round metrics, recovery counters, status, execution, and landmark fields under `run_smr` and `run_smr_lean`. Attempts, receiver vectors, and spread retention are deliberately outside the equality contract. |
-| `source_normative_extended_driver_released_bottom_target_amplifies_same_round` | Algorithm 3 regression: a pinned extended target that was blocked and became bottom admits and amplifies the command immediately after release (Section 3, p. 19; Algorithm 3, p. 20, versus Algorithm 5, p. 26). |
+| `extended_driver_released_bottom_target_amplifies_same_round` | Algorithm 3 regression: a pinned extended target that was blocked and became bottom admits and amplifies the command immediately after release (Section 3, p. 19; Algorithm 3, p. 20, versus Algorithm 5, p. 26). |
 | `recovery_adaptation_future_sequence_number_has_no_amplification_receivers_through_round_32` | ACK-enabled recovery adapter regression: with SN 1 blocked, SN 2 is ignored rather than amplified or logically admitted through round 32. The bare Algorithm 6 node remains sequence-agnostic. |
 | `recovery_adaptation_blocked_predecessor_has_no_premature_ack_through_round_48` | ACK-enabled recovery adapter regression: a blocked predecessor continues retrying after release and receives no premature ACK through round 48. Separate stepped engine unit tests pin precommit `P` versus committed `S` and ACK on a later non-boundary retry. |
 | `theorem_budget_beta_point_one_blocks_at_most_floor_beta_n` | Definition 1.1 regression: `n=598`, `β=0.1` blocks exactly `floor(59.8)=59` servers, never the nearest integer 60 (pp. 4–5). |
@@ -46,4 +46,4 @@ The remaining expected-red contract must be run separately:
 env -u SIM_SPILL -u SIM_RUNLOG cargo test -p sim --test paper_fidelity default_policy_omitted_ack_setting_requires_contacted_node_commit_ack -- --exact --ignored --test-threads=1
 ```
 
-The normal command currently has nine passing checks and one ignored default-policy expectation.
+The normal command currently has nine passing checks and one ignored default-policy expectation. Historical pre-fix outputs are retained under `.superpowers/sdd/paper-fidelity-conformance-tests/task-3-evidence/`.

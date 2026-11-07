@@ -164,6 +164,37 @@ fn forgetting_the_committed_prefix_moves_no_landmark_on_either_shape() {
     }
 }
 
+/// Lean forgetting drops the positions a later shrink would re-verify, so the verdict a forking
+/// cell gets must still match the full run: the safety latch and the first double execution.
+#[test]
+fn lean_and_full_agree_on_the_verdict_of_forking_cells() {
+    let split: Vec<u32> = (0..32).map(|i| u32::from(i >= 24)).collect();
+    let mut forked = 0;
+    for seed in 0..6 {
+        for kind in 0..3 {
+            let mut s = cell(150, 3);
+            s.seed = 880_000 + seed;
+            s.proto = Proto::Compact { t_commit_rounds: 3 };
+            match kind {
+                0 => s.schedule = BlockSchedule::Permanent { fraction: 0.25 },
+                1 => s.schedule = BlockSchedule::FreshPerRound { fraction: 0.3 },
+                _ => {
+                    s.schedule = BlockSchedule::FreshPerRound { fraction: 0.0 };
+                    s.partition = Some(split.clone());
+                }
+            }
+            let (full, lean) = (run_smr(&s), run_smr_lean(&s));
+            assert_eq!(
+                (full.safety_ok, full.exec_dup_round),
+                (lean.safety_ok, lean.exec_dup_round),
+                "seed {seed}, schedule {kind}"
+            );
+            forked += usize::from(!full.safety_ok);
+        }
+    }
+    assert!(forked >= 6, "only {forked} of 18 cells forked");
+}
+
 /// The grid path takes the lean run. Rows still assemble — the CSV's own
 /// byte-identity against committed evidence is the release byte-diff suite's
 /// job, which this only has to not break.
@@ -620,7 +651,7 @@ fn a_surge_that_strands_old_checkpoints_still_forgets_soundly() {
           "exp": "surge-strands",
           "base": {{
             "n": 128, "seed": 0, "k": 6, "ell": 3, "sigma": 1.0,
-            "proto": {{ "kind": "recovery", "t_window_rounds": 40 }},
+            "proto": {{ "kind": "recovery", "t_window_rounds": 40, "resend_until_acked": false }},
             "injections": [
               {{ "round": 5, "client": 1, "op": 7 }},
               {{ "round": 45, "client": 2, "op": 9 }},

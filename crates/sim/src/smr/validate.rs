@@ -1,3 +1,4 @@
+use super::types::MAX_APPEND_REQUESTS;
 use super::{AUTO_CLIENT_BASE, AUTO_OP_BASE, SmrScenario, TrafficPhase};
 
 impl SmrScenario {
@@ -6,11 +7,9 @@ impl SmrScenario {
         if self.n < 1 {
             return Err("n must be at least 1".into());
         }
-        if matches!(
-            self.schedule,
-            crate::BlockSchedule::Adaptive1Late { .. }
-                | crate::BlockSchedule::AdaptiveAlphaLate { .. }
-        ) {
+        self.cfg.check().map_err(|e| e.to_string())?;
+        self.schedule.validate(self.n)?;
+        if crate::blocking::schedule_knowledge(&self.schedule, self.n).reads_node_state() {
             return Err(
                 "adaptive schedules are Alg-1 only: the SMR mask path has no node-state hook"
                     .into(),
@@ -29,11 +28,29 @@ impl SmrScenario {
                 );
             }
         }
-        if self.sigma <= 0.0 || !self.sigma.is_finite() {
+        if !(self.sigma >= 1.0 && self.sigma.is_finite()) {
             return Err(format!(
-                "sigma must be positive and finite, got {}",
+                "sigma must be finite and at least 1 (Alg 3 B1, p. 20), got {}",
                 self.sigma
             ));
+        }
+        if self.sigma * (self.n as f64).log2() > MAX_APPEND_REQUESTS {
+            return Err(format!(
+                "sigma {} sends more than {MAX_APPEND_REQUESTS} append requests per delivery at n={}",
+                self.sigma, self.n
+            ));
+        }
+        if matches!(self.proto, super::Proto::Compact { t_commit_rounds: 0 }) {
+            return Err("compact t_commit_rounds must be at least 1".into());
+        }
+        if matches!(
+            self.proto,
+            super::Proto::Recovery {
+                t_window_rounds: 0,
+                ..
+            }
+        ) {
+            return Err("recovery t_window_rounds must be at least 1".into());
         }
         let mut ops = std::collections::BTreeSet::new();
         for inj in &self.injections {
@@ -49,28 +66,18 @@ impl SmrScenario {
             if clients < 1 {
                 return Err("client_model pool needs at least one client".into());
             }
+            if clients > AUTO_CLIENT_BASE {
+                return Err(format!(
+                    "client_model pool of {clients} clients leaves the auto namespace (> {AUTO_CLIENT_BASE})"
+                ));
+            }
             // Exhaustive: a new rule must fail to compile here until shown pool-compatible.
             match self.proto {
-                crate::smr::Proto::Compact { .. }
-                | crate::smr::Proto::Recovery {
-                    resend_until_acked: false,
-                    ..
-                } => {}
+                crate::smr::Proto::Compact { .. } | crate::smr::Proto::Recovery { .. } => {}
                 crate::smr::Proto::Extended => {
                     return Err(
                         "client_model pool is compact/recovery only: the extended rule has no \
                          commitment latch to free a client on"
-                            .into(),
-                    );
-                }
-                crate::smr::Proto::Recovery {
-                    resend_until_acked: true,
-                    ..
-                } => {
-                    return Err(
-                        "client_model pool needs one-in-flight pacing, which the ack-tied \
-                         recovery client would break: it resends until acked, past the executed \
-                         latch the pool frees on"
                             .into(),
                     );
                 }

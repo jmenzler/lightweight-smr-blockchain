@@ -4,7 +4,7 @@
 
 use sim::smr::{ClientModel, Injection, Proto, SmrScenario, SmrState, SmrStepStatus};
 use sim::spec::{InitSpec, ProtoSpec, ScenarioSpec, SmrScenarioSpec};
-use sim::{BlockSchedule, Config, Init, Scenario, run_traced};
+use sim::{BlockSchedule, BlockTarget, BlockWindow, Config, Init, Scenario, run, run_traced};
 
 /// Contiguous two-block partition: the first `first` ids in component 0, the
 /// rest in component 1.
@@ -67,6 +67,39 @@ fn a_partition_leaves_the_target_draws_untouched() {
         open.rounds[0].states, split.rounds[0].states,
         "…while the replies those targets give must differ"
     );
+}
+
+/// Cross-component targets never reply, so all nodes holding a value is not absorbing under a
+/// partition: even without blocking, a run must not stop at its first all-hold round.
+#[test]
+fn an_all_hold_round_is_not_absorbing_under_a_partition() {
+    let run_with = |seed: u64, schedule: BlockSchedule| {
+        run(&Scenario {
+            n: 4,
+            seed,
+            cfg: Config::default(),
+            init: Init::UniformRandom { k: 1 },
+            max_rounds: 60,
+            schedule,
+            partition: Some(two_blocks(2, 4)),
+        })
+    };
+    // A window that opens after the horizon blocks nothing and draws nothing, but keeps
+    // done_blocking_after false, so it never takes the early exit.
+    let never_exits_early = || {
+        BlockSchedule::Windows(vec![BlockWindow {
+            start_round: 1_000_000,
+            rounds: 1,
+            target: BlockTarget::Nodes(vec![0]),
+        }])
+    };
+    for seed in 0..300 {
+        assert_eq!(
+            run_with(seed, BlockSchedule::FreshPerRound { fraction: 0.0 }),
+            run_with(seed, never_exits_early()),
+            "seed {seed}"
+        );
+    }
 }
 
 #[test]

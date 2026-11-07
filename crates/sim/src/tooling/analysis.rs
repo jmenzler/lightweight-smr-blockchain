@@ -63,3 +63,54 @@ pub fn ols_fit(xs: &[f64], ys: &[f64]) -> Option<(f64, f64, f64)> {
     };
     Some((slope, intercept, r2))
 }
+
+/// Fates of a cell's Alg-1 runs at the horizon. Only an observed extinction is a death; a run
+/// still mixed (`NoConvergence`) or agreed inside the death spiral (`Collapsing`) has an unknown
+/// fate and is censored, so neither enters `death_rounds` with the horizon as its round.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SurvivalTally {
+    pub runs: u64,
+    pub survived: u64,
+    /// Agreement rounds of the survivors.
+    pub agree_rounds: Vec<usize>,
+    /// Extinction rounds of the runs that died.
+    pub death_rounds: Vec<usize>,
+    /// Runs whose fate the horizon cut off, `collapsing` among them.
+    pub censored: u64,
+    pub collapsing: u64,
+}
+
+impl SurvivalTally {
+    pub fn add(&mut self, outcome: &crate::Outcome) {
+        use crate::{Availability, Outcome};
+        self.runs += 1;
+        match *outcome {
+            Outcome::Agreement {
+                availability: Availability::Held,
+                rounds,
+                ..
+            } => {
+                self.survived += 1;
+                self.agree_rounds.push(rounds);
+            }
+            Outcome::Agreement {
+                availability: Availability::Collapsing { .. },
+                ..
+            } => {
+                self.censored += 1;
+                self.collapsing += 1;
+            }
+            Outcome::NoConvergence { .. } => self.censored += 1,
+            Outcome::Agreement {
+                availability: Availability::Extinct { at },
+                ..
+            }
+            | Outcome::AllUndecided { rounds: at } => self.death_rounds.push(at),
+        }
+    }
+
+    /// No run survived and at least one death was observed; an all-censored cell says nothing.
+    pub fn none_survive(&self) -> bool {
+        self.survived == 0 && !self.death_rounds.is_empty()
+    }
+}

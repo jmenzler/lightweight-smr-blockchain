@@ -1,9 +1,13 @@
 //! Recovery-protocol (Algorithm 6) round step; the between-window pass runs after (f), RNG-free.
 
-use crate::smr::engine::stages::{amplify, apply_all};
+use crate::smr::engine::stages::{amplify, apply_all, failed_step, sn_order_failure};
 use crate::smr::observe::canon_cursor::{CanonCursor, canon_lookup};
-use crate::smr::observe::canonical::{CanonicalOrder, Executed, ForkSignature};
+use crate::smr::observe::canonical::{
+    CanonicalOrder, DigestCache, Executed, ForkSignature, timed_digest,
+};
+use crate::smr::observe::committed::{CommittedOracle, useful_at_round_end};
 use crate::smr::observe::entry_index::EntryIndex;
+use crate::smr::observe::exec_dup::ExecDupOracle;
 use crate::smr::observe::log_index::{LogCounts, LogIndex, log_window_pos};
 use crate::smr::observe::round_metrics::smr_round_metrics;
 use crate::smr::tracker::{
@@ -12,7 +16,9 @@ use crate::smr::tracker::{
 use crate::smr::*;
 use protocol::compact::{Entry, Timed, Triage};
 use protocol::log::Log;
-use protocol::recovery::{Checkpoint, PrefixMismatch, RState, RecoveryNode, RecoveryReply};
+use protocol::recovery::{
+    Checkpoint, PrefixMismatch, RState, RecoveryNode, RecoveryReply, latest_checkpoint_index,
+};
 use protocol::shared_state::ExecutedView;
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
@@ -62,15 +68,22 @@ pub(in crate::smr) struct RecRunState {
     resend_until_acked: bool,
     prefix_mismatch: PrefixMismatch,
     pub(in crate::smr) rows: Vec<RecRoundMetrics>,
+    /// False on a checkpoint-lineage difference (Lemma 6.5), not on a fork of the committed
+    /// sequences, which `safety_ok` reports.
     pub(in crate::smr) fork_ok: bool,
+    pub(in crate::smr) commit_fork_round: Option<usize>,
     pending_rollbacks: u32,
     pending_rollback_depth: u32,
     pending_cp_fork_k: u32,
     pending_max_cp_p_len: u32,
-    prev_len: Vec<u32>,
+    prev_len: Vec<u64>,
     canonical_pos: EntryIndex,
     lineage: BTreeMap<u64, ForkSignature>,
+    /// Per W, the distinct checkpoints some server committed at a window end.
+    committed_signatures: BTreeMap<u64, Vec<ForkSignature>>,
     last_window: Vec<Option<u64>>,
+    /// Lowest checkpoint window `lineage` and `committed_signatures` still answer for.
+    lineage_floor: u64,
 }
 
 impl RecRunState {
@@ -86,6 +99,7 @@ impl RecRunState {
             prefix_mismatch,
             rows: Vec::new(),
             fork_ok: true,
+            commit_fork_round: None,
             pending_rollbacks: 0,
             pending_rollback_depth: 0,
             pending_cp_fork_k: 0,
@@ -93,14 +107,54 @@ impl RecRunState {
             prev_len: vec![0; n],
             canonical_pos: EntryIndex::new(),
             lineage: BTreeMap::new(),
+            committed_signatures: BTreeMap::new(),
             last_window: vec![None; n],
+            lineage_floor: 0,
         }
+    }
+
+    pub(in crate::smr) fn t_window(&self) -> u64 {
+        self.t_window
+    }
+
+    pub(in crate::smr) fn resend_until_acked(&self) -> bool {
+        self.resend_until_acked
+    }
+
+    /// Drops lineage below `lowest`, every node's current checkpoint window. Windows never
+    /// regress per node, so later lookups ask for a window at or above it: an exact key there,
+    /// or the nearest key below one, which is at worst the largest key below `lowest`, kept.
+    pub(in crate::smr) fn prune_lineage_below(&mut self, lowest: u64) {
+        if lowest <= self.lineage_floor {
+            return;
+        }
+        let keep_from = self
+            .lineage
+            .range(..lowest)
+            .next_back()
+            .map_or(lowest, |(&w, _)| w);
+        self.lineage = self.lineage.split_off(&keep_from);
+        self.committed_signatures = self.committed_signatures.split_off(&lowest);
+        self.lineage_floor = lowest;
+    }
+
+    fn assert_above_lineage_floor(&self, w: u64) {
+        assert!(
+            w >= self.lineage_floor,
+            "checkpoint window {w} is below the pruned lineage floor {}",
+            self.lineage_floor
+        );
     }
 
     pub(in crate::smr) fn heap_bytes_rows(&self) -> u64 {
         (self.rows.capacity() * size_of::<RecRoundMetrics>()
-            + self.prev_len.capacity() * size_of::<u32>()
+            + self.prev_len.capacity() * size_of::<u64>()
             + self.last_window.capacity() * size_of::<Option<u64>>()) as u64
+    }
+
+    #[cfg(test)]
+    pub(in crate::smr) fn canonical_pos_resident(&self) -> usize {
+        self.canonical_pos.resident()
     }
 
     pub(in crate::smr) fn heap_bytes_indexes(&self) -> u64 {
@@ -108,18 +162,53 @@ impl RecRunState {
     }
 
     pub(in crate::smr) fn heap_bytes_lineage(&self) -> u64 {
-        ((self.lineage.len() * (size_of::<u64>() + size_of::<ForkSignature>())) as u64 * 3) / 2
+        let committed: usize = self
+            .committed_signatures
+            .values()
+            .map(|v| size_of::<u64>() + v.capacity() * size_of::<ForkSignature>())
+            .sum();
+        (((self.lineage.len() * (size_of::<u64>() + size_of::<ForkSignature>()) + committed)
+            as u64)
+            * 3)
+            / 2
     }
 
-    fn check_growth(&mut self, node: usize, executed_len: usize, round: usize) {
-        assert!(
-            executed_len >= self.prev_len[node] as usize,
-            "driver bug or split brain: node {node} executed sequence regressed in round {round}"
-        );
-        self.prev_len[node] = executed_len as u32;
+    /// Lemma 6.9: a server's executed length never shrinks; a shrink is returned to be recorded.
+    fn check_growth(&mut self, node: usize, executed_len: u64) -> Result<(), RecoveryViolation> {
+        let previous_len = self.prev_len[node];
+        self.prev_len[node] = executed_len;
+        if executed_len < previous_len {
+            return Err(RecoveryViolation::ExecutedRegression {
+                previous_len,
+                len: executed_len,
+            });
+        }
+        Ok(())
     }
 
-    fn check_lineage(&mut self, node: usize, checkpoint: &Checkpoint, canon: &CanonicalOrder) {
+    /// Growth and lineage over every node; the first shrink, to be recorded. Runs before the
+    /// double-execution oracle, whose per-server slots assume no server shrank.
+    fn check_nodes<'a>(
+        &mut self,
+        nodes: &'a [RecoveryNode],
+        digests: &mut DigestCache<'a>,
+    ) -> Option<(usize, RecoveryViolation)> {
+        let mut regression = None;
+        for (i, nd) in nodes.iter().enumerate() {
+            if let Err(violation) = self.check_growth(i, nd.shared_state().logical_len()) {
+                regression.get_or_insert((i, violation));
+            }
+            self.check_lineage(i, nd.checkpoint(), digests);
+        }
+        regression
+    }
+
+    fn check_lineage<'a>(
+        &mut self,
+        node: usize,
+        checkpoint: &'a Checkpoint,
+        digests: &mut DigestCache<'a>,
+    ) {
         // A checkpoint's window strictly rises on any change, so an unchanged window is the same checkpoint.
         let last = self.last_window[node];
         assert!(
@@ -130,7 +219,8 @@ impl RecRunState {
             return;
         }
         self.last_window[node] = Some(checkpoint.w);
-        let signature = ForkSignature::of(canon, checkpoint);
+        self.assert_above_lineage_floor(checkpoint.w);
+        let signature = digests.signature(checkpoint);
         match self.lineage.get(&checkpoint.w) {
             Some(mark) => {
                 if *mark != signature {
@@ -144,7 +234,7 @@ impl RecRunState {
                         .next_back()
                         .is_some_and(|(_, prev)| {
                             !signature.extends(
-                                canon,
+                                digests.canon(),
                                 checkpoint,
                                 prev.executed_len(),
                                 prev.executed(),
@@ -157,30 +247,138 @@ impl RecRunState {
             }
         }
     }
-}
 
-// Ties go to the LAST, matching the node's `max_by_key`.
-fn last_max_window(replies: &[RecoveryReply]) -> usize {
-    let mut best = 0;
-    for (j, rep) in replies.iter().enumerate() {
-        if rep.c_j.w >= replies[best].c_j.w {
-            best = j;
+    /// Lemma 6.7 on the commit path: `checkpoint` is committed at this window end. Dates the
+    /// first window end at which its W holds a second distinct committed checkpoint.
+    fn record_commit<'a>(
+        &mut self,
+        checkpoint: &'a Checkpoint,
+        digests: &mut DigestCache<'a>,
+        round: usize,
+    ) {
+        self.assert_above_lineage_floor(checkpoint.w);
+        let signature = digests.signature(checkpoint);
+        let seen = self.committed_signatures.entry(checkpoint.w).or_default();
+        if !seen.contains(&signature) {
+            seen.push(signature);
+            if seen.len() == 2 {
+                self.commit_fork_round.get_or_insert(round);
+            }
         }
     }
-    best
 }
 
-fn recovery_client_triage(node: &RecoveryNode, command: &ClientCommand) -> Triage {
-    let committed = node.checkpoint().s.sn_get(command.client);
-    if committed == Some(command.sn) {
-        Triage::AckCommitted
-    } else if command.sn > 0
-        && committed.unwrap_or(0).checked_add(1) == Some(command.sn)
-        && node.wants_amplify(command)
-    {
-        Triage::Amplify
-    } else {
-        Triage::Ignore
+/// p. 6, commands are unique: a double execution is one server's executed sequence holding a
+/// (client, sn) twice. `replaced[i]` marks a server whose S_i may have been swapped this step.
+fn observe_exec_dup(
+    exec_dup: &mut ExecDupOracle,
+    prefix_ok: bool,
+    canonical: &CanonicalOrder,
+    nodes: &[RecoveryNode],
+    replaced: &[bool],
+    round: usize,
+) {
+    if prefix_ok {
+        exec_dup.observe_canonical(canonical.start(), canonical.retained(), round);
+    } else if exec_dup.tripped_round().is_none() {
+        let executed: Vec<ExecutedView<'_>> = nodes
+            .iter()
+            .map(|nd| nd.shared_state().executed())
+            .collect();
+        exec_dup.observe_nodes(&executed, replaced, round);
+    }
+}
+
+fn observe_committed(
+    committed: &mut CommittedOracle,
+    canonical: &CanonicalOrder,
+    nodes: &[RecoveryNode],
+    round: usize,
+) {
+    let executed: Vec<ExecutedView<'_>> = nodes
+        .iter()
+        .map(|nd| nd.shared_state().executed())
+        .collect();
+    committed.observe(&executed, canonical, round);
+}
+
+/// Whether the between-window steps would commit C_i's P on this node: it does not skip the
+/// boundary, P ≠ ⊥, and it rolls back (R_i = reset, L_i := P) or holds a log P prefixes.
+fn commits_at_window_end(nd: &RecoveryNode) -> bool {
+    !nd.stale_checkpoint()
+        && nd.checkpoint().p.is_some()
+        && (nd.reset_state() == RState::Reset || nd.log_seq().is_some())
+        && nd.validate_boundary().is_ok()
+}
+
+/// A shrunk executed sequence (Lemma 6.9) ends the run as a recorded failure in this round.
+fn regression_failure(node: usize, violation: RecoveryViolation, round: usize) -> RunFailure {
+    RunFailure {
+        node: node as u32,
+        attempted_round: round,
+        completed_round: round - 1,
+        observed_round: round,
+        phase: RunFailurePhase::ExecutedRegression,
+        violation,
+    }
+}
+
+/// The report fields are u32; a count past that must stop the run rather than wrap.
+fn report_u32(value: u64, what: &str) -> u32 {
+    u32::try_from(value).unwrap_or_else(|_| panic!("{what} {value} exceeds the u32 report field"))
+}
+
+/// The checkpoints at the largest W after a boundary, classed twice.
+struct NewestClasses {
+    /// Distinct by fork signature, P read as commands (Lemma 6.5/6.7).
+    fork_k: u32,
+    max_pre_len: u32,
+    /// Interning classes, P read with its stamps: an adopted P' becomes L_i, stamps and all,
+    /// and the stamps drive aging. `member_of[i]` names node i's class unless it represents one.
+    representatives: Vec<Arc<Checkpoint>>,
+    member_of: Vec<Option<usize>>,
+}
+
+// Keyed by digests, not `Checkpoint::eq`, whose equality asserts equal offsets.
+fn newest_window_classes<'a>(
+    nodes: &'a [RecoveryNode],
+    digests: &mut DigestCache<'a>,
+) -> NewestClasses {
+    let max_w = nodes.iter().map(|nd| nd.checkpoint().w).max().unwrap_or(0);
+    let mut distinct: Vec<ForkSignature> = Vec::new();
+    let mut intern_keys: Vec<(ForkSignature, Option<u64>)> = Vec::new();
+    let mut representatives: Vec<Arc<Checkpoint>> = Vec::new();
+    let mut member_of: Vec<Option<usize>> = vec![None; nodes.len()];
+    for (i, nd) in nodes.iter().enumerate() {
+        let cp = nd.checkpoint();
+        if cp.w != max_w {
+            continue;
+        }
+        let signature = digests.signature(cp);
+        if !distinct.contains(&signature) {
+            distinct.push(signature);
+        }
+        let key = (signature, cp.p.as_deref().map(timed_digest));
+        match intern_keys.iter().position(|k| *k == key) {
+            Some(class) => member_of[i] = Some(class),
+            None => {
+                intern_keys.push(key);
+                representatives.push(nd.checkpoint_shared());
+            }
+        }
+    }
+    NewestClasses {
+        fork_k: distinct.len() as u32,
+        max_pre_len: report_u32(
+            distinct
+                .iter()
+                .filter_map(ForkSignature::pre_len)
+                .max()
+                .unwrap_or(0) as u64,
+            "checkpoint prefix length",
+        ),
+        representatives,
+        member_of,
     }
 }
 
@@ -209,10 +407,13 @@ impl SmrState {
         #[cfg(debug_assertions)]
         let snap_cps: Vec<_> = nodes.iter().map(|nd| nd.checkpoint().clone()).collect();
         let snap_rs: Vec<RState> = nodes.iter().map(RecoveryNode::reset_state).collect();
-        let useful: Vec<bool> = (0..n).map(|i| snap_logs[i].is_some() && !mask[i]).collect();
-        let useful_total = useful.iter().filter(|&&u| u).count() as u32;
+        // p. 19 useful at the round start: the row's `useful` count and the census read it, the Def 1.4
+        // counters read `useful_at_round_end`.
+        let useful_at_start: Vec<bool> =
+            (0..n).map(|i| snap_logs[i].is_some() && !mask[i]).collect();
+        let useful_total = useful_at_start.iter().filter(|&&u| u).count() as u32;
 
-        // (b) client stage: resend until §6-committed, or until acked in ack mode
+        // (b) client stage: servers triage by Alg 5's sn rule; resend until acked, or until §6-committed everywhere
         let ack_mode = self.rec.as_ref().is_some_and(|r| r.resend_until_acked);
         let mut delivered: Vec<(usize, ClientCommand)> = Vec::new();
         for &ti in &self.client_order {
@@ -233,14 +434,21 @@ impl SmrState {
                     &snap_cps[target],
                     "stage (b) read post-step state"
                 );
+                if !mask[target] {
+                    t.injected_round.get_or_insert(round);
+                }
                 let outcome = if mask[target] {
                     AttemptOutcome::TargetBlocked
                 } else if snap_logs[target].is_none() {
                     AttemptOutcome::TargetBot
-                } else if ack_mode {
-                    match recovery_client_triage(&nodes[target], &t.cc) {
+                } else {
+                    match nodes[target].on_client_command(&t.cc) {
                         Triage::AckCommitted => {
-                            t.committed_ack_round = Some(round);
+                            // The ack client is done here (p. 25); its slot is drawable next round.
+                            if ack_mode && let Some(pool) = &mut self.pool {
+                                pool.free(t.client);
+                            }
+                            t.committed_ack_round.get_or_insert(round);
                             AttemptOutcome::AckCommitted
                         }
                         Triage::Amplify => {
@@ -252,12 +460,6 @@ impl SmrState {
                         }
                         Triage::Ignore => AttemptOutcome::Ignored,
                     }
-                } else {
-                    if t.delivered_round.is_none() {
-                        t.delivered_round = Some(round);
-                    }
-                    delivered.push((target, t.cc));
-                    AttemptOutcome::Delivered
                 };
                 t.attempts.push(DeliveryAttempt {
                     round,
@@ -324,7 +526,7 @@ impl SmrState {
                 continue;
             }
             if nodes[i].checkpoint().w > snap_cp_windows[i] {
-                adoptions.push((sources[i][last_max_window(replies)], i as u32));
+                adoptions.push((sources[i][latest_checkpoint_index(replies)], i as u32));
             }
             if snap_rs[i] != RState::NoReset
                 && nodes[i].reset_state() == RState::NoReset
@@ -355,7 +557,7 @@ impl SmrState {
         self.metrics.push(round_metrics);
 
         // Read before this round's check extends it.
-        let pos_floor = self.checker.canonical_len() as u32;
+        let pos_floor = report_u32(self.checker.canonical_len() as u64, "canonical length");
 
         if self.safety_ok {
             let executed: Vec<ExecutedView<'_>> = nodes
@@ -368,17 +570,33 @@ impl SmrState {
         }
         let cursors_exact = self.safety_ok;
         let canonical = self.checker.canonical();
-        if rec
-            .canonical_pos
-            .extend_unique(canonical.start(), canonical.retained())
-        {
-            self.exec_dup.trip_at(round);
+        // Pre-mint checkpoints: this round's adoptions here, the committing ones at the boundary.
+        let mut digests = DigestCache::new(canonical);
+        let regression = rec.check_nodes(nodes, &mut digests);
+        // Alg 6 swaps S_i for a peer's only on adopting a newer checkpoint.
+        let adopted: Vec<bool> = nodes
+            .iter()
+            .zip(&snap_cp_windows)
+            .map(|(nd, &w)| nd.checkpoint().w > w)
+            .collect();
+        if regression.is_none() {
+            observe_exec_dup(
+                &mut self.exec_dup,
+                self.safety_ok,
+                canonical,
+                nodes,
+                &adopted,
+                round,
+            );
         }
+        observe_committed(&mut self.committed, canonical, nodes, round);
+        rec.canonical_pos
+            .extend_first(canonical.start(), canonical.retained());
         let canon_index = &rec.canonical_pos;
 
         let observe_spread = self.observe_spread;
         let useful_counts = observe_spread.then(|| {
-            LogCounts::build(snap_logs.iter().zip(&useful).map(|(log, &u)| {
+            LogCounts::build(snap_logs.iter().zip(&useful_at_start).map(|(log, &u)| {
                 if u {
                     log.as_ref().map(|l| &**l.entries())
                 } else {
@@ -415,6 +633,7 @@ impl SmrState {
                     .canon_cursor
                     .get_or_insert_with(|| CanonCursor::new(pos_floor));
                 live_floor = Some(live_floor.unwrap_or(u32::MAX).min(cursor.floor()));
+                let cursor_floor = u64::from(cursor.floor());
                 if observe_spread {
                     let useful_holders = useful_counts
                         .as_ref()
@@ -422,7 +641,9 @@ impl SmrState {
                         .count(&entry);
                     let entry_holders = post_index.entry_holders(&entry);
                     let mut visits = 0usize;
-                    let hit = cursors_exact.then(|| canon_index.get(&entry)).flatten();
+                    let hit = cursors_exact
+                        .then(|| canon_index.get_from(&entry, cursor_floor))
+                        .flatten();
                     let (pos_min, pos_med, pos_max) = pos_stats(
                         nodes
                             .iter()
@@ -514,18 +735,14 @@ impl SmrState {
             rollback_depth: std::mem::take(&mut rec.pending_rollback_depth),
             cp_fork_k: std::mem::take(&mut rec.pending_cp_fork_k),
             max_cp_p_len: std::mem::take(&mut rec.pending_max_cp_p_len),
+            useful_agree: None,
         });
-
-        let canonical = self.checker.canonical();
 
         for (i, nd) in nodes.iter().enumerate() {
             debug_assert!(
                 nd.reset_state() != RState::Bot || nd.log_seq().is_none(),
                 "node {i}: Lemma 6.2 violated in round {round}"
             );
-            // check_growth must fire first and stay a hard assert in every build profile.
-            rec.check_growth(i, nd.shared_state().logical_len() as usize, round);
-            rec.check_lineage(i, nd.checkpoint(), canonical);
         }
 
         let glances = post_logs
@@ -533,12 +750,31 @@ impl SmrState {
             .zip(&executed_lens)
             .zip(nodes.iter())
             .map(|((log, &ex), nd)| NodeGlance {
-                log_len: log.map(|l| l.len() as u32),
-                executed_len: ex as u32,
+                log_len: log.map(|l| report_u32(l.len() as u64, "log length")),
+                executed_len: report_u32(ex as u64, "executed length"),
                 r: Some(r_code(nd.reset_state())),
             })
             .collect();
         drop(post_logs);
+        let rec_info = RecStepInfo {
+            adoptions,
+            reset_votes,
+        };
+
+        if let Some((node, violation)) = regression {
+            let failure = regression_failure(node, violation, round);
+            let status = failed_step(
+                &failure,
+                round_metrics,
+                mask,
+                glances,
+                spreading,
+                Some(rec_info),
+            );
+            self.failure = Some(failure);
+            self.failed_status = Some(status.clone());
+            return status;
+        }
 
         // Between-window pass: RNG-free; all-⊥ is expected mid-surge, so recovery never reads Dead.
         #[cfg(test)]
@@ -555,34 +791,40 @@ impl SmrState {
                     .collect(),
             );
         }
-        if (round as u64).is_multiple_of(rec.t_window)
-            && rec.prefix_mismatch == PrefixMismatch::Abort
-            && let Some((node, violation)) = nodes
-                .iter()
-                .enumerate()
-                .find_map(|(node, nd)| nd.validate_boundary().err().map(|v| (node, v)))
-        {
-            let failure = RecoveryFailure {
+        let boundary = (round as u64).is_multiple_of(rec.t_window);
+        // Lemma 6.7 on the commit path, which the node-local check below cannot see for a
+        // rollback: dated only, so Abort runs keep the paper's stopping rule.
+        if boundary {
+            for nd in nodes.iter().filter(|nd| commits_at_window_end(nd)) {
+                rec.record_commit(nd.checkpoint(), &mut digests, round);
+            }
+        }
+        let abort = (boundary && rec.prefix_mismatch == PrefixMismatch::Abort)
+            .then(|| {
+                nodes.iter().enumerate().find_map(|(node, nd)| {
+                    nd.validate_boundary()
+                        .err()
+                        .map(|v| (node, RecoveryViolation::Prefix(v)))
+                })
+            })
+            .flatten();
+        if let Some((node, violation)) = abort {
+            let failure = RunFailure {
                 node: node as u32,
                 attempted_round: round,
                 completed_round: round - 1,
                 observed_round: round,
-                phase: RecoveryFailurePhase::BoundaryPreflight,
+                phase: RunFailurePhase::BoundaryPreflight,
                 violation,
             };
-            let status = SmrStepStatus {
-                round,
-                metrics: round_metrics,
-                blocked: blocked_ids(mask),
-                nodes: glances,
+            let status = failed_step(
+                &failure,
+                round_metrics,
+                mask,
+                glances,
                 spreading,
-                dead: None,
-                failure: Some(failure.clone()),
-                rec: Some(RecStepInfo {
-                    adoptions,
-                    reset_votes,
-                }),
-            };
+                Some(rec_info),
+            );
             self.failure = Some(failure);
             self.failed_status = Some(status.clone());
             return status;
@@ -594,10 +836,16 @@ impl SmrState {
         }
         if (round as u64).is_multiple_of(rec.t_window) {
             let next_window = round as u64 / rec.t_window;
+            // A rollback swaps S_i for C_i's S (Alg 6 "If R_i = reset").
+            let rolled_back: Vec<bool> = nodes
+                .iter()
+                .map(|nd| nd.reset_state() == RState::Reset)
+                .collect();
             // Read before `end_window` re-mints the checkpoint window.
+            // A stale node skips the boundary (DEV-3) and does not roll back, whatever its R_i.
             let rolling = nodes
                 .iter()
-                .filter(|nd| nd.reset_state() == RState::Reset)
+                .filter(|nd| nd.reset_state() == RState::Reset && !nd.stale_checkpoint())
                 .map(|nd| nd.checkpoint().w);
             rec.pending_rollbacks = 0;
             rec.pending_rollback_depth = 0;
@@ -605,7 +853,7 @@ impl SmrState {
                 rec.pending_rollbacks += 1;
                 rec.pending_rollback_depth = rec
                     .pending_rollback_depth
-                    .max((next_window - cp_window) as u32);
+                    .max(report_u32(next_window - cp_window, "rollback depth"));
             }
             // Per-class mint keyed sound-over-complete: a missed equality only costs memory, never correctness.
             let mut keyed: HashMap<(usize, u64, usize), (usize, Vec<Timed>)> = HashMap::new();
@@ -618,7 +866,7 @@ impl SmrState {
                 };
                 let key = (
                     std::ptr::from_ref(nodes[i].checkpoint()) as usize,
-                    crate::smr::observe::canonical::timed_digest(&pre),
+                    timed_digest(&pre),
                     pre.len(),
                 );
                 KEY_PROBES.fetch_add(1, Ordering::Relaxed);
@@ -669,9 +917,34 @@ impl SmrState {
                         minted[i] = Some(nodes[i].checkpoint_shared());
                     }
                 }
+                // A refusing representative minted nothing its class members could hold.
+                if let Some(gap) = nodes[i].sn_order_violation() {
+                    let failure = sn_order_failure(i, gap, round);
+                    let status = failed_step(
+                        &failure,
+                        round_metrics,
+                        mask,
+                        glances,
+                        spreading,
+                        Some(rec_info),
+                    );
+                    self.failure = Some(failure);
+                    self.failed_status = Some(status.clone());
+                    return status;
+                }
             }
 
-            // Absorb the boundary-committed suffix before anything reads a position or digest against it.
+            // p. 33: a window ends before the between-window steps, so this round's verdicts
+            // cover what the boundary committed; anything reading positions comes after.
+            if self.safety_ok {
+                let executed: Vec<ExecutedView<'_>> = nodes
+                    .iter()
+                    .map(|nd| nd.shared_state().executed())
+                    .collect();
+                if !self.checker.check_round(&executed, self.frontier) {
+                    self.safety_ok = false;
+                }
+            }
             let longest = nodes
                 .iter()
                 .map(|nd| nd.shared_state().executed())
@@ -679,59 +952,58 @@ impl SmrState {
                 .expect("at least one node");
             self.checker.absorb(longest);
             let canonical = self.checker.canonical();
-            let verified = canonical.len();
-            // Under SkipBoundary a minority P that prefixes its own log commits; the safety latch records that.
-            #[cfg(debug_assertions)]
-            if self.safety_ok && rec.prefix_mismatch == PrefixMismatch::Abort {
-                let inconsistent = nodes.iter().position(|nd| {
+            let mut digests = DigestCache::new(canonical);
+            // check_round compares only what grew since a node's last check; the digest covers
+            // its whole retained suffix, which the lean pass is about to forget.
+            if self.safety_ok
+                && !nodes.iter().all(|nd| {
                     let st = nd.shared_state();
-                    crate::smr::observe::canonical::state_digest(canonical, st)
-                        != canonical.digest_at(st.logical_len())
-                });
-                assert!(
-                    inconsistent.is_none(),
-                    "round {round}: the boundary pass left inconsistent executed \
-                     prefixes (node {})",
-                    inconsistent.unwrap_or(0)
+                    digests.state(st) == canonical.digest_at(st.logical_len())
+                })
+            {
+                self.safety_ok = false;
+            }
+            let verified = canonical.len();
+            let regression = rec.check_nodes(nodes, &mut digests);
+            if regression.is_none() {
+                observe_exec_dup(
+                    &mut self.exec_dup,
+                    self.safety_ok,
+                    canonical,
+                    nodes,
+                    &rolled_back,
+                    round,
                 );
             }
-
-            let max_w = nodes.iter().map(|nd| nd.checkpoint().w).max().unwrap_or(0);
-            // Distinct by fork signature, not `Checkpoint::eq`, whose equality asserts equal offsets.
-            let mut distinct: Vec<ForkSignature> = Vec::new();
-            let mut representatives: Vec<Arc<Checkpoint>> = Vec::new();
-            let mut member_of: Vec<Option<usize>> = vec![None; nodes.len()];
-            for (i, nd) in nodes.iter().enumerate() {
-                let cp = nd.checkpoint();
-                if cp.w != max_w {
-                    continue;
-                }
-                let signature = ForkSignature::of(canonical, cp);
-                match distinct.iter().position(|s| *s == signature) {
-                    Some(class) => member_of[i] = Some(class),
-                    None => {
-                        distinct.push(signature);
-                        representatives.push(nd.checkpoint_shared());
-                    }
-                }
+            observe_committed(&mut self.committed, canonical, nodes, round);
+            if let Some((node, violation)) = regression {
+                let failure = regression_failure(node, violation, round);
+                let status = failed_step(
+                    &failure,
+                    round_metrics,
+                    mask,
+                    glances,
+                    spreading,
+                    Some(rec_info),
+                );
+                self.failure = Some(failure);
+                self.failed_status = Some(status.clone());
+                return status;
             }
-            rec.pending_cp_fork_k = distinct.len() as u32;
-            rec.pending_max_cp_p_len = distinct
-                .iter()
-                .filter_map(ForkSignature::pre_len)
-                .max()
-                .unwrap_or(0) as u32;
 
+            let classes = newest_window_classes(nodes, &mut digests);
+            rec.pending_cp_fork_k = classes.fork_k;
+            rec.pending_max_cp_p_len = classes.max_pre_len;
+
+            // p. 36: a command is committed once it leaves P between windows and every useful
+            // server has executed it, so the landmark is dated at a boundary.
             let pending = self.trackers[live_from..]
                 .iter()
                 .any(|t| t.executed_round.is_none());
+            let release_line = self.release_line;
             let executed_pos = if self.safety_ok && pending {
-                if rec
-                    .canonical_pos
-                    .extend_unique(canonical.start(), canonical.retained())
-                {
-                    self.exec_dup.trip_at(round);
-                }
+                rec.canonical_pos
+                    .extend_first(canonical.start(), canonical.retained());
                 Some(&rec.canonical_pos)
             } else {
                 None
@@ -744,7 +1016,12 @@ impl SmrState {
                 let mut any_useful = false;
                 let all_executed = match executed_pos {
                     Some(pos) => {
-                        let at = pos.get(&entry);
+                        // An open cursor's floor bounds the release line, so it is a valid floor.
+                        let floor = t
+                            .canon_cursor
+                            .as_ref()
+                            .map_or(release_line, |c| u64::from(c.floor()));
+                        let at = pos.get_from(&entry, floor);
                         nodes.iter().all(|nd| {
                             if nd.log_seq().is_none() {
                                 return true;
@@ -768,7 +1045,8 @@ impl SmrState {
                 };
                 if any_useful && all_executed {
                     t.executed_round = Some(round);
-                    if let Some(pool) = &mut self.pool {
+                    // The non-ack client stops on this latch, so its slot frees with it.
+                    if !ack_mode && let Some(pool) = &mut self.pool {
                         pool.free(t.client);
                     }
                 }
@@ -797,16 +1075,13 @@ impl SmrState {
                     );
                     panic!(
                         "driver bug: node {i} holds {} executed commands at round \
-                         {round}, below the observer release line {entering}. Box-legally \
-                         unreachable: adoption only ever copies a checkpoint already \
-                         held in the population and no node's checkpoint length ever \
-                         regresses (Lemma 6.9 monotonicity), so the minimum over them \
-                         — which this line is derived from — is monotone too, and no \
-                         restored state can dip below it. A firing therefore means the \
-                         OBSERVER released a position a node can still re-present. It \
-                         does NOT mean the protocol misbehaved: an executed-length \
-                         regression is caught earlier in the same round, in both \
-                         assertion configurations, by check_growth (ABORT-MONO).\n{report}",
+                         {round}, below the observer release line {entering}. The \
+                         release line is the minimum executed length over the nodes, and \
+                         the growth check above ends the run as a recorded \
+                         ExecutedRegression the moment any node's length shrinks, so that \
+                         minimum is monotone and no restored state can dip below it. A \
+                         firing therefore means the OBSERVER released a position a node \
+                         can still re-present. It does NOT mean the protocol misbehaved.\n{report}",
                         nodes[i].shared_state().logical_len()
                     );
                 }
@@ -836,47 +1111,41 @@ impl SmrState {
                 // Spill before anything forgets: afterwards it is the only record of the committed stream.
                 if self.spill.is_none() && self.spill_allowed {
                     let (_, commit, dirty) = crate::runlog::provenance();
-                    self.spill = Some(
-                        crate::smr::observe::spill::SpillWriter::create(
-                            crate::smr::observe::spill::SpillHeader {
-                                commit,
-                                dirty,
-                                seed: self.seed,
-                                n,
-                                t_window: rec.t_window,
-                                proto: "recovery".into(),
-                            },
-                        )
-                        .expect("spill create failed"),
+                    let created = crate::smr::observe::spill::SpillWriter::create(
+                        crate::smr::observe::spill::SpillHeader {
+                            commit,
+                            dirty,
+                            seed: self.seed,
+                            n,
+                            t_window: rec.t_window,
+                            proto: "recovery".into(),
+                        },
+                        self.scenario_tag.as_deref(),
                     );
+                    self.spill = Some(created.unwrap_or_else(|cause| {
+                        spill_io_failure("create", self.seed, None, &cause)
+                    }));
                 }
                 if let Some(spill) = &mut self.spill {
-                    let consistent = nodes.iter().all(|nd| {
-                        let st = nd.shared_state();
-                        crate::smr::observe::canonical::state_digest(canonical, st)
-                            == canonical.digest_at(st.logical_len())
-                    });
-                    if consistent {
-                        spill
-                            .boundary(
-                                canonical,
-                                next_window,
-                                round,
-                                checkpoint_lens,
-                                nodes
-                                    .iter()
-                                    .map(|nd| nd.shared_state().logical_len())
-                                    .collect(),
-                                release,
-                            )
-                            .expect("spill boundary write failed");
-                    } else {
-                        spill.mark_diverged();
+                    let written = spill.boundary(
+                        canonical,
+                        next_window,
+                        round,
+                        checkpoint_lens,
+                        nodes
+                            .iter()
+                            .map(|nd| nd.shared_state().logical_len())
+                            .collect(),
+                        release,
+                    );
+                    if let Err(cause) = written {
+                        spill_io_failure("boundary write", self.seed, Some(spill.path()), &cause);
                     }
                 }
 
                 self.release_line = release;
                 self.checker.release_to(release);
+                rec.canonical_pos.release_to(release);
 
                 let mut frontier = self.frontier;
                 for node in nodes.iter_mut() {
@@ -908,12 +1177,23 @@ impl SmrState {
             // Interning runs last and only while the safety latch holds.
             if self.safety_ok {
                 for (i, node) in nodes.iter_mut().enumerate() {
-                    if let Some(class) = member_of[i] {
-                        node.share_checkpoint(&representatives[class]);
+                    if let Some(class) = classes.member_of[i] {
+                        node.share_checkpoint(&classes.representatives[class]);
                     }
                 }
             }
         }
+
+        let useful_end = useful_at_round_end(nodes.iter().map(|nd| nd.log_seq().is_some()), mask);
+        let agreement = self.committed.check_strong_safety(
+            &useful_end,
+            round,
+            (round as u64).is_multiple_of(rec.t_window),
+        );
+        rec.rows
+            .last_mut()
+            .expect("this round's row is pushed")
+            .useful_agree = agreement;
 
         SmrStepStatus {
             round,
@@ -923,10 +1203,7 @@ impl SmrState {
             spreading,
             dead: None,
             failure: None,
-            rec: Some(RecStepInfo {
-                adoptions,
-                reset_votes,
-            }),
+            rec: Some(rec_info),
         }
     }
 }

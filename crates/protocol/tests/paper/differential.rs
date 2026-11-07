@@ -4,16 +4,21 @@
 //! sequence numbers), reset state and checkpoint must equal the reference's, and
 //! the production log's carried sort index must still sort its entries.
 //!
-//! Replies are built from the real node states, so the production merge sees
-//! logs that share `Arc` chunks exactly as it does in the simulator. Each world
+//! Replies come from the production nodes' own `answer`, so the production merge sees
+//! logs that share `Arc` chunks exactly as it does in the simulator.
+//!
+//! The reference makes the production code's choice wherever the paper leaves one open, so
+//! agreement is a refactoring guard (chunking, indexing, sharing), not independent evidence
+//! for those choices; the hand-derived tests next to each box pin them. Each world
 //! counts how often the cases the box is most likely to get wrong occur, and
 //! fails if a case stops being reached.
 
-use crate::reference::{self as spec, CompactServer, RecoveryServer};
+use crate::reference::{self as spec, CompactServer, MergePolicy, RecoveryServer};
 use protocol::Config;
 use protocol::chunked::ChunkSeq;
 use protocol::compact::{ClientCommand, CompactNode, CompactReply, SharedState, Timed, Triage};
 use protocol::log::Log;
+use protocol::merge::{StampTie, UnionStamp};
 use protocol::recovery::{Checkpoint, RState, RecoveryNode, RecoveryReply};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -106,17 +111,22 @@ struct CompactCoverage {
     nulled_duplicate: u64,
     shared_chunks: u64,
     executed_commands: u64,
+    drawn_logs_with_repeated_entries: u64,
 }
 
 /// An equivocating client's second command for the same sequence number.
 const EQUIVOCATE: u64 = 1 << 32;
 
-fn compact_world(seed: u64, cov: &mut CompactCoverage) {
+fn compact_world(seed: u64, policy: MergePolicy, cov: &mut CompactCoverage) {
     let cfg = config(seed);
     let t_commit = 8;
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
-    let mut prod: Vec<CompactNode> = (0..N).map(|_| CompactNode::new(cfg, t_commit)).collect();
-    let mut refs: Vec<CompactServer> = (0..N).map(|_| CompactServer::new(t_commit)).collect();
+    let mut prod: Vec<CompactNode> = (0..N)
+        .map(|_| CompactNode::new(cfg, t_commit).with_merge_policy(policy.stamp, policy.union))
+        .collect();
+    let mut refs: Vec<CompactServer> = (0..N)
+        .map(|_| CompactServer::new(t_commit).with_policy(policy))
+        .collect();
     let mut clients: Vec<ClientCommand> = (0..24)
         .map(|c| ClientCommand {
             client: c,
@@ -176,13 +186,15 @@ fn compact_world(seed: u64, cov: &mut CompactCoverage) {
                 if mask[i] || mask[j] {
                     continue;
                 }
-                match (prod[j].log_perm_arc(), refs[j].answer(b_i)) {
-                    (Some(log), Some(reply)) => {
-                        prod_in[i].push(CompactReply {
-                            l_j: log.clone(),
-                            s_j: b_i.then(|| Arc::clone(prod[j].state_arc())),
-                        });
-                        ref_in[i].push(reply);
+                match (prod[j].answer(b_i), refs[j].answer(b_i)) {
+                    (Some(reply), Some(expected)) => {
+                        assert_eq!(
+                            (reply.s_j.is_some(), expected.s_j.is_some()),
+                            (b_i, b_i),
+                            "seed {seed} round {round}: S_{j} is attached iff b_{i} = 1"
+                        );
+                        prod_in[i].push(reply);
+                        ref_in[i].push(expected);
                     }
                     (None, None) => {}
                     _ => panic!("seed {seed} round {round}: node {j} replies on one side only"),
@@ -207,7 +219,15 @@ fn compact_world(seed: u64, cov: &mut CompactCoverage) {
                     cov.step4_state_adopted += u64::from(b_i);
                     let logs: Vec<Vec<Timed>> =
                         m.iter().map(|&j| ref_in[i][j].l_j.clone()).collect();
-                    let merged = spec::median_merge(&logs, &appends[i]);
+                    cov.drawn_logs_with_repeated_entries += logs
+                        .iter()
+                        .filter(|l| {
+                            l.iter()
+                                .enumerate()
+                                .any(|(a, x)| l[..a].iter().any(|y| y.entry == x.entry))
+                        })
+                        .count() as u64;
+                    let merged = spec::median_merge_with(&logs, &appends[i], policy);
                     cov.nulled_duplicate += u64::from(!spec::conflicting(&merged).is_empty());
                     let drawn: Vec<&ChunkSeq<Timed>> =
                         m.iter().map(|&j| &**prod_in[i][j].l_j.entries()).collect();
@@ -235,7 +255,7 @@ fn compact_world(seed: u64, cov: &mut CompactCoverage) {
 fn compact_nodes_match_the_reference_every_round() {
     let mut cov = CompactCoverage::default();
     for seed in 0..SEEDS {
-        compact_world(seed, &mut cov);
+        compact_world(seed, MergePolicy::default(), &mut cov);
     }
     eprintln!("compact coverage over {SEEDS} seeds x {ROUNDS} rounds x {N} nodes: {cov:?}");
     assert!(cov.below_ell_with_reply >= 100, "{cov:?}");
@@ -244,6 +264,27 @@ fn compact_nodes_match_the_reference_every_round() {
     assert!(cov.nulled_duplicate >= 100, "{cov:?}");
     assert!(cov.shared_chunks >= 1000, "{cov:?}");
     assert!(cov.executed_commands >= 10_000, "{cov:?}");
+}
+
+/// The non-default merge readings run in the experiments' loads, so each gets the same demand as the default.
+#[test]
+fn compact_nodes_match_the_reference_under_every_merge_policy() {
+    for (stamp, union) in [
+        (StampTie::IncludeRound, UnionStamp::LastSighting),
+        (StampTie::CommandsOnly, UnionStamp::FirstSighting),
+        (StampTie::CommandsOnly, UnionStamp::LastSighting),
+    ] {
+        let mut cov = CompactCoverage::default();
+        for seed in 0..SEEDS / 2 {
+            compact_world(seed, MergePolicy { stamp, union }, &mut cov);
+        }
+        eprintln!("{stamp:?}/{union:?}: {cov:?}");
+        assert!(cov.nulled_duplicate >= 50, "{stamp:?}/{union:?}: {cov:?}");
+        assert!(
+            cov.drawn_logs_with_repeated_entries >= 50,
+            "{stamp:?}/{union:?}: {cov:?}"
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -323,20 +364,26 @@ impl RecoveryWorld {
                 if mask[i] || mask[j] {
                     continue;
                 }
-                if let Some(reply) = self.refs[j].answer() {
-                    let prod = &self.prod[j];
-                    assert_ne!(
-                        prod.reset_state(),
-                        RState::Bot,
-                        "seed {} round {round}",
+                let prod_reply = self.prod[j].answer();
+                match self.refs[j].answer() {
+                    Some(reply) => {
+                        let prod_reply = prod_reply.unwrap_or_else(|| {
+                            panic!("seed {} round {round}: node {j} does not answer", self.seed)
+                        });
+                        assert_eq!(
+                            prod_reply.l_j.as_ref().map(|l| l.entries().to_vec()),
+                            reply.l_j,
+                            "seed {} round {round}: node {j} reply log",
+                            self.seed
+                        );
+                        prod_in[i].push(prod_reply);
+                        ref_in[i].push(reply);
+                    }
+                    None => assert!(
+                        prod_reply.is_none(),
+                        "seed {} round {round}: node {j} answers while R = ⊥",
                         self.seed
-                    );
-                    prod_in[i].push(RecoveryReply {
-                        l_j: prod.log_perm_arc().cloned(),
-                        c_j: prod.checkpoint_shared(),
-                        r_j: prod.reset_state(),
-                    });
-                    ref_in[i].push(reply);
+                    ),
                 }
             }
         }
@@ -403,7 +450,7 @@ impl RecoveryWorld {
                 _ => &reference.l_i,
             };
             let p = reference.c_i.p.as_deref().unwrap_or(&[]);
-            let ok = log.as_ref().is_none_or(|l| l.starts_with(p));
+            let ok = log.as_ref().is_none_or(|l| spec::is_command_prefix(p, l));
             assert_eq!(
                 self.prod[i].validate_boundary().is_ok(),
                 ok,

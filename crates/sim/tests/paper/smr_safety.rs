@@ -4,7 +4,8 @@
 //! shorten) a node's executed sequence.
 
 use protocol::compact::{ClientCommand, Entry, SharedState};
-use protocol::shared_state::ExecutedView;
+use protocol::shared_state::{ExecSeq, ExecutedView};
+use rand::{Rng, SeedableRng};
 use sim::smr::{ClientModel, PrefixChecker, prefixes_consistent};
 
 fn cmd(op: u64) -> Entry {
@@ -141,6 +142,103 @@ fn late_join_from_empty_verifies_full_content() {
     ]);
 }
 
+// Alg 5, p. 26: a ⊥ server adopts S_j and commits on it in the same step, so
+// its executed sequence can change below its old length without shrinking.
+#[test]
+fn adopt_then_commit_to_equal_length_is_flagged() {
+    parity(&[
+        vec![vec![cmd(1), cmd(2)], vec![cmd(1), cmd(2)]],
+        vec![vec![cmd(1), cmd(2)], vec![cmd(3), cmd(2)]],
+    ]);
+}
+
+#[test]
+fn rewritten_tail_at_equal_length_is_flagged() {
+    let base: Vec<Entry> = (1..=10).map(cmd).collect();
+    let mut rewritten: Vec<Entry> = (1..=8).map(cmd).collect();
+    rewritten.extend([cmd(100), cmd(101)]);
+    parity(&[vec![base.clone(), base.clone()], vec![base, rewritten]]);
+}
+
+#[test]
+fn every_adopt_shorter_then_regrow_shape_matches_the_reference() {
+    for old_len in 1..=4u64 {
+        for adopted_len in 0..old_len {
+            for new_len in old_len..=old_len + 2 {
+                let before: Vec<Entry> = (1..=old_len).map(cmd).collect();
+                let mut after: Vec<Entry> = (1..=adopted_len).map(cmd).collect();
+                after.extend((adopted_len..new_len).map(|p| cmd(1000 + p)));
+                parity(&[
+                    vec![before.clone(), before.clone()],
+                    vec![before.clone(), after],
+                ]);
+            }
+        }
+    }
+}
+
+/// Reference over the whole run: every sequence seen at any round end is
+/// prefix-comparable with every other, which is what the latch certifies.
+fn extend_history(history: &mut Vec<Entry>, seqs: &[ExecSeq]) -> bool {
+    for seq in seqs {
+        let seq = seq.to_vec();
+        let common = seq.len().min(history.len());
+        if seq[..common] != history[..common] {
+            return false;
+        }
+        history.extend_from_slice(&seq[common..]);
+    }
+    true
+}
+
+/// Sequences that persist across rounds, so the checker's skip over a prefix a
+/// node still holds is exercised: Alg 5 adoption (S_i := S_j shares S_j's
+/// chunks) plus same-round commits, against the reference every round.
+#[test]
+fn persistent_sequences_with_adoptions_match_the_reference() {
+    let n = 4;
+    let mut diverged = Vec::new();
+    for seed in 0..300 {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        let mut seqs: Vec<ExecSeq> = vec![ExecSeq::new(); n];
+        let mut inc = PrefixChecker::new(n);
+        let mut history = Vec::new();
+        let mut forks = 0u64;
+        for round in 0..150 {
+            for i in 0..n {
+                if rng.random_range(0..5) == 0 {
+                    seqs[i] = seqs[rng.random_range(0..n)].clone();
+                }
+                for _ in 0..rng.random_range(0..3) {
+                    let next = if rng.random_range(0..300) == 0 {
+                        forks += 1;
+                        cmd(1_000_000 + forks)
+                    } else {
+                        cmd(seqs[i].end() + 1)
+                    };
+                    seqs[i].push(next);
+                }
+            }
+            let reference = extend_history(&mut history, &seqs);
+            let views: Vec<ExecutedView<'_>> = seqs.iter().map(ExecutedView::of).collect();
+            assert_eq!(
+                inc.check_round(&views, 0),
+                reference,
+                "seed {seed} round {round}"
+            );
+            if !reference {
+                diverged.push(round);
+                break;
+            }
+        }
+    }
+    diverged.sort_unstable();
+    assert!(
+        diverged.len() > 100 && diverged[diverged.len() / 2] > 10,
+        "the fixture must fork in most seeds, typically after many rounds: {diverged:?}"
+    );
+}
+
 /// The position floor rides on this: the canonical length only ever grows,
 /// and only over content some node had already executed in a checked round —
 /// an adoption shrink must not walk it back.
@@ -261,6 +359,9 @@ fn traffic_cell(t_commit: u64, max_rounds: usize) -> sim::smr::SmrScenario {
     }
 }
 
+/// Seed-pinned regression pin of the RNG stream and merge order, not a paper check: the cell
+/// forks at a small T, which the paper's sufficient condition T > T_B + max{T_B, T_M} neither
+/// predicts nor excludes (its constants are unknown).
 #[test]
 fn known_split_brain_cell_still_latches_false() {
     // E5 dispatch-1's aborting cell (diverges at round 278) truncated past it.
@@ -272,4 +373,15 @@ fn known_split_brain_cell_still_latches_false() {
 fn known_clean_cell_stays_true() {
     let report = sim::smr::run_smr(&traffic_cell(31, 400));
     assert!(report.safety_ok);
+}
+
+#[test]
+#[ignore = "slow: ~80 s; cargo test -p sim --test paper -- --ignored the_split_brain_is_a_finite_t_effect"]
+fn the_split_brain_is_a_finite_t_effect_that_does_not_return_at_larger_t() {
+    // Strong safety needs T > T_B + max{T_B, T_M} (p. 27): at the cell that forks at T = 21,
+    // every larger T tried must stay clean.
+    for t_commit in [41, 61, 81] {
+        let report = sim::smr::run_smr(&traffic_cell(t_commit, 400));
+        assert!(report.safety_ok, "T = {t_commit}");
+    }
 }

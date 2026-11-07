@@ -6,34 +6,39 @@
 
 mod engine;
 mod observe;
+mod summary;
 mod tracker;
 mod types;
 mod validate;
 
 pub use crate::runlog::{run_smr_logged, run_smr_recorded};
 pub use engine::engine_rec::boundary_key_counts;
+pub(crate) use engine::pool::EXHAUSTED_MARKER as POOL_EXHAUSTED_MARKER;
 pub use observe::accounting::Accounting;
 pub use observe::census_count::census_counts;
 pub use observe::detail::RecNodeDetail;
 pub use observe::log_index::holder_vec_count;
 pub use observe::safety::{EntrySeq, PrefixChecker, prefixes_consistent};
 pub use observe::spill::{Spill, SpillBoundary, SpillHeader, SpillTrailer, read_spill};
+pub use summary::{CommandFold, LatencySamples, RecoverySummary, SmrSummary};
+#[cfg(test)]
+pub(crate) use summary::{client_end_round, paper_latency_sample};
 pub use tracker::injection_sns;
 pub use types::{
     AUTO_CLIENT_BASE, AUTO_OP_BASE, AttemptOutcome, ClientModel, CommandReport, CommandStatus,
-    DeliveryAttempt, Injection, ManualBlock, MergePolicy, NodeGlance, PrefixMismatch, Proto,
-    RecRoundMetrics, RecStepInfo, RecoveryFailure, RecoveryFailurePhase, RecoveryReport,
-    RepeatedCommit, SEED_COMMAND, SmrReport, SmrRoundMetrics, SmrScenario, SmrStepStatus,
-    SmrTerminal, SpreadCurve, SpreadPoint, SpreadingCommand, TrafficPhase, active_phase, amp_count,
-    auto_command,
+    DeliveryAttempt, HaltKind, Injection, ManualBlock, MergePolicy, NodeGlance, PrefixMismatch,
+    Proto, RecRoundMetrics, RecStepInfo, RecoveryReport, RecoveryViolation, RepeatedCommit,
+    RunFailure, RunFailurePhase, SEED_COMMAND, SmrReport, SmrRoundMetrics, SmrScenario,
+    SmrStepStatus, SmrTerminal, SpreadCurve, SpreadPoint, SpreadingCommand, TrafficPhase,
+    active_phase, amp_count, auto_command,
 };
 pub(crate) use types::{PrefixMismatchWire, RepeatedCommitWire, is_abort, is_execute};
 pub use validate::point_mass_pmf;
 pub(crate) use validate::validate_weights;
 
 use crate::blocking::{
-    adjust_sticky_mask, compile_blocking, fraction_count, round_mask, sample_blocked,
-    sticky_with_background,
+    adjust_sticky_mask, checked_mask, compile_history_only, fraction_count, history_only_view,
+    sample_blocked, sticky_with_background,
 };
 use crate::{Config, same_component};
 use engine::engine_rec::RecRunState;
@@ -70,6 +75,7 @@ pub fn run_smr(scenario: &SmrScenario) -> SmrReport {
 struct RunScope {
     lean: bool,
     observe_spread: bool,
+    flat: bool,
 }
 
 impl RunScope {
@@ -77,6 +83,7 @@ impl RunScope {
         RunScope {
             lean: false,
             observe_spread: true,
+            flat: false,
         }
     }
 
@@ -84,6 +91,7 @@ impl RunScope {
         RunScope {
             lean: true,
             observe_spread: true,
+            flat: false,
         }
     }
 
@@ -91,6 +99,14 @@ impl RunScope {
         RunScope {
             lean: true,
             observe_spread: census_forced_on(),
+            flat: false,
+        }
+    }
+
+    fn flat() -> Self {
+        RunScope {
+            flat: true,
+            ..RunScope::grid()
         }
     }
 }
@@ -107,6 +123,21 @@ pub fn run_smr_grid(scenario: &SmrScenario) -> SmrReport {
 
 pub fn grid_observes_census() -> bool {
     census_forced_on()
+}
+
+/// The sweep's runner: [`run_smr_grid`] that also retires every command no stage can change any
+/// more and folds per-round rows as they land, so only live commands and per-client protocol
+/// state grow. Returns what a sweep row and its ledger record read, not a report.
+pub fn run_smr_flat(scenario: &SmrScenario) -> SmrSummary {
+    run_smr_flat_observed(scenario, &mut |_: &SmrState| {})
+}
+
+/// [`run_smr_flat`] with the live state after every round.
+pub fn run_smr_flat_observed(
+    scenario: &SmrScenario,
+    observe: &mut dyn FnMut(&SmrState),
+) -> SmrSummary {
+    run_loop(scenario, RunScope::flat(), observe).into_summary()
 }
 
 /// [`run_smr_grid`] with the live state after every round.
@@ -142,6 +173,21 @@ fn run_smr_sampled(
     scope: RunScope,
     observe: &mut dyn FnMut(&SmrState),
 ) -> SmrReport {
+    let state = run_loop(scenario, scope, observe);
+    let report = state.report();
+    debug_assert_eq!(
+        state.summary(),
+        SmrSummary::from_report(&report, scenario),
+        "the streamed summary differs from the one read off the report"
+    );
+    report
+}
+
+fn run_loop(
+    scenario: &SmrScenario,
+    scope: RunScope,
+    observe: &mut dyn FnMut(&SmrState),
+) -> SmrState {
     scenario.validate().expect("invalid SmrScenario");
     let mut state = SmrState::new_with_certs(
         scenario.n,
@@ -160,18 +206,18 @@ fn run_smr_sampled(
     state.drop_settled_spread = scope.lean;
     state.truncate_history = scope.lean;
     state.observe_spread = scope.observe_spread;
-    let blocking = compile_blocking(&scenario.schedule, scenario.n, state.rng_mut());
-    let mut sticky_mask = vec![false; scenario.n];
+    state.flat = scope.flat;
+    state.scenario_tag = Some(crate::runlog::params_tag(scenario));
+    let mut blocking = compile_history_only(&scenario.schedule, scenario.n, state.rng_mut());
     let progress = crate::progress::cell(scenario.n, scenario.seed, scenario.max_rounds);
     for round in 1..=scenario.max_rounds {
         progress.tick(round);
         state.draw_arrivals();
-        let mut mask = round_mask(
-            &blocking,
-            round,
-            &mut sticky_mask,
-            scenario.n,
+        let mut mask = checked_mask(
+            blocking.as_mut(),
+            &history_only_view(round),
             state.rng_mut(),
+            scenario.n,
         );
         for mb in &scenario.manual_blocks {
             if mb.covers(round) {
@@ -187,6 +233,7 @@ fn run_smr_sampled(
             break;
         }
         if scenario.halt_on_violation && !state.safety_ok() {
+            state.halt = Some((state.round, HaltKind::Fork));
             break;
         }
     }
@@ -194,7 +241,7 @@ fn run_smr_sampled(
     if state.failure.is_none() {
         state.finish_spill();
     }
-    state.report()
+    state
 }
 
 enum SmrNodes {
@@ -208,6 +255,7 @@ pub struct SmrState {
     n: usize,
     seed: u64,
     cfg: Config,
+    proto: Proto,
     amp: usize,
     rng: ChaCha12Rng,
     nodes: SmrNodes,
@@ -216,25 +264,36 @@ pub struct SmrState {
     metrics: Vec<SmrRoundMetrics>,
     round: usize,
     dead: Option<usize>,
-    failure: Option<RecoveryFailure>,
+    failure: Option<RunFailure>,
     failed_status: Option<SmrStepStatus>,
     safety_ok: bool,
     checker: PrefixChecker,
     exec_dup: ExecDupOracle,
+    committed: observe::committed::CommittedOracle,
     /// Entries the execute-once state machine left out, over all nodes, and the first such round.
     repeat_skips: u64,
     first_repeat_skip_round: Option<usize>,
     boundary_skips: BoundarySkipTally,
+    wedged_round: Option<usize>,
+    /// Set by the run loop when `halt_on_violation` stops it.
+    halt: Option<(usize, HaltKind)>,
     canon_index: EntryIndex,
     inert_prefix: usize,
-    nulls_possible: bool,
+    /// Compact: trackers behind the inert prefix whose commit is not dated yet.
+    undated: Vec<usize>,
     pub(crate) drop_settled_spread: bool,
     pub(crate) truncate_history: bool,
     pub(crate) observe_spread: bool,
+    /// Retire settled commands and fold per-round rows; the run reports a summary only.
+    flat: bool,
+    retired: summary::CommandFold,
+    row_fold: summary::RowFold,
     frontier: u64,
     release_line: u64,
     spill: Option<observe::spill::SpillWriter>,
     spill_allowed: bool,
+    /// Tag of the full scenario, set by the scenario runner; names the spill file.
+    pub(crate) scenario_tag: Option<String>,
     traffic: Vec<TrafficPhase>,
     pool: Option<ClientPool>,
     auto_spawned: u64,
@@ -333,11 +392,11 @@ impl SmrState {
             }
         };
         let (trackers, client_order) = trackers_for(injections);
-        let nulls_possible = tracker::nulls_reachable(&trackers);
         SmrState {
             n,
             seed,
             cfg,
+            proto,
             amp: amp_count(sigma, n),
             rng,
             nodes,
@@ -351,20 +410,27 @@ impl SmrState {
             safety_ok: true,
             checker: PrefixChecker::new(n),
             exec_dup: ExecDupOracle::new(n),
+            committed: observe::committed::CommittedOracle::new(n),
             repeat_skips: 0,
             first_repeat_skip_round: None,
             boundary_skips: BoundarySkipTally::new(n),
+            wedged_round: None,
+            halt: None,
             canon_index: EntryIndex::new(),
             inert_prefix: 0,
-            nulls_possible,
+            undated: Vec::new(),
             drop_settled_spread: false,
             truncate_history: false,
             observe_spread: true,
+            flat: false,
+            retired: summary::CommandFold::default(),
+            row_fold: summary::RowFold::default(),
             frontier: 0,
             release_line: 0,
             spill: None,
             spill_allowed: matches!(proto, Proto::Recovery { .. })
                 && observe::spill::spill_enabled(),
+            scenario_tag: None,
             traffic: traffic.to_vec(),
             pool: client_model.pool_size().map(ClientPool::new),
             auto_spawned: 0,
@@ -412,10 +478,14 @@ impl SmrState {
                 injection_round: round,
                 target: None,
                 auto: true,
+                injected_round: None,
                 delivered_round: None,
                 all_logs_round: None,
                 prefix_fixed_round: None,
+                index_agreed_round: None,
+                agreed_index: None,
                 committed_ack_round: None,
+                committed_round: None,
                 executed_round: None,
                 fixed_prefix: None,
                 spread: Vec::new(),
@@ -485,7 +555,7 @@ impl SmrState {
     /// Live pmf edit: lands from the next round and replaces every later phase.
     pub fn set_traffic_pmf(&mut self, pmf: Vec<f64>) -> Result<(), String> {
         if self.failure.is_some() {
-            return Err("recovery run failed; traffic cannot be changed".into());
+            return Err("run failed; traffic cannot be changed".into());
         }
         validate_pmf(&pmf)?;
         let from_round = self.round + 1;
@@ -504,6 +574,7 @@ impl SmrState {
 
     /// Manual commands only; a replay regenerates traffic arrivals from phases + seed.
     pub fn manual_injections(&self) -> Vec<Injection> {
+        self.assert_records_kept("list manual injections");
         self.trackers
             .iter()
             .filter(|t| !t.auto)
@@ -522,9 +593,14 @@ impl SmrState {
     }
 
     fn assert_not_failed(&self, action: &str) {
+        assert!(self.failure.is_none(), "run failed; cannot {action}");
+    }
+
+    /// A flat run has dropped settled commands and past rows; nothing may answer as if it had not.
+    fn assert_records_kept(&self, action: &str) {
         assert!(
-            self.failure.is_none(),
-            "recovery run failed; cannot {action}"
+            !self.flat,
+            "a flat run keeps no settled commands or past rows; cannot {action} (read summary())"
         );
     }
 
@@ -532,18 +608,31 @@ impl SmrState {
         self.round
     }
 
-    pub fn failure(&self) -> Option<&RecoveryFailure> {
+    pub fn failure(&self) -> Option<&RunFailure> {
         self.failure.as_ref()
     }
 
     /// Register a live command; it lands next round, since stamping this round would break replay.
+    /// Refused while its client has a command scheduled later: its sn would differ on replay.
     pub fn inject(&mut self, client: u32, op: u64, target: Option<u32>) -> Result<usize, String> {
         if self.failure.is_some() {
-            return Err("recovery run failed; commands cannot be injected".into());
+            return Err("run failed; commands cannot be injected".into());
         }
+        self.assert_records_kept("inject a command");
         let duplicate = self.trackers.iter().any(|t| t.op == op);
         validate_injection(client, op, target, self.n, duplicate)?;
         let round = self.round + 1;
+        if let Some(later) = self
+            .trackers
+            .iter()
+            .find(|t| !t.auto && t.client == client && t.injection_round > round)
+        {
+            return Err(format!(
+                "client {client} already has op {} scheduled for round {}; sequence numbers \
+                 follow injection rounds, so a live command cannot precede it",
+                later.op, later.injection_round
+            ));
+        }
         let (mut new_tracker, _) = trackers_for(&[Injection {
             round,
             client,
@@ -564,6 +653,7 @@ impl SmrState {
 
     /// Every command this session knows, in tracker order, for replay export.
     pub fn injections(&self) -> Vec<Injection> {
+        self.assert_records_kept("list injections");
         self.trackers
             .iter()
             .map(|t| Injection {
@@ -592,10 +682,25 @@ impl SmrState {
             SmrNodes::Comp(_) => self.step_comp(mask),
             SmrNodes::Rec(_) => self.step_rec(mask),
         };
+        self.fold_rows();
+        if self.flat && self.failure.is_none() {
+            self.retire_settled();
+            self.prune_lineage();
+        }
         self.tally_repeat_skips();
         if let SmrNodes::Rec(nodes) = &self.nodes {
             let stale = nodes.iter().map(RecoveryNode::stale_checkpoint);
             self.boundary_skips.observe(stale, self.round);
+            let wedged = observe::fleet_wedge::fleet_wedged(nodes);
+            assert!(
+                self.wedged_round.is_none() || wedged,
+                "round {}: the fleet left a wedge declared at round {:?}, which no step can leave",
+                self.round,
+                self.wedged_round
+            );
+            if wedged {
+                self.wedged_round.get_or_insert(self.round);
+            }
         }
         status
     }
@@ -610,6 +715,16 @@ impl SmrState {
             self.first_repeat_skip_round = Some(self.round);
         }
         self.repeat_skips = total;
+    }
+
+    /// Which servers hold L_i = ⊥ now.
+    pub fn bottom_logs(&self) -> Vec<bool> {
+        self.assert_not_failed("read live log presence");
+        match &self.nodes {
+            SmrNodes::Ext(nodes) => nodes.iter().map(|nd| nd.log().is_none()).collect(),
+            SmrNodes::Comp(nodes) => nodes.iter().map(|nd| nd.log_seq().is_none()).collect(),
+            SmrNodes::Rec(nodes) => nodes.iter().map(|nd| nd.log_seq().is_none()).collect(),
+        }
     }
 
     /// Per-node executed sequences (compact only).
@@ -648,7 +763,9 @@ impl SmrState {
         }
     }
 
-    /// The canonical §6 committed sequence: the longest executed one, ties by lowest node id.
+    /// The longest executed sequence over all n recovery nodes (⊥ nodes included), ties by lowest id.
+    /// A display construct: §6 defines a server's committed commands by its own S_i (p. 35), and
+    /// while prefix consistency holds this sequence extends every server's S_i.
     pub fn committed_entries(&self) -> Option<Vec<Entry>> {
         self.assert_not_failed("read live committed entries");
         let SmrNodes::Rec(nodes) = &self.nodes else {
@@ -710,7 +827,7 @@ impl SmrState {
         }
     }
 
-    /// The report's `safety_ok` latch without rebuilding the report.
+    /// The report's `safety_ok` no-fork latch without rebuilding the report.
     pub fn safety_ok(&self) -> bool {
         self.safety_ok
     }
@@ -720,8 +837,81 @@ impl SmrState {
         self.exec_dup.tripped_round().is_none()
     }
 
-    /// The report so far — non-consuming, callable mid-session.
+    /// Def 1.5 retractions so far, per server and observation: (all, the rewrites among them).
+    pub fn retraction_counts(&self) -> (u64, u64) {
+        self.committed.retractions()
+    }
+
+    /// Folds the rows this step pushed; a flat run then drops them.
+    fn fold_rows(&mut self) {
+        let from = if self.flat { 0 } else { self.row_fold.rounds() };
+        let rec = self.rec.as_ref();
+        if let Some(rec) = rec {
+            assert_eq!(
+                rec.rows.len(),
+                self.metrics.len(),
+                "one recovery row per round"
+            );
+        }
+        for (i, m) in self.metrics.iter().enumerate().skip(from) {
+            let row = rec.map(|r| (&r.rows[i], self.n, r.t_window()));
+            self.row_fold.add(m, row);
+        }
+        assert_eq!(
+            self.row_fold.rounds(),
+            self.round,
+            "one row per stepped round"
+        );
+        if self.flat {
+            self.metrics.clear();
+            if let Some(rec) = &mut self.rec {
+                rec.rows.clear();
+            }
+        }
+    }
+
+    /// Lineage keys below every node's checkpoint window can never be looked up again.
+    fn prune_lineage(&mut self) {
+        if let (Some(rec), SmrNodes::Rec(nodes)) = (&mut self.rec, &self.nodes) {
+            let lowest = nodes.iter().map(|nd| nd.checkpoint().w).min();
+            rec.prune_lineage_below(lowest.expect("at least one node"));
+        }
+    }
+
+    /// Commands a flat run has retired, and commands still held.
+    pub fn command_residency(&self) -> (usize, usize) {
+        (self.retired.commands, self.trackers.len())
+    }
+
+    /// What a sweep row and its ledger record read; the only output of a flat run.
+    pub fn summary(&self) -> SmrSummary {
+        self.summary_with(self.retired.clone())
+    }
+
+    /// [`Self::summary`] without copying the retired samples, the run's largest remaining term.
+    fn into_summary(mut self) -> SmrSummary {
+        let retired = std::mem::take(&mut self.retired);
+        self.summary_with(retired)
+    }
+
+    fn summary_with(&self, retired: summary::CommandFold) -> SmrSummary {
+        SmrSummary::streamed(
+            self.report_records(false),
+            self.proto,
+            retired,
+            &self.trackers,
+            &self.row_fold,
+        )
+    }
+
+    /// The report so far — non-consuming, callable mid-session; panics on a flat run.
     pub fn report(&self) -> SmrReport {
+        self.assert_records_kept("build a report");
+        self.report_records(true)
+    }
+
+    /// With `records` false, the report's scalars alone: no commands, rows or recovery rounds.
+    fn report_records(&self, records: bool) -> SmrReport {
         let terminal = if let Some(failure) = &self.failure {
             SmrTerminal::Failed {
                 attempted_round: failure.attempted_round,
@@ -730,35 +920,54 @@ impl SmrState {
                 phase: failure.phase,
             }
         } else {
-            match self.dead {
-                Some(round) => SmrTerminal::Dead { round },
-                None => SmrTerminal::Ran { rounds: self.round },
+            match (self.dead, self.halt) {
+                (Some(round), _) => SmrTerminal::Dead { round },
+                (None, Some((round, kind))) => SmrTerminal::Halted { round, kind },
+                (None, None) => SmrTerminal::Ran { rounds: self.round },
             }
         };
-        let mut commands: Vec<CommandReport> = self
-            .trackers
-            .iter()
-            .map(|t| t.report(terminal, self.observe_spread))
-            .collect();
+        let mut commands: Vec<CommandReport> = if records {
+            self.trackers
+                .iter()
+                .map(|t| t.report(terminal, self.observe_spread))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // (injection_round, client) is total and shared by a live session and its replay.
         commands.sort_by_key(|c| (c.injection_round, c.client));
         SmrReport {
-            metrics: self.metrics.clone(),
+            metrics: if records {
+                self.metrics.clone()
+            } else {
+                Vec::new()
+            },
             commands,
             terminal,
             safety_ok: self.safety_ok,
             exec_dup_round: self.exec_dup.tripped_round(),
+            retractions: self.committed.retractions().0,
+            retraction_rewrites: self.committed.retractions().1,
+            first_retraction_round: self.committed.first_retraction_round(),
+            strong_safety_violation_rounds: self.committed.strong_safety().0,
+            strong_safety_first_violation: self.committed.strong_safety().1,
+            strong_safety_boundary_violations: self.committed.strong_safety_at_boundaries().0,
+            strong_safety_boundary_first_violation: self.committed.strong_safety_at_boundaries().1,
             repeat_skips: self.repeat_skips,
             first_repeat_skip_round: self.first_repeat_skip_round,
             boundary_skip_events: self.boundary_skips.events(),
             first_boundary_skip_round: self.boundary_skips.first_round(),
             last_boundary_skip_round: self.boundary_skips.last_round(),
             max_rejoin_rounds: self.boundary_skips.max_rejoin_rounds(),
+            longest_stale_rounds: self.boundary_skips.longest_stale_rounds(),
             unrejoined_nodes: self.boundary_skips.unrejoined(),
+            horizon_skip_nodes: self.boundary_skips.horizon_skips(),
+            wedged_round: self.wedged_round,
             failure: self.failure.clone(),
             recovery: self.rec.as_ref().map(|r| RecoveryReport {
                 fork_ok: r.fork_ok,
-                rounds: r.rows.clone(),
+                commit_fork_round: r.commit_fork_round,
+                rounds: if records { r.rows.clone() } else { Vec::new() },
             }),
             pool_peak_in_flight: self.pool.as_ref().map(ClientPool::peak_in_flight),
             spill_path: self
@@ -769,10 +978,27 @@ impl SmrState {
     }
 
     pub(crate) fn finish_spill(&mut self) {
-        if let Some(spill) = &mut self.spill {
-            spill.finish().expect("spill trailer write failed");
+        if let Some(spill) = &mut self.spill
+            && let Err(cause) = spill.finish()
+        {
+            spill_io_failure("trailer write", self.seed, Some(spill.path()), &cause);
         }
     }
+}
+
+/// A run whose canonical stream cannot be written is unauditable, like an unlogged ledger row:
+/// stop the sweep, name the run and the way out, and record no failure row for an I/O error.
+pub(crate) fn spill_io_failure(
+    step: &str,
+    seed: u64,
+    path: Option<&std::path::Path>,
+    cause: &str,
+) -> ! {
+    let file = path.map_or(String::new(), |p| format!(" ({})", p.display()));
+    panic!(
+        "spill {step} failed for seed {seed}{file}: {cause}. The run cannot be audited without \
+         its canonical stream; fix the disk or set SIM_SPILL=off to run without it."
+    )
 }
 
 fn blocked_ids(mask: &[bool]) -> Vec<u32> {

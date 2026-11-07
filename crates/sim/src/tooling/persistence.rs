@@ -1,4 +1,10 @@
 //! Split-brain persistence probe: blast radius and transience of commitment errors.
+//!
+//! A split is the cross-server half of no-fork only. Per-server Def 1.5 retractions are
+//! counted separately and in every run, split or not. A "heal" (return to cross-server
+//! consistency) under Alg 5 needs some server to retract executed commands, a further Def 1.5
+//! violation, so every heal is reported with whether its episode retracted (`heals_by_retraction`)
+//! and with the retractions of the first heal round (`r_h_retractions`).
 
 use crate::BlockSchedule;
 use crate::smr::{
@@ -22,6 +28,8 @@ pub struct ProbeOptions {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Transience {
+    /// First round after r_v that is cross-server consistent again; not a return to a valid
+    /// state, since reaching it retracts executed commands (see [`Heals`]).
     pub r_h: Option<usize>,
     pub heal_rounds: Option<usize>,
     pub episodes: usize,
@@ -41,6 +49,49 @@ pub fn transience(r_v: usize, split: &[bool]) -> Transience {
             .count(),
         inconsistent_rounds: split.iter().filter(|&&s| s).count(),
         phi: split.iter().filter(|&&s| s).count() as f64 / split.len() as f64,
+    }
+}
+
+/// Returns to consistency after r_v and the per-server retractions they took.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Heals {
+    /// Rounds after r_v that end a split episode.
+    pub heals: usize,
+    /// The heals with at least one retraction in their episode's healing span: the rounds after
+    /// the one in which the split appeared, through the heal round. A retraction in the split's
+    /// first round did not heal it, since the split held at that round's end.
+    pub by_retraction: usize,
+    /// Retractions in round r_h; `None` without a heal.
+    pub r_h_retractions: Option<u64>,
+}
+
+/// `split` and `retractions` both start at r_v, one entry per round.
+pub fn heals(split: &[bool], retractions: &[u64]) -> Heals {
+    assert_eq!(
+        split.len(),
+        retractions.len(),
+        "one entry per round after r_v"
+    );
+    let ends: Vec<usize> = (1..split.len())
+        .filter(|&i| split[i - 1] && !split[i])
+        .collect();
+    let episode_start = |end: usize| {
+        (0..end)
+            .rev()
+            .find(|&i| i == 0 || !split[i - 1])
+            .expect("a heal follows a split round")
+    };
+    Heals {
+        heals: ends.len(),
+        by_retraction: ends
+            .iter()
+            .filter(|&&end| {
+                retractions[episode_start(end) + 1..=end]
+                    .iter()
+                    .any(|&r| r > 0)
+            })
+            .count(),
+        r_h_retractions: split.iter().position(|&s| !s).map(|i| retractions[i]),
     }
 }
 
@@ -175,6 +226,10 @@ pub struct ProbeRun {
     pub r_v: Option<usize>,
     pub transience: Option<Transience>,
     pub split_after_rv: Vec<bool>,
+    /// Per-server Def 1.5 retractions in each round from r_v on, aligned with `split_after_rv`.
+    pub retractions_after_rv: Vec<u64>,
+    pub heals: Option<Heals>,
+    /// Rounds in which some server's executed length dropped; rewrites are not counted here.
     pub shrink_events: usize,
     pub exec_len_rv: Option<usize>,
     pub observations: Vec<Observation>,
@@ -227,6 +282,8 @@ pub fn probe_run(scenario: &SmrScenario, opts: &ProbeOptions) -> Result<ProbeRun
         r_v: None,
         transience: None,
         split_after_rv: Vec::new(),
+        retractions_after_rv: Vec::new(),
+        heals: None,
         shrink_events: 0,
         exec_len_rv: None,
         observations: Vec::new(),
@@ -237,7 +294,9 @@ pub fn probe_run(scenario: &SmrScenario, opts: &ProbeOptions) -> Result<ProbeRun
     let mut lengths = vec![0usize; scenario.n];
 
     for round in 1..=scenario.max_rounds {
+        let retractions_before = state.retraction_counts().0;
         let status = state.step_sampled(blocked);
+        let retracted = state.retraction_counts().0 - retractions_before;
         probe.rounds = round;
         // Borrowed, never materialised: a copy here puts the whole executed history in the per-round cost.
         let seqs: Vec<&ExecSeq> = (0..scenario.n)
@@ -269,6 +328,7 @@ pub fn probe_run(scenario: &SmrScenario, opts: &ProbeOptions) -> Result<ProbeRun
         }
         if probe.r_v.is_some() {
             probe.split_after_rv.push(split);
+            probe.retractions_after_rv.push(retracted);
         }
 
         let last_round = probe.r_v.is_some_and(|r_v| {
@@ -293,6 +353,9 @@ pub fn probe_run(scenario: &SmrScenario, opts: &ProbeOptions) -> Result<ProbeRun
 
     probe.report = state.report();
     probe.transience = probe.r_v.map(|r_v| transience(r_v, &probe.split_after_rv));
+    probe.heals = probe
+        .r_v
+        .map(|_| heals(&probe.split_after_rv, &probe.retractions_after_rv));
     probe.replay_ok = opts
         .expected_safety
         .map(|expected| expected == probe.report.safety_ok);
@@ -302,9 +365,10 @@ pub fn probe_run(scenario: &SmrScenario, opts: &ProbeOptions) -> Result<ProbeRun
 pub const PROBE_CSV_HEADER: &str = "exp,n,k,ell,beta,sigma,rate,t_commit,horizon,client_model,seed,\
 terminal,rounds,truncated,commands,complete,safety,latch_round,r_v,latch_agrees,expected_safety,\
 replay_ok,r_h,heal_rounds,episodes,incons_rounds,phi,shrink_events,exec_len_rv,obs_n,d_rv,d_1t,\
-d_last,obs_last_round,delta_d,common_last,branches_rv,branch1_rv,branch2_rv,incons_nodes_rv,\
+d_last,obs_last_round,delta_d,common_last,branches_rv,branch1_rv,branch2_rv,off_majority_nodes_rv,\
 first_mismatch_rv,last_mismatch_rv,displaced_after_rv_last,dup_exec_max,sn_regress_max,\
-fork_branch_rv,d_fork_rv,d_fork_1t,d_fork_last,delta_d_fork";
+fork_branch_rv,d_fork_rv,d_fork_1t,d_fork_last,delta_d_fork,retractions,retraction_rewrites,\
+first_retraction_round,heals,heals_by_retraction,r_h_retractions";
 
 fn rate(scenario: &SmrScenario) -> f64 {
     scenario
@@ -327,6 +391,7 @@ fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
 }
 
 /// One CSV row per probe run; persistence columns of a never-split run are empty, not zero.
+/// The retraction columns are filled in every run: Def 1.5 does not wait for a split.
 pub fn probe_row(exp: &str, scenario: &SmrScenario, probe: &ProbeRun) -> String {
     let beta = match scenario.schedule {
         BlockSchedule::FreshPerRound { fraction } => fraction,
@@ -339,6 +404,7 @@ pub fn probe_row(exp: &str, scenario: &SmrScenario, probe: &ProbeRun) -> String 
     let terminal = match probe.report.terminal {
         SmrTerminal::Ran { .. } => "ran",
         SmrTerminal::Dead { .. } => "dead",
+        SmrTerminal::Halted { .. } => "halted",
         SmrTerminal::Failed { .. } => {
             panic!("persistence probe cannot score a failed partial report")
         }
@@ -376,7 +442,8 @@ pub fn probe_row(exp: &str, scenario: &SmrScenario, probe: &ProbeRun) -> String 
     format!(
         "{exp},{},{},{},{beta},{},{},{t_commit},{},{client_model},{},\
          {terminal},{},{},{},{complete},{},{},{},{},{},{},\
-         {},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+         {},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\
+         {},{},{},{},{},{}",
         scenario.n,
         scenario.cfg.k,
         scenario.cfg.ell,
@@ -421,6 +488,12 @@ pub fn probe_row(exp: &str, scenario: &SmrScenario, probe: &ProbeRun) -> String 
         opt(at(1).and_then(|o| o.d_fork)),
         opt(last.and_then(|o| o.d_fork)),
         opt(delta_d_fork),
+        probe.report.retractions,
+        probe.report.retraction_rewrites,
+        opt(probe.report.first_retraction_round),
+        opt(probe.heals.as_ref().map(|h| h.heals)),
+        opt(probe.heals.as_ref().map(|h| h.by_retraction)),
+        opt(probe.heals.as_ref().and_then(|h| h.r_h_retractions)),
     )
 }
 
@@ -431,14 +504,13 @@ pub fn observe(round: usize, seqs: &[&[Entry]], exec_len_rv: usize) -> Observati
     let disp = displacement(a, b);
     let overlap = a.len().min(b.len());
     let mismatches: Vec<usize> = (0..overlap).filter(|&p| a[p] != b[p]).collect();
-    let longest = seqs.iter().max_by_key(|s| s.len()).expect("non-empty");
     // `None` is legitimate: the split test uses the longest sequence, this the largest branch.
     let fork = forked_branch(seqs);
 
     Observation {
         round,
         branches: branches.len(),
-        inconsistent_nodes: seqs.iter().filter(|s| longest[..s.len()] != s[..]).count(),
+        inconsistent_nodes: nodes_off_the_majority_chain(seqs, &branches),
         branch1: branches[0].len(),
         branch2: branches.get(1).map_or(0, Vec::len),
         exec_len_a: a.len(),
@@ -463,6 +535,28 @@ pub fn observe(round: usize, seqs: &[&[Entry]], exec_len_rv: usize) -> Observati
         dup_exec: max_duplicate_executions(seqs),
         sn_regress: max_sn_regressions(seqs),
     }
+}
+
+/// Nodes whose sequence is not a prefix of the anchor: the branch most nodes' sequences are prefixes of,
+/// the longer then the smaller sequence on a tie, so the count does not depend on node order.
+fn nodes_off_the_majority_chain(seqs: &[&[Entry]], branches: &[Vec<usize>]) -> usize {
+    let reps: Vec<(&[Entry], usize)> = branches.iter().map(|m| (seqs[m[0]], m.len())).collect();
+    let support = |anchor: &[Entry]| {
+        reps.iter()
+            .filter(|(rep, _)| anchor.starts_with(rep))
+            .map(|&(_, members)| members)
+            .sum::<usize>()
+    };
+    let (anchor, _) = reps
+        .iter()
+        .max_by(|(a, _), (b, _)| {
+            support(a)
+                .cmp(&support(b))
+                .then(a.len().cmp(&b.len()))
+                .then_with(|| b.cmp(a))
+        })
+        .expect("non-empty");
+    seqs.iter().filter(|s| !anchor.starts_with(s)).count()
 }
 
 pub fn partition_branches(seqs: &[&[Entry]]) -> Vec<Vec<usize>> {

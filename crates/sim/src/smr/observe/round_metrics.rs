@@ -14,6 +14,11 @@ pub(in crate::smr) fn smr_round_metrics(
     arrivals: u32,
 ) -> SmrRoundMetrics {
     let min_executed = executed_lens.iter().min().copied().unwrap_or(0) as u32;
+    let useful_lens = || {
+        (0..executed_lens.len())
+            .filter(|&i| post_logs[i].is_some() && !mask[i])
+            .map(|i| executed_lens[i] as u32)
+    };
     SmrRoundMetrics {
         nonbot_logs: post_logs.iter().filter(|l| l.is_some()).count() as u32,
         blocked: mask.iter().filter(|&&b| b).count() as u32,
@@ -27,6 +32,7 @@ pub(in crate::smr) fn smr_round_metrics(
             .unwrap_or(0) as u32,
         min_executed_len: min_executed,
         max_executed_len: executed_lens.iter().max().copied().unwrap_or(0) as u32,
+        useful_executed: useful_lens().min().zip(useful_lens().max()),
         arrivals,
         lcp_len: min_executed,
     }

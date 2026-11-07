@@ -205,26 +205,19 @@ pub(in crate::smr) struct SpillWriter {
 }
 
 impl SpillWriter {
-    pub(in crate::smr) fn create(header: SpillHeader) -> Result<Self, String> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let stamp = crate::runlog::utc_now().replace([':', '-'], "");
+    /// `tag` names the full scenario, so runs that differ only in a parameter keep distinct files.
+    pub(in crate::smr) fn create(header: SpillHeader, tag: Option<&str>) -> Result<Self, String> {
         let dir = crate::runlog::default_log_path()
             .parent()
             .map(|p| p.join("spills"))
             .ok_or("no ledger directory to place the spill beside")?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("spill dir: {e}"))?;
-        let path = dir.join(format!(
-            "{stamp}-smr-n{}-seed{}-{nonce}.jsonl",
-            header.n, header.seed
-        ));
-        let mut file = std::fs::File::create(&path)
-            .map_err(|e| format!("cannot create spill {}: {e}", path.display()))?;
+        let tag = tag.map_or_else(|| crate::runlog::params_tag(&header), str::to_string);
+        Self::create_in(&dir, header, &tag)
+    }
+
+    fn create_in(dir: &Path, header: SpillHeader, tag: &str) -> Result<Self, String> {
+        let stem = crate::runlog::tagged_artifact_stem("smr-", header.n, header.seed, tag);
+        let (mut file, path) = crate::runlog::create_new_unique(dir, &stem, "jsonl")?;
         write_record(&mut file, &Record::Header(header))?;
         Ok(SpillWriter {
             path,

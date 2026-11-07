@@ -1,4 +1,4 @@
-use sim::{BlockSchedule, Init, Outcome, Scenario, log_run_to};
+use sim::{Availability, BlockSchedule, Init, Outcome, Scenario, log_run_to};
 use std::fs;
 
 fn scenario(seed: u64) -> Scenario {
@@ -25,6 +25,7 @@ fn record_carries_commit_params_and_outcome() {
     let outcome = Outcome::Agreement {
         value: 1,
         rounds: 17,
+        availability: Availability::Held,
     };
     log_run_to(&path, &scenario(42), &outcome, None).unwrap();
     let line = fs::read_to_string(&path).unwrap();
@@ -85,6 +86,48 @@ fn trace_is_stored_and_referenced_in_ledger() {
     assert_eq!(trace["n"], 100);
     assert_eq!(trace["seed"], 9);
     assert!(!trace["rounds"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn two_ledgers_sharing_a_trace_dir_never_collide_on_a_trace_name() {
+    let root = std::env::temp_dir().join(format!("sim-runlog-test-shared-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let trace_dir = root.join("traces");
+    let last_row = |ledger: &std::path::Path| -> serde_json::Value {
+        let text = fs::read_to_string(ledger).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    };
+    let file_name = |p: &str| std::path::Path::new(p).file_name().unwrap().to_owned();
+    // Same-second runs share a metrics name in their own dirs, so their trace names coincide.
+    // Fresh dirs per attempt: a pair split by a second boundary leaves shared dirs' `-k` suffixes out of step.
+    let mut same_second = false;
+    for attempt in 0..20 {
+        let ledgers = [
+            root.join(format!("a{attempt}")).join("ledger.jsonl"),
+            root.join(format!("b{attempt}")).join("ledger.jsonl"),
+        ];
+        for ledger in &ledgers {
+            fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            sim::run_recorded(&scenario(21), ledger, &trace_dir, 10_000_000, None);
+        }
+        let (a, b) = (last_row(&ledgers[0]), last_row(&ledgers[1]));
+        let traces = [
+            a["trace_path"].as_str().unwrap(),
+            b["trace_path"].as_str().unwrap(),
+        ];
+        assert_ne!(traces[0], traces[1]);
+        for t in traces {
+            assert!(fs::metadata(t).is_ok(), "{t} exists");
+        }
+        if file_name(a["metrics_path"].as_str().unwrap())
+            == file_name(b["metrics_path"].as_str().unwrap())
+        {
+            same_second = true;
+            break;
+        }
+    }
+    assert!(same_second, "precondition: two runs within one second");
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]

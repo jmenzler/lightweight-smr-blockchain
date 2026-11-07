@@ -1,6 +1,7 @@
 use protocol::compact::{ClientCommand, Entry};
 use sim::smr::{
-    ClientModel, CommandStatus, Injection, Proto, SmrScenario, prefixes_consistent, run_smr,
+    AttemptOutcome, ClientModel, CommandStatus, Injection, Proto, SmrScenario, SmrState,
+    TrafficPhase, point_mass_pmf, prefixes_consistent, run_smr,
 };
 use sim::{BlockSchedule, Config};
 
@@ -57,10 +58,13 @@ fn compact_lifecycle_commits_everywhere() {
         Some(2),
         "beta = 0: accepted on first draw"
     );
-    let ack = cmd.committed_ack_round.expect("client learns commitment");
-    assert!(
-        ack >= 2 + T as usize,
-        "ack only after the command aged T rounds (ack {ack})"
+    // Alg 5: the command joins every log in round 2 and commits once its age reaches T, at
+    // the end of round 2 + T; the client's next resend, in the following round, is acknowledged.
+    assert_eq!(cmd.committed_round, Some(2 + T as usize));
+    assert_eq!(
+        cmd.committed_ack_round,
+        Some(2 + T as usize + 1),
+        "client learns commitment in the round after the commit"
     );
     assert_eq!(cmd.status, CommandStatus::Complete);
     let last = report.metrics.last().unwrap();
@@ -73,15 +77,28 @@ fn compact_lifecycle_commits_everywhere() {
 }
 
 #[test]
-fn client_resends_until_committed_ack() {
-    // The delivery ack (Amplify accept) and the commitment ack are different
-    // rounds: the client keeps resending between them and stops after
-    // AckCommitted.
+fn client_resends_every_round_until_committed_ack() {
+    // p. 25: the client resends "until commitment is acknowledged by the contacted server":
+    // one attempt per round from the injection round, none acknowledged as committed before
+    // the commit, and the last one is the AckCommitted attempt.
     let report = run_smr(&scenario(32, 11, vec![inj(2, 1, 7)]));
     let cmd = &report.commands[0];
-    let delivered = cmd.delivered_round.unwrap();
-    let ack = cmd.committed_ack_round.unwrap();
-    assert!(ack > delivered);
+    let ack = cmd.committed_ack_round.expect("client learns commitment");
+    let rounds: Vec<usize> = cmd.attempts.iter().map(|a| a.round).collect();
+    assert_eq!(
+        rounds,
+        (2..=ack).collect::<Vec<_>>(),
+        "one attempt per round"
+    );
+    let (last, earlier) = cmd.attempts.split_last().unwrap();
+    assert_eq!(last.outcome, AttemptOutcome::AckCommitted);
+    assert!(
+        earlier
+            .iter()
+            .all(|a| a.outcome != AttemptOutcome::AckCommitted),
+        "no early commitment ack: {earlier:?}"
+    );
+    assert!(ack > cmd.delivered_round.unwrap());
 }
 
 #[test]
@@ -224,4 +241,65 @@ fn compact_safety_holds_under_blocking() {
     for cmd in &report.commands {
         assert_eq!(cmd.status, CommandStatus::Complete, "op {}", cmd.op);
     }
+}
+
+/// Def 1.3 Validity (p. 6): a command in a log at the end of a round was injected by then, or some
+/// server held it at the start of the round. ⊥ entries and no-ops are protocol-internal.
+#[test]
+fn compact_logs_hold_only_injected_or_inherited_commands() {
+    // Traffic stops at round 40, so the logs drain and x_d enters them too.
+    let traffic = [
+        TrafficPhase {
+            from_round: 1,
+            arrivals_pmf: point_mass_pmf(3),
+        },
+        TrafficPhase {
+            from_round: 40,
+            arrivals_pmf: point_mass_pmf(0),
+        },
+    ];
+    let mut state = SmrState::new(
+        32,
+        Config::default(),
+        Proto::Compact { t_commit_rounds: T },
+        2.0,
+        21,
+        &[],
+        &traffic,
+        ClientModel::Unique,
+        None,
+    );
+    let ops_in_logs = |state: &SmrState| -> Vec<u64> {
+        state
+            .compact_logs()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|t| t.entry.op())
+            .collect()
+    };
+    let mut at_end_of_round = vec![Vec::new()];
+    for _ in 0..80 {
+        state.step_fraction(0.1);
+        at_end_of_round.push(ops_in_logs(&state));
+    }
+    let injected: std::collections::BTreeMap<u64, usize> = state
+        .report()
+        .commands
+        .iter()
+        .map(|c| (c.op, c.injection_round))
+        .collect();
+    for round in 1..at_end_of_round.len() {
+        for op in &at_end_of_round[round] {
+            let by_now = injected.get(op).is_some_and(|&r| r <= round);
+            assert!(
+                by_now || at_end_of_round[round - 1].contains(op),
+                "round {round}: op {op} is in a log but was neither injected nor in any log before"
+            );
+        }
+    }
+    assert!(
+        at_end_of_round.iter().any(|ops| ops.len() > 10),
+        "the run must load the logs"
+    );
 }

@@ -1,6 +1,10 @@
-//! Executed-prefix safety checking (split-brain detection).
+//! No-fork checking: every server's executed sequence, ⊥ and blocked servers included, is a
+//! prefix of one order (the "does not fork" goal of pp. 29–30). This is neither Def 1.4 Strong
+//! Safety (equality among useful servers) nor Def 1.5 Monotonicity (per server over time); a
+//! lagging useful server and a server whose sequence shrinks both pass it.
 
 use crate::smr::observe::canonical::CanonicalOrder;
+use protocol::chunked::SealedMark;
 use protocol::compact::Entry;
 use protocol::shared_state::{ExecSeq, ExecutedView};
 
@@ -46,7 +50,7 @@ impl<S: EntrySeq + ?Sized> EntrySeq for &S {
     }
 }
 
-/// Reference split-brain check: all executed sequences are prefixes of the longest.
+/// Reference no-fork check: all executed sequences are prefixes of the longest.
 pub fn prefixes_consistent<S: EntrySeq>(seqs: &[S]) -> bool {
     let Some(longest) = seqs.iter().max_by_key(|s| s.entry_count()) else {
         return true;
@@ -55,17 +59,37 @@ pub fn prefixes_consistent<S: EntrySeq>(seqs: &[S]) -> bool {
         .all(|s| longest.entries().take(s.entry_count()).eq(s.entries()))
 }
 
-/// Incremental `prefixes_consistent`; a shrunk sequence is re-verified from its offset.
+/// Incremental `prefixes_consistent`. Alg 5's S_i := S_j (p. 26) can rewrite a
+/// sequence anywhere, so only a prefix the node provably still holds is skipped.
 pub struct PrefixChecker {
     canonical: CanonicalOrder,
-    checked: Vec<u64>,
+    verified: Vec<Verified>,
+}
+
+/// What the last check verified of one node: everything from `offset` on.
+#[derive(Default)]
+struct Verified {
+    offset: u64,
+    mark: Option<SealedMark<Entry>>,
+}
+
+impl Verified {
+    /// First position of `seq` not known to be verified.
+    fn recheck_from(&self, seq: ExecutedView<'_>) -> u64 {
+        match &self.mark {
+            Some(mark) if seq.offset() >= self.offset && seq.holds(mark) => {
+                mark.end().max(seq.offset())
+            }
+            _ => seq.offset(),
+        }
+    }
 }
 
 impl PrefixChecker {
     pub fn new(n: usize) -> Self {
         Self {
             canonical: CanonicalOrder::new(),
-            checked: vec![0; n],
+            verified: (0..n).map(|_| Verified::default()).collect(),
         }
     }
 
@@ -98,7 +122,7 @@ impl PrefixChecker {
         self.canonical.release_to(upto);
     }
 
-    /// Verify one round's snapshots; false = split brain (caller latches).
+    /// Verify one round's snapshots; false = a fork (caller latches). A shrink is re-verified, not flagged.
     pub fn check_round(&mut self, executed: &[ExecutedView<'_>], frontier: u64) -> bool {
         for (i, seq) in executed.iter().enumerate() {
             let len = seq.logical_len();
@@ -121,11 +145,7 @@ impl PrefixChecker {
                  still re-present",
                 self.canonical.start()
             );
-            let start = if len < self.checked[i] {
-                offset
-            } else {
-                self.checked[i].max(offset)
-            };
+            let start = self.verified[i].recheck_from(*seq);
             let overlap = len.min(self.canonical.len());
             if start < overlap && !seq.eq_slice_from(start, self.canonical.slice(start, overlap)) {
                 return false;
@@ -134,7 +154,10 @@ impl PrefixChecker {
                 let reach = self.canonical.len();
                 self.canonical.extend_from_iter(seq.iter_from(reach));
             }
-            self.checked[i] = len;
+            self.verified[i] = Verified {
+                offset,
+                mark: seq.last_sealed(),
+            };
         }
         true
     }

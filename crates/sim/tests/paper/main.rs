@@ -1,6 +1,10 @@
+mod alg1_outcome;
 mod e6_harness;
 mod metrics;
 mod multi_command_clients;
+mod one_late_adversary;
+mod recovery_boundary_prefix;
+mod round_law;
 mod simulation;
 mod smr_compact;
 mod smr_extended;

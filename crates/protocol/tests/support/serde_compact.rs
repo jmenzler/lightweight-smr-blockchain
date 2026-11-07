@@ -34,3 +34,22 @@ fn compact_wire_types_roundtrip_json() {
         serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
     assert_eq!(state2, state);
 }
+
+#[test]
+fn a_wire_state_cannot_demand_an_unbounded_auto_lane() {
+    use protocol::compact::AUTO_CLIENT_BASE;
+    use protocol::shared_state::MAX_WIRE_AUTO_SLOTS;
+
+    let frame = |client: u32| format!(r#"{{"executed":[],"sn":{{"{client}":3}}}}"#);
+    let last_ok = AUTO_CLIENT_BASE + MAX_WIRE_AUTO_SLOTS - 1;
+    let state: SharedState = serde_json::from_str(&frame(AUTO_CLIENT_BASE + 4000)).unwrap();
+    assert_eq!(state.sn_get(AUTO_CLIENT_BASE + 4000), Some(3));
+    assert!(serde_json::from_str::<SharedState>(&frame(last_ok)).is_ok());
+    for client in [last_ok + 1, u32::MAX] {
+        let refused = serde_json::from_str::<SharedState>(&frame(client)).err();
+        assert!(
+            refused.is_some_and(|e| e.to_string().contains("auto-lane")),
+            "client {client} was not refused"
+        );
+    }
+}

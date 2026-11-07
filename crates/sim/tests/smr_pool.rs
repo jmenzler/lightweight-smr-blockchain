@@ -213,9 +213,8 @@ fn an_undersized_pool_aborts_loudly() {
 }
 
 #[test]
-fn a_grid_point_that_exhausts_its_pool_takes_the_grid_down() {
-    // `capture_strip_abort` converts only boundary-strip aborts into rows; an
-    // undersized pool must surface, not be recorded as a run outcome.
+fn a_grid_point_that_exhausts_its_pool_is_an_abort_row() {
+    // A direct run still panics (above); a grid records the point and goes on.
     let mut base: SmrScenarioSpec = serde_json::from_str(
         r#"{"n":16,"seed":0,"k":6,"ell":3,"sigma":5.0,
             "proto":{"kind":"compact","t_commit_rounds":8},
@@ -242,10 +241,10 @@ fn a_grid_point_that_exhausts_its_pool_takes_the_grid_down() {
             seed_count: 1,
         }],
     };
-    let message = panic_message(|| {
-        let _ = run_smr_grid_streaming(&spec, None, None);
-    });
-    assert!(message.contains("client pool exhausted"), "got: {message}");
+    let csv = run_smr_grid_streaming(&spec, None, None).expect("the grid goes on");
+    let row = csv.lines().nth(1).expect("one data row");
+    assert!(row.contains(",abort,1,"), "aborted in round 1: {row}");
+    assert!(row.contains(",pool,"), "kind pool: {row}");
 }
 
 #[test]
@@ -254,30 +253,78 @@ fn pool_runs_replay_identically() {
     assert_eq!(run_smr(&s), run_smr(&s));
 }
 
+const RECOVERY_ACK: Proto = Proto::Recovery {
+    t_window_rounds: T_WINDOW,
+    resend_until_acked: true,
+    prefix_mismatch: sim::smr::PrefixMismatch::Abort,
+};
+
+// p. 25: the client sends "until commitment is acknowledged by the contacted server", so its
+// slot frees on that ack, as in compact, not on the observer's all-executed latch.
 #[test]
-fn validation_rejects_pool_under_the_ack_tied_recovery_client() {
-    // With `resend_until_acked` the client stays pending until its committed
-    // ack, but the pool frees the slot at the strictly earlier all-executed
-    // latch — so a successor would mint while its predecessor is still
-    // resending, putting two commands on one client id in the same round.
-    let ack_mode = scenario(
-        Proto::Recovery {
-            t_window_rounds: T_WINDOW,
-            resend_until_acked: true,
-            prefix_mismatch: sim::smr::PrefixMismatch::Abort,
-        },
-        8,
-        &[(1, 1)],
-        20,
-    );
-    let err = ack_mode
-        .validate()
-        .expect_err("ack-mode recovery cannot pace a pool");
-    assert!(err.contains("client_model pool"), "got: {err}");
+fn ack_mode_recovery_frees_a_pool_client_at_its_committed_ack_and_not_before() {
+    let first = &single_arrival(RECOVERY_ACK).commands[0];
+    let executed = first.executed_round.expect("executes inside the horizon");
+    let acked = first.committed_ack_round.expect("acked inside the horizon");
+    assert!(acked > executed, "precondition: the ack trails the latch");
+
+    let at_latch = panic_message(|| {
+        run_smr(&scenario(
+            RECOVERY_ACK,
+            1,
+            &[(1, 1), (2, 0), (executed + 1, 1), (executed + 2, 0)],
+            120,
+        ));
+    });
     assert!(
-        err.contains("one-in-flight"),
-        "the message must name the invariant that breaks: {err}"
+        at_latch.contains("client pool exhausted"),
+        "the slot is busy until the ack, got: {at_latch}"
     );
+
+    let report = run_smr(&scenario(
+        RECOVERY_ACK,
+        1,
+        &[(1, 1), (2, 0), (acked + 1, 1), (acked + 2, 0)],
+        120,
+    ));
+    let next = successor(&report, AUTO_CLIENT_BASE);
+    assert_eq!(
+        next.injection_round,
+        acked + 1,
+        "drawable the round after the ack"
+    );
+    assert!(
+        next.delivered_round.is_some(),
+        "the successor spreads on sn(c) + 1"
+    );
+    assert_eq!(report.pool_peak_in_flight, Some(1));
+}
+
+#[test]
+fn an_ack_mode_recovery_pool_keeps_one_command_in_flight_per_client() {
+    let report = run_smr(&scenario(RECOVERY_ACK, 64, &[(1, 1)], 200));
+    let mut by_client: std::collections::BTreeMap<u32, Vec<&CommandReport>> =
+        std::collections::BTreeMap::new();
+    for c in &report.commands {
+        by_client.entry(c.client).or_default().push(c);
+    }
+    assert!(
+        report.commands.len() > by_client.len(),
+        "the run must reuse clients"
+    );
+    for (client, mut cmds) in by_client {
+        cmds.sort_by_key(|c| c.injection_round);
+        for pair in cmds.windows(2) {
+            let acked = pair[0]
+                .committed_ack_round
+                .expect("a successor exists only after an ack");
+            assert!(
+                pair[1].injection_round > acked,
+                "client {client}: injected at {} before its predecessor's ack at {acked}",
+                pair[1].injection_round
+            );
+        }
+    }
 }
 
 #[test]

@@ -52,6 +52,13 @@ fn main() {
     }
 }
 
+#[derive(Default)]
+struct Tally {
+    checks: usize,
+    at_ack_ok: usize,
+    at_ack_total: usize,
+}
+
 fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
     let proto = Proto::Compact {
         t_commit_rounds: t_commit(n),
@@ -67,6 +74,18 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
         ClientModel::Unique,
         None,
     );
+    let mut tally = Tally::default();
+    let outcome = drive_cell(&mut state, &mut tally, beta, n);
+    ledger(&state, beta, n, seed, &tally, outcome.as_ref().err());
+    outcome
+}
+
+fn drive_cell(
+    state: &mut SmrState,
+    tally: &mut Tally,
+    beta: f64,
+    n: usize,
+) -> Result<String, String> {
     let mut harness = CertHarness::new(n);
     let mut actors: Vec<Actor> = CLIENTS
         .iter()
@@ -80,9 +99,6 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
         harness.register_client(a.client);
     }
 
-    let mut checks = 0usize;
-    let mut at_ack_ok = 0usize;
-    let mut at_ack_total = 0usize;
     let mut stale: Option<(Certificate, u64)> = None;
     let mut mask = vec![false; n];
 
@@ -96,8 +112,23 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
                         .build_certificate(a.issued)
                         .ok_or("no certificate at ack")?;
                     let t = harness.verify_everywhere(a.client, &cert, &mask);
-                    at_ack_total += 1;
-                    at_ack_ok += usize::from(t.covered > 0 && t.accepted == t.covered);
+                    tally.at_ack_total += 1;
+                    tally.at_ack_ok += usize::from(t.covered > 0 && t.accepted == t.covered);
+                }
+                if a.issued > 1 {
+                    let prev = harness
+                        .client(a.client)
+                        .build_certificate(a.issued - 1)
+                        .ok_or("no chained certificate at ack")?;
+                    let t = harness.verify_everywhere(a.client, &prev, &mask);
+                    if t.covered == 0 || t.accepted != t.covered {
+                        return Err(format!(
+                            "at-ack chained sn {}: {}/{} accepted",
+                            a.issued - 1,
+                            t.accepted,
+                            t.covered
+                        ));
+                    }
                 }
                 let op = a.next_op;
                 a.next_op += 1;
@@ -111,7 +142,7 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
 
         mask = state.sample_mask(state.blocked_count(beta));
         state.step_masked(&mask);
-        harness.observe_round(&state);
+        harness.observe_round(state);
 
         if !state.report().safety_ok {
             return Err(format!("split brain at round {round}"));
@@ -127,17 +158,18 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
                 .map(|c| (c, sn));
         }
         if round % CHECK_EVERY == 0 {
-            checks += verify_all(&harness, &actors, &mask)?;
+            tally.checks += verify_all(&harness, &actors, &mask)?;
         }
     }
 
     let no_block = vec![false; n];
-    checks += verify_all(&harness, &actors, &no_block)?;
+    tally.checks += verify_all(&harness, &actors, &no_block)?;
     tamper_checks(&harness, &no_block)?;
 
-    if at_ack_ok != at_ack_total {
+    if tally.at_ack_ok != tally.at_ack_total {
         return Err(format!(
-            "at-ack verification failed: {at_ack_ok}/{at_ack_total}"
+            "at-ack verification failed: {}/{}",
+            tally.at_ack_ok, tally.at_ack_total
         ));
     }
     let (stale_cert, stale_sn) = stale.ok_or("no stale certificate captured")?;
@@ -152,15 +184,14 @@ fn run_cell(beta: f64, n: usize, seed: u64) -> Result<String, String> {
         ));
     }
 
-    ledger(&state, beta, n, seed, checks, at_ack_ok, at_ack_total);
     let committed: u64 = CLIENTS.iter().map(|&c| harness.acked_sn(c)).sum();
     Ok(format!(
-        "ok — {committed} commands, {checks} cert checks, at-ack {at_ack_ok}/{at_ack_total}, stale rejected {}/{} servers",
-        t.covered, t.covered
+        "ok — {committed} commands, {} cert checks, at-ack {}/{}, stale rejected {}/{} servers",
+        tally.checks, tally.at_ack_ok, tally.at_ack_total, t.covered, t.covered
     ))
 }
 
-// Thm 6: every committed sn of every actor verifies at every covering useful server.
+// Thm 6: every committed sn of every actor verifies at every useful server.
 fn verify_all(harness: &CertHarness, actors: &[Actor], mask: &[bool]) -> Result<usize, String> {
     let mut checks = 0;
     for a in actors {
@@ -171,7 +202,7 @@ fn verify_all(harness: &CertHarness, actors: &[Actor], mask: &[bool]) -> Result<
                 .ok_or_else(|| format!("client {} sn {sn}: no certificate", a.client))?;
             let VerifyTally { covered, accepted } =
                 harness.verify_everywhere(a.client, &cert, mask);
-            if accepted != covered {
+            if covered == 0 || accepted != covered {
                 return Err(format!(
                     "client {} sn {sn}: {accepted}/{covered} accepted",
                     a.client
@@ -238,19 +269,49 @@ fn tamper_checks(harness: &CertHarness, mask: &[bool]) -> Result<(), String> {
             ));
         }
     }
+    newest_tamper_checks(harness, mask)
+}
+
+// The newest command of each client verifies as a bare entry; the same sn with other content must not.
+fn newest_tamper_checks(harness: &CertHarness, mask: &[bool]) -> Result<(), String> {
+    for client in CLIENTS {
+        let sn = harness.acked_sn(client);
+        let Some(Certificate::Newest {
+            entry: Entry::Cmd(c),
+        }) = harness.client(client).build_certificate(sn)
+        else {
+            return Err(format!("client {client}: expected a newest command"));
+        };
+        let honest = Certificate::Newest {
+            entry: Entry::Cmd(c),
+        };
+        let t = harness.verify_everywhere(client, &honest, mask);
+        if t.covered == 0 || t.accepted != t.covered {
+            return Err(format!(
+                "newest sn {sn}: {}/{} accepted",
+                t.accepted, t.covered
+            ));
+        }
+        let forged = Certificate::Newest {
+            entry: Entry::Cmd(ClientCommand {
+                op: c.op + 1_000_000,
+                ..c
+            }),
+        };
+        let t = harness.verify_everywhere(client, &forged, mask);
+        if t.accepted != 0 {
+            return Err(format!(
+                "tamper newest altered-op: accepted {}/{}",
+                t.accepted, t.covered
+            ));
+        }
+    }
     Ok(())
 }
 
-// Ledgered as its byte-identical batch replay (actual injection rounds exported).
-fn ledger(
-    state: &SmrState,
-    beta: f64,
-    n: usize,
-    seed: u64,
-    checks: usize,
-    ok: usize,
-    total: usize,
-) {
+// Ledgered as its byte-identical batch replay (actual injection rounds exported), failed cells
+// included: a cell that stops early replays for the rounds it ran.
+fn ledger(state: &SmrState, beta: f64, n: usize, seed: u64, tally: &Tally, error: Option<&String>) {
     let Some(ledger) = ledger_target(None) else {
         return;
     };
@@ -263,7 +324,7 @@ fn ledger(
             t_commit_rounds: t_commit(n),
         },
         injections: state.injections(),
-        max_rounds: ROUNDS,
+        max_rounds: state.round(),
         schedule: BlockSchedule::FreshPerRound { fraction: beta },
         traffic: None,
         client_model: ClientModel::Unique,
@@ -277,9 +338,10 @@ fn ledger(
     let extra = serde_json::json!({
         "exp": "E6",
         "beta": beta,
-        "cert_checks": checks,
-        "at_ack_ok": ok,
-        "at_ack_total": total,
+        "cert_checks": tally.checks,
+        "at_ack_ok": tally.at_ack_ok,
+        "at_ack_total": tally.at_ack_total,
+        "error": error,
     });
     log_smr_run_to(&ledger, &scenario, &state.report(), Some(extra))
         .expect("run ledger write failed (set SIM_RUNLOG=off to opt out)");

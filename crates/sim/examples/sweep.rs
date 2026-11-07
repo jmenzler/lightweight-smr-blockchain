@@ -1,6 +1,6 @@
-use sim::{BlockSchedule, Init, Outcome, Scenario, run_logged, run_traced};
+use sim::{BlockSchedule, Init, Scenario, run_logged, run_traced};
 
-// Gray-zone sweep over the blocking fraction beta.
+// Pre-registered gray-zone sweep (prereg/2026-07-21-gray-zone-sweep.md + Amendment 1).
 // Usage: sweep <fresh|permanent|smoke> [out.csv]
 // Holder-fraction series (P3) recorded for fresh arm, n=1000, beta in {0.135,0.140,0.145}.
 fn main() {
@@ -62,14 +62,8 @@ fn main() {
                 } else {
                     run_logged(&scenario, None).0
                 };
-                let (label, rounds) = match outcome {
-                    Outcome::Agreement { rounds, .. } => {
-                        survived += 1;
-                        ("agreement", rounds)
-                    }
-                    Outcome::AllUndecided { rounds } => ("died", rounds),
-                    Outcome::NoConvergence { rounds } => ("censored", rounds),
-                };
+                survived += u64::from(outcome.survived());
+                let (label, rounds) = outcome.label();
                 csv.push_str(&format!("{arm},{n},{beta},{seed},{label},{rounds}\n"));
             }
             eprintln!("{arm} n={n} beta={beta:.3}: {survived}/{seed_count} survived");

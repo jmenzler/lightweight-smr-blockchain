@@ -31,6 +31,14 @@ function chainDelta() {
   return out;
 }
 
+// Certificates and the chain delta are read only when the page's block drawer shows them.
+function feeds(m) {
+  return {
+    certs: m.wantCerts ? smrLive.certs_json() : undefined,
+    chain: m.wantChain ? chainDelta() : undefined,
+  };
+}
+
 onmessage = ev => {
   const m = ev.data;
   ready.then(() => {
@@ -55,7 +63,10 @@ onmessage = ev => {
         }
         case 'live-step': {
           if (!live) throw new Error('no live session');
-          postMessage({ type: 'live-round', json: live.step(m.fraction) });
+          const json = live.step(m.fraction);
+          const out = JSON.parse(json);
+          if (out.error) postMessage({ type: 'error', error: out.error });
+          else postMessage({ type: 'live-round', json });
           break;
         }
         case 'live-export': {
@@ -92,14 +103,16 @@ onmessage = ev => {
           if (smrLive) { smrLive.free(); smrLive = null; }
           chainFrom = 0;
           smrLive = wasm_bindgen.LiveSmr.new_with_mode(JSON.stringify(m.spec), !!m.sticky);
-          postMessage({ type: 'smr-live-ready', report: smrLive.report_json(), certs: smrLive.certs_json(), chain: chainDelta() });
+          postMessage({ type: 'smr-live-ready', delta: smrLive.report_delta_json() });
           break;
         }
         case 'smr-live-step': {
           if (!smrLive) throw new Error('no smr live session');
           const status = smrLive.step(m.fraction);
           const parsed = JSON.parse(status);
-          if (parsed.failure) {
+          if (parsed.error) {
+            postMessage({ type: 'error', error: parsed.error });
+          } else if (parsed.failure) {
             const report = smrLive.report_json();
             const scenario = smrLive.export_scenario();
             postMessage({
@@ -111,14 +124,50 @@ onmessage = ev => {
               failure: parsed.failure,
             });
           } else {
-            postMessage({ type: 'smr-round', status, report: smrLive.report_json(), certs: smrLive.certs_json(), chain: chainDelta() });
+            postMessage({ type: 'smr-round', status, delta: smrLive.report_delta_json(), ...feeds(m) });
+          }
+          break;
+        }
+        // Fast path: one fraction per round, stepped back to back, and the
+        // report / certs / chain read once at the end. Stops early on an absorbing
+        // status, and a typed failure leaves the same message a single step does.
+        case 'smr-live-steps': {
+          if (!smrLive) throw new Error('no smr live session');
+          let status = null;
+          let steps = 0;
+          let stop = false;
+          for (const fraction of m.fractions) {
+            status = smrLive.step(fraction);
+            steps++;
+            const parsed = JSON.parse(status);
+            if (parsed.error) {
+              postMessage({ type: 'error', error: parsed.error });
+              stop = true;
+              break;
+            }
+            if (parsed.failure) {
+              postMessage({
+                type: 'smr-failed',
+                mode: 'live',
+                status,
+                report: smrLive.report_json(),
+                scenario: smrLive.export_scenario(),
+                failure: parsed.failure,
+              });
+              stop = true;
+              break;
+            }
+            if (parsed.absorbed || parsed.dead !== null) break;
+          }
+          if (!stop && status !== null) {
+            postMessage({ type: 'smr-round', status, steps, delta: smrLive.report_delta_json(), ...feeds(m) });
           }
           break;
         }
         case 'smr-live-inject': {
           if (!smrLive) throw new Error('no smr live session');
           // wasm-bindgen maps Rust u64 to JS BigInt
-          postMessage({ type: 'smr-injected', quiet: !!m.quiet, json: smrLive.inject(m.client, BigInt(m.op), m.target === null ? undefined : m.target), certs: smrLive.certs_json(), chain: chainDelta() });
+          postMessage({ type: 'smr-injected', quiet: !!m.quiet, json: smrLive.inject(m.client, BigInt(m.op), m.target === null ? undefined : m.target), ...feeds(m) });
           break;
         }
         case 'smr-capture-stale': {
@@ -139,6 +188,16 @@ onmessage = ev => {
         case 'smr-live-export': {
           if (!smrLive) throw new Error('no smr live session');
           postMessage({ type: 'smr-scenario', json: smrLive.export_scenario() });
+          break;
+        }
+        case 'smr-live-feeds': {
+          if (!smrLive) throw new Error('no smr live session');
+          postMessage({ type: 'smr-feeds', ...feeds(m) });
+          break;
+        }
+        case 'smr-live-report': {
+          if (!smrLive) throw new Error('no smr live session');
+          postMessage({ type: 'smr-report', json: smrLive.report_json() });
           break;
         }
         case 'smr-node-detail': {

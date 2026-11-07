@@ -1,5 +1,6 @@
 //! A sequence held as sealed immutable chunks plus one owned tail.
 
+use crate::compact::{Entry, Timed};
 use std::sync::Arc;
 
 /// Chunk capacity for logs: measured, a power of two, and output-invisible.
@@ -142,9 +143,10 @@ impl<T: Clone, const K: usize> ChunkSeq<T, K> {
     }
 
     /// Strict equality over the frame and every retained entry, as interning requires.
+    /// `Eq` makes a shared chunk equal to itself, so it is not compared entry by entry.
     pub fn represents_same_as(&self, other: &Self) -> bool
     where
-        T: PartialEq,
+        T: Eq,
     {
         self.start == other.start
             && self.base_chunk == other.base_chunk
@@ -154,7 +156,7 @@ impl<T: Clone, const K: usize> ChunkSeq<T, K> {
                 .sealed
                 .iter()
                 .zip(other.sealed.iter())
-                .all(|(a, b)| a[..] == b[..])
+                .all(|(a, b)| Arc::ptr_eq(a, b) || a[..] == b[..])
     }
 
     /// Live entries covered by the first `chunks` sealed chunks, in relative units.
@@ -246,7 +248,10 @@ impl<T: Clone, const K: usize> ChunkSeq<T, K> {
     }
 
     /// Mutable access to the live entry at `rel`, copying its chunk first if shared.
-    pub fn make_mut_at(&mut self, rel: usize) -> &mut T {
+    pub fn make_mut_at(&mut self, rel: usize) -> &mut T
+    where
+        T: WriteInPlace,
+    {
         let at = self.start + rel as u64;
         assert!(at < self.end(), "write past the end at {at}");
         let chunk = (at as usize) / K;
@@ -298,6 +303,53 @@ impl<T: Clone, const K: usize> ChunkSeq<T, K> {
     /// Materialise the live entries; cold paths and tests only.
     pub fn to_vec(&self) -> Vec<T> {
         self.iter().cloned().collect()
+    }
+}
+
+/// Element types a sequence may overwrite in place; executed commands are not one.
+pub trait WriteInPlace {}
+
+impl WriteInPlace for Timed {}
+
+#[cfg(test)]
+impl WriteInPlace for u64 {}
+
+/// A sealed chunk and its absolute index; holding the handle keeps the allocation from reuse.
+#[derive(Debug, Clone)]
+pub struct SealedMark<T> {
+    chunk: usize,
+    end: u64,
+    handle: Arc<[T]>,
+}
+
+impl<T> SealedMark<T> {
+    /// One past the chunk's last position.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+}
+
+// Entry is not `WriteInPlace`, so a sealed chunk of an Entry sequence is never
+// replaced or written: holders gain it only together with every chunk before it
+// (clone, adopt) and lose chunks only from the front.
+impl<const K: usize> ChunkSeq<Entry, K> {
+    pub fn last_sealed(&self) -> Option<SealedMark<Entry>> {
+        let handle = self.sealed.last()?;
+        let chunk = self.base_chunk + self.sealed.len() - 1;
+        Some(SealedMark {
+            chunk,
+            end: ((chunk + 1) * K) as u64,
+            handle: Arc::clone(handle),
+        })
+    }
+
+    /// True iff this holds the mark's allocation at its index; then it agrees with
+    /// every other holder on each position below `mark.end()` that both retain.
+    pub fn holds(&self, mark: &SealedMark<Entry>) -> bool {
+        mark.chunk
+            .checked_sub(self.base_chunk)
+            .and_then(|i| self.sealed.get(i))
+            .is_some_and(|c| Arc::ptr_eq(c, &mark.handle))
     }
 }
 

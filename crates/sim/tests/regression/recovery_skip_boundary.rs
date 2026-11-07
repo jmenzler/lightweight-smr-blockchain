@@ -4,10 +4,10 @@ use sim::smr::{
 };
 use sim::sweep::{AnySpec, expand_smr, parse_specs};
 
-/// The ratio-8 recovery spec from the prefix-abort diagnosis.
+/// The ratio-8 recovery spec of `experiments/e9-recovery/evidence/diag-prefix-abort-spec.json`.
 const SPEC: &str = r#"[{"exp": "DBG-rec", "base": {"n": 32, "seed": 0, "k": 6, "ell": 3,
-    "sigma": 1.0, "proto": {"kind": "recovery", "t_window_rounds": 26}, "injections": [],
-    "max_rounds": 208, "traffic": {"kind": "pmf", "arrivals_pmf": [0.0, 0.0, 0.0, 0.0, 1.0]},
+    "sigma": 1.0, "proto": {"kind": "recovery", "t_window_rounds": 26, "resend_until_acked": false},
+    "injections": [], "max_rounds": 208, "traffic": {"kind": "pmf", "arrivals_pmf": [0.0, 0.0, 0.0, 0.0, 1.0]},
     "schedule": {"kind": "fresh_per_round", "fraction": 0.0}},
     "ladder": [{"n": 32, "seed_base": 0, "seed_count": 1}]}]"#;
 
@@ -259,8 +259,8 @@ fn a_guarded_run_without_repeats_reports_no_skips_and_keeps_its_bytes() {
 #[test]
 fn the_spec_opts_in_by_name_and_keeps_the_default_off_the_wire() {
     let opted = SPEC.replace(
-        r#""t_window_rounds": 26}"#,
-        r#""t_window_rounds": 26, "prefix_mismatch": "skip_boundary"}"#,
+        r#""resend_until_acked": false}"#,
+        r#""resend_until_acked": false, "prefix_mismatch": "skip_boundary"}"#,
     );
     let specs = parse_specs(&opted).expect("spec parses");
     let AnySpec::Smr(grid) = &specs[0] else {
@@ -323,6 +323,12 @@ fn the_ledger_carries_skip_episodes_only_when_a_boundary_was_skipped() {
         report.max_rejoin_rounds.expect("the minority rejoined")
     );
     assert!(outcome.get("unrejoined_nodes").is_none(), "{outcome}");
+    assert_eq!(
+        outcome["longest_stale_rounds"],
+        report
+            .longest_stale_rounds
+            .expect("an episode was observed")
+    );
 
     let clean = ledger_outcome(&scenario(4330000, PrefixMismatch::SkipBoundary), "clean");
     for key in [
@@ -330,18 +336,21 @@ fn the_ledger_carries_skip_episodes_only_when_a_boundary_was_skipped() {
         "first_boundary_skip_round",
         "last_boundary_skip_round",
         "max_rejoin_rounds",
+        "longest_stale_rounds",
         "unrejoined_nodes",
+        "horizon_skip_nodes",
     ] {
         assert!(clean.get(key).is_none(), "{key}: {clean}");
     }
 }
 
-/// Ratio-4 seed where both repairs are on and a minority P that prefixes its holder's log commits.
+/// Ratio-4 seed where both repairs are on and a minority P that prefixes its holder's log commits:
+/// the run forks, but no server's executed sequence ever holds a (client, sn) twice.
 #[test]
-fn seed_4420464_records_the_double_execution_and_runs_to_the_horizon() {
+fn seed_4420464_forks_without_a_double_execution_and_runs_to_the_horizon() {
     let spec: sim::spec::SmrScenarioSpec = serde_json::from_value(serde_json::json!({
         "n": 32, "seed": 4420464, "k": 6, "ell": 3, "sigma": 1.0,
-        "proto": {"kind": "recovery", "t_window_rounds": 13, "prefix_mismatch": "skip_boundary"},
+        "proto": {"kind": "recovery", "t_window_rounds": 13, "resend_until_acked": false, "prefix_mismatch": "skip_boundary"},
         "repeated_commit": "skip", "injections": [], "max_rounds": 130,
         "traffic": {"kind": "pmf", "arrivals_pmf": [0.0, 0.0, 0.0, 0.0, 1.0]},
         "schedule": {"kind": "fresh_per_round", "fraction": 0.0},
@@ -349,6 +358,6 @@ fn seed_4420464_records_the_double_execution_and_runs_to_the_horizon() {
     .expect("spec parses");
     let report = sim::smr::run_smr_grid(&SmrScenario::try_from(spec).expect("valid"));
     assert_eq!(report.terminal, SmrTerminal::Ran { rounds: 130 });
-    assert_eq!(report.exec_dup_round, Some(92));
+    assert_eq!(report.exec_dup_round, None);
     assert!(!report.safety_ok);
 }

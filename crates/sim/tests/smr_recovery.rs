@@ -632,6 +632,61 @@ fn reset_and_no_reset_never_coexist_at_any_window_end() {
 }
 
 #[test]
+fn reset_and_no_reset_never_coexist_at_a_window_end_under_client_load() {
+    // Lemma 6.1 again, now with one client command arriving every round, so the logs the
+    // boundary commits are non-trivial; the checkpoint lineage (Lemma 6.5) must stay one
+    // chain through every boundary of the run.
+    let n = 32;
+    let loaded = |seed: u64, schedule: BlockSchedule| {
+        let mut s = scenario(n, seed, 36, vec![]);
+        s.max_rounds = 324;
+        s.traffic = Some(vec![TrafficPhase {
+            from_round: 1,
+            arrivals_pmf: sim::smr::point_mass_pmf(1),
+        }]);
+        s.schedule = schedule;
+        s
+    };
+    let mut surge_resets = 0;
+    for seed in 0..8 {
+        let shapes = [
+            BlockSchedule::FreshPerRound { fraction: 0.1 },
+            BlockSchedule::Windows(vec![window(150, 70, BlockTarget::SampleFraction(0.5))]),
+        ];
+        for (shape, schedule) in shapes.into_iter().enumerate() {
+            let report = run_smr(&loaded(seed, schedule));
+            let rec = report.recovery.as_ref().expect("recovery block");
+            for boundary in (36..=324).step_by(36) {
+                let row = rec.rounds[boundary - 1];
+                assert!(
+                    !(row.reset > 0 && row.noreset > 0),
+                    "seed {seed} shape {shape} row {boundary}: reset ({}) and no-reset ({}) coexist",
+                    row.reset,
+                    row.noreset
+                );
+                if shape == 1 {
+                    surge_resets += u64::from(row.reset > 0);
+                }
+            }
+            assert!(
+                rec.rounds.iter().all(|row| row.cp_fork_k <= 1),
+                "seed {seed} shape {shape}: two checkpoints at the largest window"
+            );
+            assert!(report.safety_ok && rec.fork_ok, "seed {seed} shape {shape}");
+            let committed = rec.rounds.iter().map(|row| row.max_checkpoint_window).max();
+            assert!(
+                committed > Some(3) && report.metrics[200].max_executed_len > 0,
+                "seed {seed} shape {shape}: the load must produce commits before the surge ends"
+            );
+        }
+    }
+    assert!(
+        surge_resets > 0,
+        "the surge shape must exercise reset at some window end"
+    );
+}
+
+#[test]
 fn arbitrary_blocking_hammer_upholds_monotonicity_prefix_consistency_and_checkpoint_lineage() {
     // Safety only — arbitrary blocking includes never-recovering shapes, so
     // no liveness claims. Lemma 6.9 (monotonicity) + Lemma 6.5/Cor 6.6/6.7
@@ -744,7 +799,8 @@ fn previously_blocked_minority_never_commits_a_divergent_sequence_after_block_re
     // guarantee), then REVERSE the block so M alone runs (a surge, 12 <
     // n/4) and feed it a poison command. M must never commit a divergent
     // sequence; after full release the system re-solves the commitment
-    // problem on the majority's history (Def 1.4 re-solved end to end).
+    // problem on the majority's history (Def 1.4 re-solved end to end). This reversal starves
+    // M by construction; the one where the blocked group can progress is the next test.
     let m_nodes: Vec<u32> = (0..12).collect();
     let majority: Vec<u32> = (12..128).collect();
     for seed in 0..20 {
@@ -849,6 +905,88 @@ fn previously_blocked_minority_never_commits_a_divergent_sequence_after_block_re
 }
 
 #[test]
+fn a_previously_blocked_group_that_can_progress_adopts_the_newest_checkpoint_and_forks_nothing() {
+    // The p. 29-30 attack with a reversal that does NOT starve: B = 30 of 128 nodes (23%)
+    // sit out while the other 98 commit op B; then 30 of those 98 are blocked, so the active
+    // group B + 68 holders (98 nodes, 76%) can keep running. B must adopt the holders'
+    // newest checkpoint instead of minting on its stale history, op C pinned to a B node
+    // commits on top of [A, B], and no two checkpoints of the largest window ever differ.
+    let blocked_first: Vec<u32> = (0..30).collect();
+    let blocked_second: Vec<u32> = (98..128).collect();
+    for seed in 0..6 {
+        let mut s = scenario(
+            128,
+            seed,
+            40,
+            vec![
+                inj(5, 1, 101),
+                inj(130, 2, 102),
+                Injection {
+                    round: 300,
+                    client: 3,
+                    op: 103,
+                    target: Some(3),
+                },
+            ],
+        );
+        s.max_rounds = 720;
+        s.schedule = BlockSchedule::Windows(vec![
+            window(121, 160, BlockTarget::Nodes(blocked_first.clone())),
+            window(281, 160, BlockTarget::Nodes(blocked_second.clone())),
+        ]);
+        let report = run_smr(&s);
+        let rec = report.recovery.as_ref().expect("recovery block");
+        let (m, rows) = (&report.metrics, &rec.rounds);
+
+        assert!(report.safety_ok, "seed {seed}: split brain");
+        assert!(rec.fork_ok, "seed {seed}: checkpoint lineage forked");
+        assert!(
+            rows.iter()
+                .all(|row| row.cp_fork_k <= 1 && row.rollbacks == 0),
+            "seed {seed}: two checkpoints at the largest window, or a rollback"
+        );
+        assert!(
+            rows.windows(2)
+                .all(|w| w[1].max_checkpoint_window >= w[0].max_checkpoint_window),
+            "seed {seed}: the newest checkpoint window went backwards"
+        );
+
+        // The first group really sat out the commit of op B at [A].
+        assert_eq!(
+            (m[245 - 1].min_executed_len, m[245 - 1].max_executed_len),
+            (1, 2),
+            "seed {seed}: the others at [A, B], the blocked group frozen at [A]"
+        );
+        // After the reversal the active group sustains itself and the first group has caught
+        // up to [A, B] long before op C could commit.
+        for round in 320..=440 {
+            assert!(
+                m[round - 1].nonbot_logs >= 80,
+                "seed {seed} round {round}: the active group must stay alive, not spiral"
+            );
+            assert!(
+                m[round - 1].min_executed_len >= 2,
+                "seed {seed} round {round}: the first group is back at [A, B]"
+            );
+        }
+
+        let op_c = &report.commands[2];
+        assert_eq!(
+            op_c.status,
+            sim::smr::CommandStatus::Complete,
+            "seed {seed}"
+        );
+        assert!(op_c.executed_round.is_some_and(|r| r > 300), "seed {seed}");
+        let last = m.last().unwrap();
+        assert_eq!(
+            (last.min_executed_len, last.max_executed_len),
+            (3, 3),
+            "seed {seed}: final history [A, B, C] everywhere"
+        );
+    }
+}
+
+#[test]
 fn golden_recovery_landmarks_are_stable() {
     // Frozen values pin the stage order AND the boundary-after-(f) timing:
     // same-seed replay passes under any consistent reorder, only these
@@ -914,7 +1052,8 @@ mod recovered_round {
     use sim::smr::{RecRoundMetrics, RecoveryReport, SmrReport, SmrRoundMetrics, SmrTerminal};
 
     /// A report whose per-round (nonbot_logs, reset, min_exec, max_exec)
-    /// come from the given vector; all other fields are irrelevant zeros.
+    /// come from the given vector, the useful servers agreeing iff min_exec
+    /// == max_exec; all other fields are irrelevant zeros.
     fn report(rows: &[(u32, u32, u32, u32)]) -> SmrReport {
         SmrReport {
             metrics: rows
@@ -928,6 +1067,7 @@ mod recovered_round {
                         max_log_len: 0,
                         min_executed_len,
                         max_executed_len,
+                        useful_executed: Some((min_executed_len, max_executed_len)),
                         arrivals: 0,
                         lcp_len: 0,
                     },
@@ -937,20 +1077,31 @@ mod recovered_round {
             terminal: SmrTerminal::Ran { rounds: rows.len() },
             safety_ok: true,
             exec_dup_round: None,
+            retractions: 0,
+            retraction_rewrites: 0,
+            first_retraction_round: None,
+            strong_safety_violation_rounds: 0,
+            strong_safety_first_violation: None,
+            strong_safety_boundary_violations: 0,
+            strong_safety_boundary_first_violation: None,
             repeat_skips: 0,
             first_repeat_skip_round: None,
             boundary_skip_events: 0,
             first_boundary_skip_round: None,
             last_boundary_skip_round: None,
             max_rejoin_rounds: None,
+            longest_stale_rounds: None,
             unrejoined_nodes: 0,
+            horizon_skip_nodes: 0,
+            wedged_round: None,
             failure: None,
             recovery: Some(RecoveryReport {
                 fork_ok: true,
+                commit_fork_round: None,
                 rounds: rows
                     .iter()
                     .enumerate()
-                    .map(|(i, &(_, reset, _, _))| RecRoundMetrics {
+                    .map(|(i, &(_, reset, lo, hi))| RecRoundMetrics {
                         noreset: 0,
                         reset,
                         bot_r: 0,
@@ -960,6 +1111,7 @@ mod recovered_round {
                         rollback_depth: 0,
                         cp_fork_k: 0,
                         max_cp_p_len: 0,
+                        useful_agree: Some(lo == hi),
                     })
                     .collect(),
             }),
@@ -1016,6 +1168,38 @@ mod recovered_round {
         // 30}; the suffix from 40 is clean, so the run recovered at 40.
         let r = boundaries([(0, 32, 0, 0), (32, 0, 1, 1), (23, 0, 1, 1), (32, 0, 1, 1)]);
         assert_eq!(r.recovered_round(32, 10), Some(40));
+    }
+
+    #[test]
+    fn a_lagging_blocked_server_does_not_hold_back_convergence_among_useful_servers() {
+        // Lengths over all servers differ at every boundary; the useful servers agree from 20.
+        let mut r = boundaries([(0, 32, 0, 0), (32, 0, 1, 2), (32, 0, 1, 2), (32, 0, 1, 2)]);
+        for b in [20, 30, 40] {
+            r.recovery.as_mut().unwrap().rounds[b - 1].useful_agree = Some(true);
+        }
+        assert_eq!(r.recovered_round(32, 10), Some(20));
+    }
+
+    #[test]
+    fn a_lagging_useful_server_still_blocks_convergence() {
+        let mut r = boundaries([(0, 32, 0, 0), (32, 0, 2, 2), (32, 0, 2, 2), (32, 0, 2, 2)]);
+        r.recovery.as_mut().unwrap().rounds[19].useful_agree = Some(false);
+        assert_eq!(r.recovered_round(32, 10), Some(30));
+    }
+
+    #[test]
+    fn equal_lengths_with_different_sequences_are_not_convergence() {
+        let mut r = boundaries([(0, 32, 0, 0), (32, 0, 2, 2), (32, 0, 2, 2), (32, 0, 2, 2)]);
+        r.recovery.as_mut().unwrap().rounds[19].useful_agree = Some(false);
+        assert_eq!(r.metrics[19].useful_executed, Some((2, 2)));
+        assert_eq!(r.recovered_round(32, 10), Some(30));
+    }
+
+    #[test]
+    fn no_useful_server_is_not_convergence() {
+        let mut r = boundaries([(32, 0, 1, 1), (32, 0, 1, 1), (32, 0, 1, 1), (32, 0, 1, 1)]);
+        r.recovery.as_mut().unwrap().rounds[9].useful_agree = None;
+        assert_eq!(r.recovered_round(32, 10), Some(20));
     }
 
     #[test]
@@ -1383,12 +1567,15 @@ fn a_manual_block_masks_exactly_its_node_over_a_half_open_window() {
             Some(sim::smr::AttemptOutcome::TargetBlocked),
             "round {round}"
         );
-        assert_eq!(
-            attempt_at(&plain, round),
-            Some(sim::smr::AttemptOutcome::Delivered),
-            "round {round}: unblocked twin delivers"
-        );
     }
+    // The unblocked twin reaches node 3 every round; Alg 5 amplifies while x ∉ L_3, then ignores it.
+    let delivered = Some(sim::smr::AttemptOutcome::Delivered);
+    let ignored = Some(sim::smr::AttemptOutcome::Ignored);
+    assert_eq!(
+        [5, 6, 7].map(|round| attempt_at(&plain, round)),
+        [delivered, delivered, ignored],
+        "unblocked twin"
+    );
     // Half-open: round 8 is off the mask. The node still answers ⊥ because
     // three blocked rounds emptied its log — that is the block's aftermath,
     // not the block, and only an unmasked target can report it.
@@ -1446,9 +1633,10 @@ fn an_open_ended_manual_block_runs_to_the_horizon_under_every_schedule() {
 #[test]
 fn manual_blocks_stay_off_the_wire_when_unused() {
     let json = r#"{"n":16,"seed":7,"k":6,"ell":3,"sigma":5.0,
-        "proto":{"kind":"recovery","t_window_rounds":10},
+        "proto":{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false},
         "injections":[],"max_rounds":25}"#;
-    let spec: SmrScenarioSpec = serde_json::from_str(json).expect("old specs still parse");
+    let spec: SmrScenarioSpec =
+        serde_json::from_str(json).expect("a spec without an overlay parses");
     assert!(spec.manual_blocks.is_empty());
     let round_tripped = serde_json::to_string(&spec).expect("serializes");
     assert!(
@@ -1457,7 +1645,7 @@ fn manual_blocks_stay_off_the_wire_when_unused() {
     );
 
     let with = r#"{"n":16,"seed":7,"k":6,"ell":3,"sigma":5.0,
-        "proto":{"kind":"recovery","t_window_rounds":10},
+        "proto":{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false},
         "injections":[],"max_rounds":25,
         "manual_blocks":[{"node":3,"from_round":5},{"node":4,"from_round":2,"to_round":9}]}"#;
     let spec: SmrScenarioSpec = serde_json::from_str(with).expect("overlay parses");
@@ -1477,7 +1665,7 @@ fn manual_block_validation_rejects_impossible_windows() {
     for (block, needle) in cases {
         let json = format!(
             r#"{{"n":16,"seed":7,"k":6,"ell":3,"sigma":5.0,
-            "proto":{{"kind":"recovery","t_window_rounds":10}},
+            "proto":{{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}},
             "injections":[],"max_rounds":25,"manual_blocks":[{block}]}}"#
         );
         let spec: SmrScenarioSpec = serde_json::from_str(&json).expect("parses");
@@ -1491,7 +1679,7 @@ fn manual_block_validation_rejects_impossible_windows() {
 #[test]
 fn recovery_spec_wire_form_round_trips_and_rejects_zero_window() {
     let json = r#"{"n":16,"seed":7,"k":6,"ell":3,"sigma":5.0,
-        "proto":{"kind":"recovery","t_window_rounds":10},
+        "proto":{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false},
         "injections":[],"max_rounds":25}"#;
     let spec: SmrScenarioSpec = serde_json::from_str(json).unwrap();
     let scenario = SmrScenario::try_from(spec).unwrap();
@@ -1507,7 +1695,7 @@ fn recovery_spec_wire_form_round_trips_and_rejects_zero_window() {
     assert!(matches!(report.terminal, SmrTerminal::Ran { rounds: 25 }));
 
     let bad = r#"{"n":16,"seed":7,"k":6,"ell":3,"sigma":5.0,
-        "proto":{"kind":"recovery","t_window_rounds":0},
+        "proto":{"kind":"recovery","t_window_rounds":0,"resend_until_acked":false},
         "injections":[],"max_rounds":25}"#;
     let bad_spec: SmrScenarioSpec = serde_json::from_str(bad).unwrap();
     let err = SmrScenario::try_from(bad_spec).unwrap_err();

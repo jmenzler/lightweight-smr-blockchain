@@ -230,7 +230,7 @@ fn control_small_recovery_full_and_lean_runs_match_logical_state() {
 }
 
 #[test]
-fn source_normative_extended_driver_released_bottom_target_amplifies_same_round() {
+fn extended_driver_released_bottom_target_amplifies_same_round() {
     let injections = [injection(2, 1, 1, Some(0))];
     let mut state = state(Proto::Extended, &injections);
     let mut round_one_block = vec![false; N];
@@ -269,11 +269,15 @@ fn source_normative_extended_driver_released_bottom_target_amplifies_same_round(
     );
     assert_eq!(round_two.nodes[0].log_len, Some(2));
     assert_eq!(report.metrics[1].distinct_logs, 2);
+    // p. 19: useful = non-empty log at the START of the round and unblocked. Node 0 is bottom
+    // when round 2 begins, so it is not counted although it holds a log at the round's end.
+    assert_eq!(report.metrics[0].useful, (N - 1) as u32);
+    assert_eq!(report.metrics[1].useful, (N - 1) as u32);
 }
 
+// p. 25: a client resends "until commitment is acknowledged by the contacted server".
 #[test]
-#[ignore = "expected red: omitted-field recovery client default"]
-fn default_policy_omitted_ack_setting_requires_contacted_node_commit_ack() {
+fn the_paper_recovery_client_stops_on_a_contacted_servers_commit_ack() {
     let scenario = parse_scenario(
         r#"{
             "n": 32,
@@ -281,7 +285,7 @@ fn default_policy_omitted_ack_setting_requires_contacted_node_commit_ack() {
             "k": 6,
             "ell": 3,
             "sigma": 5.0,
-            "proto": {"kind": "recovery", "t_window_rounds": 8},
+            "proto": {"kind": "recovery", "t_window_rounds": 8, "resend_until_acked": true},
             "injections": [{"round": 1, "client": 1, "op": 1}],
             "max_rounds": 40
         }"#,
@@ -290,12 +294,12 @@ fn default_policy_omitted_ack_setting_requires_contacted_node_commit_ack() {
     let command = command(&report, 1);
     assert!(
         !command.attempts.is_empty(),
-        "paper-facing omitted-field client must make at least one delivery attempt"
+        "the paper client must make at least one delivery attempt"
     );
     let last_attempt = &command.attempts[command.attempts.len() - 1];
     let activity_terminated = last_attempt.round < 40;
     eprintln!(
-        "current omitted-default output: activity_terminated={activity_terminated}, last_attempt={last_attempt:?}, executed_round={:?}, committed_ack_round={:?}",
+        "paper client output: activity_terminated={activity_terminated}, last_attempt={last_attempt:?}, executed_round={:?}, committed_ack_round={:?}",
         command.executed_round, command.committed_ack_round
     );
 
@@ -306,7 +310,7 @@ fn default_policy_omitted_ack_setting_requires_contacted_node_commit_ack() {
         } else {
             last_attempt.round == 40
         },
-        "paper-facing omitted-field client must either end with AckCommitted matching committed_ack_round or keep attempting through horizon 40; last_attempt={last_attempt:?}, executed_round={:?}, committed_ack_round={:?}",
+        "the paper client must either end with AckCommitted matching committed_ack_round or keep attempting through horizon 40; last_attempt={last_attempt:?}, executed_round={:?}, committed_ack_round={:?}",
         command.executed_round,
         command.committed_ack_round
     );

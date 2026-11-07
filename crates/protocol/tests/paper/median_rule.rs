@@ -1,4 +1,5 @@
-use protocol::{Config, MedianNode, Value, median};
+use crate::law;
+use protocol::{Config, MedianNode, Value};
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use rstest::rstest;
@@ -79,16 +80,70 @@ fn step_with_goes_undecided_below_ell_regardless_of_f() {
     assert_eq!(node.x_i(), None);
 }
 
+/// Adopted value of `node` after one step on `replies`, for each of the seeds 0..TRIALS.
+fn adopted_over_seeds(cfg: Config, own: Value, replies: &[Value]) -> Vec<Value> {
+    (0..law::TRIALS)
+        .map(|seed| {
+            let mut node = MedianNode::new(own, cfg);
+            node.step(replies, &mut ChaCha12Rng::seed_from_u64(seed));
+            node.x_i().expect("at least ℓ replies")
+        })
+        .collect()
+}
+
 #[test]
-fn median_rule_is_the_f_median_instance() {
-    let replies = [11, 5, 42, 7, 23, 5];
-    for seed in 0..50u64 {
-        let mut a = MedianNode::new(1, Config::default());
-        let mut b = MedianNode::new(1, Config::default());
-        a.step(&replies, &mut ChaCha12Rng::seed_from_u64(seed));
-        b.step_with(&replies, &mut ChaCha12Rng::seed_from_u64(seed), median);
-        assert_eq!(a.x_i(), b.x_i());
-    }
+fn adopted_value_follows_the_median_of_a_uniform_ell_subset() {
+    // Alg 1: the median of ℓ replies chosen uniformly at random. Laws counted by hand over
+    // the C(6,3) = 20 subsets; a max rule, a min rule, a median over all replies, or a
+    // content-chosen subset each give a different law.
+    let multiset = [5, 9, 9, 7, 5, 1]; // sorted 1,5,5,7,9,9: P(5) = 10/20, P(7) = 6/20, P(9) = 4/20
+    law::assert_follows_law(
+        &adopted_over_seeds(Config::default(), 100, &multiset),
+        &[(1, 0.0), (5, 0.5), (7, 0.3), (9, 0.2)],
+    );
+    let distinct = [10, 20, 30, 40, 50, 60]; // rank j has (j-1)(6-j) of the 20 subsets as median
+    law::assert_follows_law(
+        &adopted_over_seeds(Config::default(), 100, &distinct),
+        &[
+            (10, 0.0),
+            (20, 0.2),
+            (30, 0.3),
+            (40, 0.3),
+            (50, 0.2),
+            (60, 0.0),
+        ],
+    );
+}
+
+#[test]
+fn median_index_is_right_for_ell_five() {
+    // (7,5): the median of 5 values is the 3rd smallest. Of the C(7,5) = 21 subsets of seven
+    // distinct values, rank j is the median in C(j-1,2)·C(7-j,2) = 6, 9, 6 for j = 3, 4, 5.
+    let cfg = Config::new(7, 5).unwrap();
+    law::assert_follows_law(
+        &adopted_over_seeds(cfg, 100, &[1, 2, 3, 4, 5, 6, 7]),
+        &[
+            (1, 0.0),
+            (2, 0.0),
+            (3, 6.0 / 21.0),
+            (4, 9.0 / 21.0),
+            (5, 6.0 / 21.0),
+            (6, 0.0),
+            (7, 0.0),
+        ],
+    );
+}
+
+#[test]
+fn own_value_does_not_enter_the_median() {
+    // Alg 1 takes the median of the replies only: a server holding 100 among replies 1,1,1
+    // adopts 1, and one holding 0 among 8,8,8 adopts 8.
+    let mut high = MedianNode::new(100, Config::default());
+    high.step(&[1, 1, 1], &mut rng());
+    assert_eq!(high.x_i(), Some(1));
+    let mut low = MedianNode::new(0, Config::default());
+    low.step(&[8, 8, 8], &mut rng());
+    assert_eq!(low.x_i(), Some(8));
 }
 
 #[test]
@@ -147,4 +202,67 @@ fn undecided_node_recovers_on_enough_replies() {
     node.step(&[], &mut rng()); // -> undecided
     node.step(&[4, 4, 8], &mut rng()); // median of {4,4,8} = 4
     assert_eq!(node.x_i(), Some(4));
+}
+
+// --- Config preconditions hold on every node construction path, not only via Config::new ---
+
+fn forged(k: usize, ell: usize) -> Config {
+    Config { k, ell }
+}
+
+#[rstest]
+#[case::ell_zero(6, 0)]
+#[case::ell_one(6, 1)]
+#[case::ell_even(6, 4)]
+#[case::ell_exceeds_k(3, 5)]
+#[case::k_one(1, 1)]
+fn config_check_rejects_forged_parameters(#[case] k: usize, #[case] ell: usize) {
+    assert!(forged(k, ell).check().is_err());
+}
+
+#[test]
+fn config_check_accepts_the_paper_instance() {
+    assert!(Config::default().check().is_ok());
+}
+
+#[rstest]
+#[case::ell_zero(6, 0)]
+#[case::ell_even(6, 4)]
+#[case::ell_exceeds_k(3, 5)]
+fn every_node_constructor_rejects_forged_config(#[case] k: usize, #[case] ell: usize) {
+    use protocol::compact::CompactNode;
+    use protocol::recovery::RecoveryNode;
+    use protocol::{GossipNode, LogNode, PriorityNode};
+    let cfg = forged(k, ell);
+    let panics = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    assert!(panics(&|| {
+        let _ = MedianNode::new(1, cfg);
+    }));
+    assert!(panics(&|| {
+        let _ = MedianNode::new_undecided(cfg);
+    }));
+    assert!(panics(&|| {
+        let _ = PriorityNode::new(1, cfg);
+    }));
+    assert!(panics(&|| {
+        let _ = GossipNode::new(1, 1, 0, cfg);
+    }));
+    assert!(panics(&|| {
+        let _ = LogNode::new(1, cfg);
+    }));
+    assert!(panics(&|| {
+        let _ = CompactNode::new(cfg, 4);
+    }));
+    assert!(panics(&|| {
+        let _ = RecoveryNode::new(cfg, 4, false);
+    }));
+}
+
+// --- Algorithm 2: f must return one of its inputs, in release builds too ---
+
+#[test]
+#[should_panic(expected = "validity")]
+fn step_with_rejects_an_f_that_invents_a_value() {
+    let mut node = MedianNode::new(7, Config::default());
+    node.step_with(&[1, 2, 3], &mut rng(), |s| s.iter().sum());
 }

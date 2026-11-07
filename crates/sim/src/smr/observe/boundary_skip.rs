@@ -6,6 +6,7 @@ pub(in crate::smr) struct BoundarySkipTally {
     first_round: Option<usize>,
     last_round: Option<usize>,
     max_rejoin_rounds: Option<usize>,
+    observed_round: usize,
 }
 
 impl BoundarySkipTally {
@@ -16,10 +17,12 @@ impl BoundarySkipTally {
             first_round: None,
             last_round: None,
             max_rejoin_rounds: None,
+            observed_round: 0,
         }
     }
 
     pub(in crate::smr) fn observe(&mut self, stale: impl IntoIterator<Item = bool>, round: usize) {
+        self.observed_round = round;
         for (since, stale) in self.stale_since.iter_mut().zip(stale) {
             match (*since, stale) {
                 (None, true) => {
@@ -51,13 +54,38 @@ impl BoundarySkipTally {
         self.last_round
     }
 
-    /// Over completed episodes only; `unrejoined` counts the open ones.
+    /// Over completed episodes only; open ones are in `unrejoined` and `longest_stale_rounds`.
     pub(in crate::smr) fn max_rejoin_rounds(&self) -> Option<usize> {
         self.max_rejoin_rounds
     }
 
+    /// Open episodes with at least one observed round to adopt in.
     pub(in crate::smr) fn unrejoined(&self) -> usize {
-        self.stale_since.iter().filter(|s| s.is_some()).count()
+        self.stale_since
+            .iter()
+            .flatten()
+            .filter(|&&start| start < self.observed_round)
+            .count()
+    }
+
+    /// Open episodes that started at the last observed round: censored by the horizon, not stuck.
+    pub(in crate::smr) fn horizon_skips(&self) -> usize {
+        self.stale_since
+            .iter()
+            .flatten()
+            .filter(|&&start| start == self.observed_round)
+            .count()
+    }
+
+    /// Longest stale spell, a lower bound where the episode is still open.
+    pub(in crate::smr) fn longest_stale_rounds(&self) -> Option<usize> {
+        let open = self
+            .stale_since
+            .iter()
+            .flatten()
+            .map(|&start| self.observed_round - start)
+            .max();
+        self.max_rejoin_rounds.max(open)
     }
 }
 

@@ -10,7 +10,7 @@ use sim_wasm::{LiveSmr, run_smr_json};
 fn recovery_spec(t_window: u64) -> String {
     format!(
         r#"{{"n":32,"seed":11,"k":6,"ell":3,"sigma":1.5,
-            "proto":{{"kind":"recovery","t_window_rounds":{t_window}}},
+            "proto":{{"kind":"recovery","t_window_rounds":{t_window},"resend_until_acked":false}},
             "injections":[{{"round":2,"client":1,"op":7}}],
             "max_rounds":200,
             "traffic":{{"kind":"pmf","arrivals_pmf":[0.7,0.3]}},
@@ -204,7 +204,7 @@ fn the_rec_row_arc_is_frozen() {
     // has no row to land on: the horizon truncates it.
     // Regenerate only as a deliberate, commit-noted act.
     let spec = r#"{"n":8,"seed":5,"k":6,"ell":3,"sigma":2.0,
-        "proto":{"kind":"recovery","t_window_rounds":4},
+        "proto":{"kind":"recovery","t_window_rounds":4,"resend_until_acked":false},
         "injections":[{"round":1,"client":1,"op":7}],"max_rounds":20,
         "schedule":{"kind":"windows","windows":[
             {"start_round":6,"rounds":4,"target":{"kind":"sample_fraction","fraction":1.0}}]}}"#;
@@ -231,7 +231,24 @@ fn the_rec_row_arc_is_frozen() {
         row(8, 0, 0, 4, 0, 4, 0, 0, 0),
         row(8, 0, 0, 4, 0, 4, 0, 0, 0),
     ]);
-    assert_eq!(report["recovery"]["rounds"], expected);
+    let mut rows = report["recovery"]["rounds"].clone();
+    let agree: Vec<serde_json::Value> = rows
+        .as_array_mut()
+        .expect("rows")
+        .iter_mut()
+        .map(|r| {
+            r.as_object_mut()
+                .expect("row")
+                .remove("useful_agree")
+                .expect("present")
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    // Def 1.4 at each round's end: no useful server from the blackout until the rollback at 16.
+    let t = serde_json::Value::Bool(true);
+    let none = serde_json::Value::Null;
+    let want: Vec<serde_json::Value> = [vec![t.clone(); 5], vec![none; 10], vec![t; 5]].concat();
+    assert_eq!(agree, want);
     assert_eq!(report["recovery"]["fork_ok"], true);
     assert_eq!(report["safety_ok"], true);
 }
@@ -280,7 +297,9 @@ fn js_r_star(report: &serde_json::Value, n: usize, t_window: usize) -> Option<us
     };
     boundaries.iter().copied().find(|&r_star| {
         let m = &metrics[r_star - 1];
-        m["min_executed_len"] == m["max_executed_len"]
+        m["useful_executed"]
+            .as_array()
+            .is_some_and(|range| range[0] == range[1])
             && boundaries.iter().all(|&b| b < r_star || clean(b))
     })
 }
@@ -291,7 +310,7 @@ fn the_lab_r_star_scan_agrees_with_the_engine_across_seeds() {
         for (t_window, blackout_start) in [(10, 12), (10, 25), (20, 30)] {
             let spec = format!(
                 r#"{{"n":64,"seed":{seed},"k":6,"ell":3,"sigma":2.0,
-                    "proto":{{"kind":"recovery","t_window_rounds":{t_window}}},
+                    "proto":{{"kind":"recovery","t_window_rounds":{t_window},"resend_until_acked":false}},
                     "injections":[{{"round":2,"client":1,"op":7}}],"max_rounds":140,
                     "schedule":{{"kind":"windows","windows":[
                         {{"start_round":{blackout_start},"rounds":16,
@@ -316,7 +335,7 @@ fn a_clean_release_recovers_exactly_two_windows_past_the_next_boundary() {
     // back onto live logs, and the one after that is the first clean row.
     const T: usize = 10;
     let spec = r#"{"n":64,"seed":17,"k":6,"ell":3,"sigma":2.0,
-        "proto":{"kind":"recovery","t_window_rounds":10},
+        "proto":{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false},
         "injections":[{"round":2,"client":1,"op":7}],"max_rounds":70,
         "schedule":{"kind":"windows","windows":[
             {"start_round":12,"rounds":16,"target":{"kind":"sample_fraction","fraction":1.0}}]}}"#;

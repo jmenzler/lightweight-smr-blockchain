@@ -1,4 +1,4 @@
-use crate::chunked::ChunkSeq;
+use crate::chunked::{ChunkSeq, SealedMark};
 use crate::compact::{AUTO_CLIENT_BASE, ClientId, Entry};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,6 +9,9 @@ pub const K_STATE: usize = 8;
 
 pub type ExecSeq = ChunkSeq<Entry, K_STATE>;
 
+/// Auto-lane slots a wire state may name; the lane is a dense vector, so this caps what one frame can make a receiver allocate (128 MiB).
+pub const MAX_WIRE_AUTO_SLOTS: u32 = 1 << 24;
+
 /// Whether the replicated state machine is execute-once (cf. Raft client sessions, Ongaro 2014 §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RepeatedCommit {
@@ -17,6 +20,14 @@ pub enum RepeatedCommit {
     Execute,
     /// Execute-once: an entry with sn(x) ≤ sn(c) leaves S_i unchanged; commits must come in sn order.
     Skip,
+}
+
+/// An execute-once commit of client `client`'s `sn` while S_i holds only up to `committed_sn` < sn − 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfSnOrder {
+    pub client: ClientId,
+    pub sn: u64,
+    pub committed_sn: u64,
 }
 
 /// The shared state S_i: executed commands in commit order plus each client's committed sn.
@@ -153,7 +164,36 @@ impl SharedState {
         }
     }
 
+    /// Whether `entries`, committed in order under [`RepeatedCommit::Skip`], keep every client's
+    /// commits in sn order; the first entry that skips an sn is the error.
+    pub(crate) fn check_sn_order<'a>(
+        &self,
+        entries: impl IntoIterator<Item = &'a Entry>,
+    ) -> Result<(), OutOfSnOrder> {
+        let mut advanced: BTreeMap<ClientId, u64> = BTreeMap::new();
+        for (client, sn) in entries.into_iter().filter_map(Entry::client_sn) {
+            let done = advanced
+                .get(&client)
+                .copied()
+                .or_else(|| self.sn_get(client))
+                .unwrap_or(0);
+            if sn <= done {
+                continue;
+            }
+            if sn != done + 1 {
+                return Err(OutOfSnOrder {
+                    client,
+                    sn,
+                    committed_sn: done,
+                });
+            }
+            advanced.insert(client, sn);
+        }
+        Ok(())
+    }
+
     /// Commits one entry; returns false iff the execute-once state machine left it out.
+    /// Under Skip the caller has passed [`Self::check_sn_order`] for the sequence this entry is in.
     pub(crate) fn commit(&mut self, entry: &Entry, repeated: RepeatedCommit) -> bool {
         if repeated == RepeatedCommit::Skip
             && let Some((client, sn)) = entry.client_sn()
@@ -226,6 +266,14 @@ impl<'a> ExecutedView<'a> {
 
     pub fn eq_slice_from(self, from: u64, other: &[Entry]) -> bool {
         self.0.eq_slice_from(from, other)
+    }
+
+    pub fn last_sealed(self) -> Option<SealedMark<Entry>> {
+        self.0.last_sealed()
+    }
+
+    pub fn holds(self, mark: &SealedMark<Entry>) -> bool {
+        self.0.holds(mark)
     }
 }
 
@@ -307,7 +355,8 @@ impl PartialEq for SharedState {
 
 impl Eq for SharedState {}
 
-// The wire form is the materialized sequence: bincode is not self-describing.
+// The wire form is the materialized sequence: bincode is not self-describing. It holds the whole
+// executed list, so a state-carrying reply grows with the history and meets a frame cap in long runs.
 #[cfg(feature = "serde")]
 impl serde::Serialize for SharedState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -347,6 +396,13 @@ impl<'de> serde::Deserialize<'de> for SharedState {
         {
             return Err(serde::de::Error::custom(format!(
                 "committed sn 0 for auto-lane client {client} is absence, not a value"
+            )));
+        }
+        if let Some((&client, _)) = wire.sn.last_key_value()
+            && client >= AUTO_CLIENT_BASE + MAX_WIRE_AUTO_SLOTS
+        {
+            return Err(serde::de::Error::custom(format!(
+                "auto-lane client {client} is past the {MAX_WIRE_AUTO_SLOTS}-slot wire limit"
             )));
         }
         Ok(SharedState::from_entries(wire.executed, wire.sn))

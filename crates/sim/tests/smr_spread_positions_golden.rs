@@ -12,6 +12,9 @@ use sim::smr::{
 };
 use sim::{BlockSchedule, Config};
 
+#[path = "fixtures/digest_fields.rs"]
+mod digest_fields;
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn fold(mut h: u64, s: &str) -> u64 {
@@ -25,7 +28,18 @@ fn fold(mut h: u64, s: &str) -> u64 {
 /// FNV-1a over the serialized command reports, with the shape counts kept
 /// separately so a collapsed-to-nothing regression cannot hide behind a hash.
 fn digest(report: &SmrReport) -> (usize, usize, u64) {
-    let json = serde_json::to_string(&report.commands).expect("commands serialize");
+    // Observer-derived landmarks are not part of the position stream.
+    let commands: Vec<_> = report
+        .commands
+        .iter()
+        .cloned()
+        .map(|c| sim::smr::CommandReport {
+            committed_round: None,
+            injected_round: None,
+            ..c
+        })
+        .collect();
+    let json = serde_json::to_string(&commands).expect("commands serialize");
     let points = report
         .commands
         .iter()
@@ -158,7 +172,9 @@ fn loaded_compact_under_blocking_step_stream_is_stable() {
             .sum::<usize>();
         h = fold(
             h,
-            &serde_json::to_string(&status).expect("status serializes"),
+            &digest_fields::without_derived_fields(
+                &serde_json::to_string(&status).expect("status serializes"),
+            ),
         );
     }
     assert_eq!((holder_entries, h), (30_749, 18_099_349_346_505_310_375));
@@ -219,7 +235,7 @@ fn recovery_rollback_cascade_positions_are_stable() {
     };
     let report = run_smr(&s);
     assert_eq!(report.commands[0].executed_round, Some(50));
-    assert_eq!(digest(&report), (1, 50, 1_551_227_221_973_455_359));
+    assert_eq!(digest(&report), (1, 50, 9_474_469_677_102_058_681));
 }
 
 /// Sustained traffic through a recovery surge: many commands are pending at
@@ -264,7 +280,9 @@ fn loaded_recovery_through_a_surge_step_stream_is_stable() {
             .sum::<usize>();
         h = fold(
             h,
-            &serde_json::to_string(&status).expect("status serializes"),
+            &digest_fields::without_derived_fields(
+                &serde_json::to_string(&status).expect("status serializes"),
+            ),
         );
     }
     let report = state.report();
@@ -281,7 +299,7 @@ fn loaded_recovery_through_a_surge_step_stream_is_stable() {
         (rollbacks, executed, holder_entries, h),
         (61, 718, 2_657_913, 18_305_340_862_122_328_681)
     );
-    assert_eq!(digest(&report), (800, 58_920, 3_074_947_211_562_126_896));
+    assert_eq!(digest(&report), (800, 58_920, 16_816_833_026_232_476_530));
 }
 
 /// A surge/release arc crossing twelve boundaries with rollbacks at three of
@@ -317,5 +335,5 @@ fn recovery_surge_release_positions_are_stable() {
             .all(|m| (76..=88).contains(&m.blocked)),
         "sticky floor(0.6*128)=76 union background 12 must stay in [76,88]"
     );
-    assert_eq!(digest(&report), (2, 229, 2_898_936_418_982_617_194));
+    assert_eq!(digest(&report), (2, 229, 145_342_823_802_424_030));
 }

@@ -14,6 +14,13 @@ pub enum ReplyPayload {
     },
 }
 
+/// Client acknowledgements on the request's own connection. Only the commit ack exists in the paper
+/// (Alg 5, "until commitment is acknowledged", p. 25); the rest is instrumentation that never changes
+/// server state. `Delivered`: an Alg 3 server accepted the command, which ends the client (Alg 3 has
+/// no commit, resend policy open, A3.OPEN.25). `Amplified`: an Alg 5 server holding a log accepted
+/// it, which sets the client's delivery round. `Ignored`: an Alg 5 server at ⊥ discards the command
+/// as the paper says, but answers explicitly where the paper's server stays silent; it does not
+/// count as injection (M.OPEN.13) and does not stop the resends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AckKind {
     Delivered,
@@ -64,6 +71,11 @@ pub enum Msg {
     },
 }
 
+/// Bytes of zero padding that trail the frame body: one `payload_pad` per carried entry.
+pub fn padding_len(msg: &Msg, payload_pad: u32) -> usize {
+    entry_count(msg) * payload_pad as usize
+}
+
 fn entry_count(msg: &Msg) -> usize {
     match msg {
         Msg::PullReply { payload, .. } => match payload {
@@ -81,7 +93,7 @@ fn entry_count(msg: &Msg) -> usize {
 
 pub fn encode(msg: &Msg, max_frame_bytes: u32, payload_pad: u32) -> Result<Vec<u8>, String> {
     let body = bincode::serialize(msg).map_err(|e| e.to_string())?;
-    let pad = entry_count(msg) * payload_pad as usize;
+    let pad = padding_len(msg, payload_pad);
     let total = 4 + body.len() + pad;
     if total > max_frame_bytes as usize {
         return Err(format!(

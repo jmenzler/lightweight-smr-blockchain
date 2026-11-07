@@ -1,4 +1,6 @@
 //! Commitment / prefix-agreement runner (Thm 3 / Lemma 3.8); run from the repo root.
+//! T_M here is Lemma 3.8's: prefix_fixed_round (identical prefix through x in every non-⊥ log)
+//! minus all_logs_round, an upper bound on the Def 1.3 same-index agreement time.
 
 use sim::analysis::ols_fit;
 use sim::harness::{concurrent_injections, fresh_extended};

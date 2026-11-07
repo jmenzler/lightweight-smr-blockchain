@@ -1,9 +1,9 @@
 // run form: spec building, presets, scenario import/export
 import { S, $, clamp01 } from './state.js';
-import { post } from './engine.js';
-import { loadTrace } from './trace.js';
 import { looksLikeSpill, loadSpill } from './spill.js';
 import { PMF } from './pmf-editor.js';
+import { programBeta } from './smr-derive.js';
+import { openTrace, runBatchSpec } from './live.js';
 
 /* ---------- run form ---------- */
 
@@ -46,6 +46,69 @@ function buildInitSpec() {
   }
   return base;
 }
+/* ---------- blocking strategy ---------- */
+
+// fresh, sticky and a scheduled program run in a live session: the live path
+// draws exactly the stream the batch engine draws for them. Permanent and the
+// adaptive strategies need draws or node state the live path does not have, so
+// they run through the batch engine and open as a finished run.
+export const LIVE_STRATEGIES = ['fresh', 'sticky', 'program'];
+const STRATEGY_HINT = {
+  fresh: 'A new random set of nodes is blocked every round (≈ Lemma 2.2’s adversary); the live slider changes the fraction.',
+  sticky: 'A persistent targeted set follows the live slider; the percentage here is never-stopping background noise under it.',
+  permanent: 'One fixed set for the whole run (≈ Lemma 2.3’s adversary). The engine draws it before round 1, so this runs as a finished batch run.',
+  program: 'Blocked fraction per round segment; the live slider takes over from the round you grab it.',
+  adaptive0: 'Blocks the value holders, reading the state one round later than Definition 1.1 allows: a stress adversary outside the paper’s model. Runs as a finished batch run.',
+  adaptiveAlpha: 'The Definition 1.1 α-late adversary; α = 1 is the paper’s 1-late adversary. Runs as a finished batch run.',
+};
+export const strategy = () => $('svStrategy').value;
+
+export function syncStrategy() {
+  const st = strategy();
+  $('svRowBeta').classList.toggle('hidden', st === 'program');
+  $('svRowAlpha').classList.toggle('hidden', st !== 'adaptiveAlpha');
+  $('svRowProgram').classList.toggle('hidden', st !== 'program');
+  $('svBetaLabel').textContent = st === 'sticky' ? 'background blocked % of n'
+    : LIVE_STRATEGIES.includes(st) ? 'blocked % of n (the live slider starts here)' : 'blocked % of n';
+  $('svStrategyHint').textContent = STRATEGY_HINT[st] ?? '';
+}
+$('svStrategy').addEventListener('change', syncStrategy);
+
+function progRow(from = 10, to = 60, pct = 30) {
+  const row = document.createElement('div');
+  row.className = 'progRow';
+  row.innerHTML = `
+    <input class="fInput progFrom" type="number" min="1" value="${from}" />
+    <input class="fInput progTo" type="number" min="2" value="${to}" />
+    <input class="fInput progPct" type="number" min="0" max="60" value="${pct}" />
+    <button class="injDel" title="remove">✕</button>`;
+  row.querySelector('.injDel').addEventListener('click', () => row.remove());
+  $('svProgRows').appendChild(row);
+}
+$('svProgAdd').addEventListener('click', () => progRow());
+progRow();
+syncStrategy();
+
+export function readProgram() {
+  return [...document.querySelectorAll('#svProgRows .progRow')].map(row => ({
+    from: Math.max(1, Math.round(+row.querySelector('.progFrom').value || 1)),
+    to: Math.round(+row.querySelector('.progTo').value || 1),
+    beta: Math.min(Math.max(+row.querySelector('.progPct').value || 0, 0), 60),
+  })).filter(seg => seg.to > seg.from);
+}
+
+function scheduleSpec(st, beta, maxRounds) {
+  const fraction = beta / 100;
+  if (st === 'permanent') return { kind: 'permanent', fraction };
+  if (st === 'adaptive0') return { kind: 'adaptive_0late', fraction, policy: 'block_holders' };
+  if (st === 'adaptiveAlpha') return { kind: 'adaptive_alpha_late', fraction, alpha: Math.max(1, Math.round(+$('runAlpha').value || 1)), policy: 'block_holders' };
+  if (st === 'program') {
+    const program = readProgram();
+    return { kind: 'per_round_fractions', fractions: Array.from({ length: maxRounds }, (_, i) => (programBeta(program, i + 1) ?? 0) / 100) };
+  }
+  return { kind: 'fresh_per_round', fraction };
+}
+
 export function buildSpec() {
   const n = Math.min(Math.max(+$('runN').value || 1000, 10), 200000);
   const beta = Math.min(Math.max(+$('runBeta').value || 0, 0), 60);
@@ -57,7 +120,7 @@ export function buildSpec() {
     ell: Math.round(+$('runEll').value || 3),
     init: buildInitSpec(),
     max_rounds: maxRounds,
-    schedule: { kind: $('runSchedule').value, fraction: beta / 100 },
+    schedule: scheduleSpec(strategy(), beta, maxRounds),
   };
 }
 export function validateSpec(spec) {
@@ -66,37 +129,29 @@ export function validateSpec(spec) {
   }
   return null;
 }
-$('runBtn').addEventListener('click', () => {
-  if (S.engine !== 'wasm') { $('runStatus').textContent = 'engine not ready'; return; }
-  const spec = buildSpec();
-  const problem = validateSpec(spec);
-  if (problem) { $('runStatus').textContent = 'error: ' + problem; return; }
-  $('runStatus').textContent = 'running…';
-  post({ type: 'run', spec });
-});
-
-/* ---------- E2 presets (three-regime bracket) ---------- */
+/* ---------- E2 presets (prereg 2026-07-21-e2-three-regime-bracket) ---------- */
 function applyPreset(p) {
   $('runInit').value = p.init;
   $('runUseful').value = p.useful !== undefined ? p.useful : 1;
   $('runSplitFrac').value = 0.5;
-  $('runSchedule').value = p.schedule;
+  $('svStrategy').value = p.strategy;
+  syncStrategy();
   $('runBeta').value = p.beta;
   $('runMax').value = p.maxRounds;
   syncFormRows();
-  $('runStatus').textContent = p.label + ' preset loaded — press run';
+  $('runStatus').textContent = p.label + ' preset loaded — press Start';
 }
 $('presetA').addEventListener('click', () => applyPreset({
   label: 'A collapse', init: 'split', useful: 0.30,
-  schedule: 'fresh_per_round', beta: 0, maxRounds: 200,
+  strategy: 'fresh', beta: 0, maxRounds: 200,
 }));
 $('presetB').addEventListener('click', () => applyPreset({
   label: 'B converge-hold', init: 'split', useful: 5 / 9,
-  schedule: 'fresh_per_round', beta: 10, maxRounds: 500,
+  strategy: 'fresh', beta: 10, maxRounds: 500,
 }));
 $('presetC').addEventListener('click', () => applyPreset({
   label: 'C death spiral', init: 'split',
-  schedule: 'permanent', beta: 30, maxRounds: 500,
+  strategy: 'permanent', beta: 30, maxRounds: 500,
 }));
 
 /* ---------- scenario import / export ---------- */
@@ -114,7 +169,8 @@ $('exportSpecBtn').addEventListener('click', () => {
 /* Fill the form when the spec is expressible; false = run it directly. */
 function fillFormFromSpec(spec) {
   const sched = spec.schedule || { kind: 'fresh_per_round', fraction: 0 };
-  if (sched.kind !== 'fresh_per_round' && sched.kind !== 'permanent') return false;
+  const FORM_KINDS = { fresh_per_round: 'fresh', permanent: 'permanent', adaptive_0late: 'adaptive0', adaptive_alpha_late: 'adaptiveAlpha' };
+  if (!(sched.kind in FORM_KINDS)) return false;
   const setBase = (init, prefix) => {
     if (init.kind === 'split') { $(prefix).value = 'split'; $('runSplitFrac').value = init.fraction; return true; }
     if (init.kind === 'uniform_random') { $(prefix).value = 'random'; $('runRandK').value = init.k; return true; }
@@ -140,10 +196,21 @@ function fillFormFromSpec(spec) {
   $('runK').value = spec.k;
   $('runEll').value = spec.ell;
   $('runMax').value = spec.max_rounds;
-  $('runSchedule').value = sched.kind;
+  $('svStrategy').value = FORM_KINDS[sched.kind];
+  if (sched.alpha) $('runAlpha').value = sched.alpha;
+  syncStrategy();
   $('runBeta').value = Math.round((sched.fraction || 0) * 100);
   syncFormRows();
   return true;
+}
+// A single-value scenario fills the form when the form can express it,
+// otherwise it runs directly.
+export function importSingleSpec(parsed) {
+  if (fillFormFromSpec(parsed)) {
+    $('runStatus').textContent = 'scenario loaded — press Start';
+  } else {
+    runBatchSpec(parsed);
+  }
 }
 $('importSpecBtn').addEventListener('click', () => {
   const inp = document.createElement('input');
@@ -157,13 +224,8 @@ $('importSpecBtn').addEventListener('click', () => {
       // first, exactly as the trace-versus-spec discrimination below does.
       if (looksLikeSpill(t)) { loadSpill(t); return; }
       const parsed = JSON.parse(t);
-      if (Array.isArray(parsed.rounds)) { loadTrace(parsed); return; }
-      if (fillFormFromSpec(parsed)) {
-        $('runStatus').textContent = 'scenario loaded — press run';
-      } else {
-        $('runStatus').textContent = 'running imported scenario…';
-        post({ type: 'run', spec: parsed });
-      }
+      if (Array.isArray(parsed.rounds)) { openTrace(parsed); return; }
+      importSingleSpec(parsed);
     }).catch(e => { $('runStatus').textContent = 'import failed: ' + e; });
   };
   inp.click();
