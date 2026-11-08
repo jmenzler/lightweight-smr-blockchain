@@ -148,6 +148,7 @@ impl SmrState {
             .filter(|t| t.all_logs_round.is_none() && round >= t.injection_round)
             .map(|t| SpreadingCommand {
                 client: t.client,
+                op: t.op,
                 holders: post
                     .iter()
                     .enumerate()

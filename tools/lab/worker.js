@@ -22,6 +22,25 @@ let spill = null;
 // land, so each message carries only the new blocks. {error} rides through
 // untouched — the panel freezes on it instead of guessing.
 let chainFrom = 0;
+// The oldest unsettled age per round, sent from the same kind of cursor.
+let agesFrom = 0;
+// The live memory view; null where it does not apply (extended) and between samples. A read grows
+// with n × clients (compact walks every server's §5 windows), so it is taken every memEvery rounds,
+// and memEvery doubles while a read costs more than a tenth of the stepping it rides on.
+let memEvery = 1, memNext = 0;
+function memorySample(round, stepMs) {
+  if (round < memNext) return null;
+  const t0 = performance.now();
+  const m = JSON.parse(smrLive.memory_json());
+  if (stepMs > 0 && performance.now() - t0 > 0.1 * stepMs && memEvery < 64) memEvery *= 2;
+  memNext = round + memEvery;
+  return m.error ? null : m;
+}
+function agesDelta() {
+  const ages = JSON.parse(smrLive.unsettled_ages_json(agesFrom));
+  agesFrom += ages.length;
+  return ages;
+}
 function chainDelta() {
   if (!smrLive) return null;
   // wasm-bindgen maps Rust u64 to JS BigInt, like inject's op
@@ -102,13 +121,17 @@ onmessage = ev => {
         case 'smr-live-new': {
           if (smrLive) { smrLive.free(); smrLive = null; }
           chainFrom = 0;
+          agesFrom = 0;
+          memEvery = 1; memNext = 0;
           smrLive = wasm_bindgen.LiveSmr.new_with_mode(JSON.stringify(m.spec), !!m.sticky);
-          postMessage({ type: 'smr-live-ready', delta: smrLive.report_delta_json() });
+          postMessage({ type: 'smr-live-ready', delta: smrLive.report_delta_json(), ages: agesDelta(), memory: memorySample(0, 0) });
           break;
         }
         case 'smr-live-step': {
           if (!smrLive) throw new Error('no smr live session');
+          const t0 = performance.now();
           const status = smrLive.step(m.fraction);
+          const stepMs = performance.now() - t0;
           const parsed = JSON.parse(status);
           if (parsed.error) {
             postMessage({ type: 'error', error: parsed.error });
@@ -121,10 +144,11 @@ onmessage = ev => {
               status,
               report,
               scenario,
+              ages: agesDelta(),
               failure: parsed.failure,
             });
           } else {
-            postMessage({ type: 'smr-round', status, delta: smrLive.report_delta_json(), ...feeds(m) });
+            postMessage({ type: 'smr-round', status, delta: smrLive.report_delta_json(), ages: agesDelta(), memory: memorySample(parsed.round, stepMs), ...feeds(m) });
           }
           break;
         }
@@ -136,6 +160,7 @@ onmessage = ev => {
           let status = null;
           let steps = 0;
           let stop = false;
+          const t0 = performance.now();
           for (const fraction of m.fractions) {
             status = smrLive.step(fraction);
             steps++;
@@ -152,6 +177,7 @@ onmessage = ev => {
                 status,
                 report: smrLive.report_json(),
                 scenario: smrLive.export_scenario(),
+                ages: agesDelta(),
                 failure: parsed.failure,
               });
               stop = true;
@@ -160,7 +186,7 @@ onmessage = ev => {
             if (parsed.absorbed || parsed.dead !== null) break;
           }
           if (!stop && status !== null) {
-            postMessage({ type: 'smr-round', status, steps, delta: smrLive.report_delta_json(), ...feeds(m) });
+            postMessage({ type: 'smr-round', status, steps, delta: smrLive.report_delta_json(), ages: agesDelta(), memory: memorySample(JSON.parse(status).round, performance.now() - t0), ...feeds(m) });
           }
           break;
         }

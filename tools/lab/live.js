@@ -10,6 +10,8 @@ import { buildSpec, validateSpec, strategy, readProgram, LIVE_STRATEGIES } from 
 import { programBeta } from './smr-derive.js';
 import { useSeek, resetSvViewport } from './sv-viewport.js';
 import { downloadJson } from './form.js';
+import { ROUND_CAP, continuePlan, targetEnd } from './continue.js';
+import { bindContinueMenu, continueStatus } from './continue-ui.js';
 
 const sv = S.sv;
 const MAX_REPLAY_STEP = 10;
@@ -36,14 +38,12 @@ function endText(end) {
     case 'bot': return `⚠ finished · every node ⊥ at round ${end.round} — nothing can recover`;
     case 'ended': return `ended · stopped at round ${end.round}/${end.max} by End`;
     case 'file': return `opened trace · ${end.round} rounds`;
+    case 'cap': return `stopped at the ${end.max}-round lab limit`;
   }
   throw new Error('unknown end kind ' + end.kind);
 }
-const END_LABEL = { max: 'finished', agreement: 'finished', bot: 'all ⊥', ended: 'ended', file: 'trace' };
+const END_LABEL = { max: 'finished', agreement: 'finished', bot: 'all ⊥', ended: 'ended', file: 'trace', cap: 'lab limit' };
 
-// the form's own round limit: the lab keeps every round in page memory
-const ROUND_CAP = 5000;
-const continueTarget = ctx => Math.min(ROUND_CAP, ctx.maxRounds + ctx.spec.max_rounds);
 
 function sessionCtx(spec, kind, sticky, program, st) {
   return { spec, kind, sticky, program, strategy: st, n: spec.n, maxRounds: spec.max_rounds };
@@ -185,7 +185,7 @@ const speedDelay = () => (sv.speed === 'max' ? 0 : 700 / sv.speed);
 
 function liveStep() {
   if (!S.live || S.live.awaiting) return;
-  if (total() >= sv.ctx.maxRounds) { finishLive({ kind: 'max', round: total(), max: sv.ctx.maxRounds }); return; }
+  if (total() >= sv.ctx.maxRounds) { finishLive(targetEnd(total(), sv.ctx.maxRounds)); return; }
   S.live.awaiting = true;
   post({ type: 'live-step', fraction: fractionFor(total() + 1) });
 }
@@ -203,7 +203,7 @@ export function onLiveRound(r) {
   const sliderZero = +$('liveSlider').value === 0;
   update();
   if (r.all_undecided) { finishLive({ kind: 'bot', round: r.round, max: sv.ctx.maxRounds }); return; }
-  if (total() >= sv.ctx.maxRounds) { finishLive({ kind: 'max', round: total(), max: sv.ctx.maxRounds }); return; }
+  if (total() >= sv.ctx.maxRounds) { finishLive(targetEnd(total(), sv.ctx.maxRounds)); return; }
   // the engine reports absorption one step later, and only if blocking stays 0
   if (holdAgreed && sliderZero && S.live.bg === 0) {
     S.live.playing = false;
@@ -298,8 +298,8 @@ export function updateToolbar() {
   $('svBackBtn').disabled = !!lv;
   $('svEndBtn').classList.toggle('hidden', !lv);
   $('svNewBtn').classList.toggle('hidden', !!lv || !has);
-  $('svContinueBtn').classList.toggle('hidden', !!lv || !sv.resume);
-  if (sv.resume) $('svContinueBtn').dataset.tip = `keep going to round ${continueTarget(sv.ctx)}`;
+  $('svContinuePop').classList.toggle('hidden', !!lv || !sv.resume);
+  if (sv.resume) refreshContinue();
   for (const b of document.querySelectorAll('#svSpeed button')) b.classList.toggle('on', b.dataset.speed === String(sv.speed));
   $('svStrat').textContent = has ? (sv.ctx.program ? 'program' : sv.ctx.strategy) : '';
   $('svRoundLbl').textContent = end ? `round ${S.t}/${total()} · ${END_LABEL[end.kind]}`
@@ -343,21 +343,23 @@ $('liveSlider').addEventListener('input', () => {
   sv.program = null;
 });
 $('svEndBtn').addEventListener('click', () => finishLive({ kind: 'ended', round: total(), max: sv.ctx.maxRounds }));
-$('svContinueBtn').addEventListener('click', () => {
+const refreshContinue = bindContinueMenu('sv', { ctx: () => sv.ctx, current: () => total(), go: continueRun });
+function continueRun(mode) {
   const lv = sv.resume;
-  if (!lv) return;
+  const plan = lv ? continuePlan(total(), mode) : null;
+  if (!plan) return;
   stopReplay();
   sv.resume = null;
-  sv.ctx.maxRounds = continueTarget(sv.ctx);
+  sv.ctx.maxRounds = plan.target;
   sv.end = null;
   S.live = lv;
   S.t = total();
   lv.playing = true;
-  $('runStatus').textContent = `continuing to round ${sv.ctx.maxRounds}`;
+  $('runStatus').textContent = continueStatus(plan);
   update();
   updateToolbar();
   liveStep();
-});
+}
 $('svNewBtn').addEventListener('click', () => {
   stopReplay();
   S.live = null;

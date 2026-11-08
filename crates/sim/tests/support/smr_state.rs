@@ -155,6 +155,63 @@ fn step_status_lists_holders_for_commands_still_spreading() {
     assert!(done.is_some());
 }
 
+/// One client with two commands spreading at once (a pipelined client here; a pool client
+/// reused after its ack in general): each spreading entry names its own command, and its holder
+/// set is that command's alone, never its sibling's.
+#[test]
+fn spreading_entries_are_keyed_by_command_not_by_client() {
+    let mut state = SmrState::new(
+        48,
+        Config::default(),
+        Proto::Compact { t_commit_rounds: 8 },
+        2.0,
+        71,
+        &[
+            Injection {
+                round: 2,
+                client: 1,
+                op: 7,
+                target: None,
+            },
+            Injection {
+                round: 3,
+                client: 1,
+                op: 8,
+                target: None,
+            },
+        ],
+        &[],
+        ClientModel::Unique,
+        None,
+    );
+    let mut both = 0;
+    for _ in 0..12 {
+        let status = state.step_fraction(0.0);
+        let logs = state.compact_logs();
+        for s in &status.spreading {
+            let holders: Vec<u32> = logs
+                .iter()
+                .enumerate()
+                .filter(|(_, log)| {
+                    log.as_ref().is_some_and(|l| {
+                        l.iter().any(|t| {
+                            matches!(t.entry, protocol::compact::Entry::Cmd(cc) if cc.op == s.op)
+                        })
+                    })
+                })
+                .map(|(i, _)| i as u32)
+                .collect();
+            assert_eq!(s.holders, holders, "round {}: op {}", status.round, s.op);
+        }
+        let ops: Vec<u64> = status.spreading.iter().map(|s| s.op).collect();
+        if ops == [7, 8] {
+            both += 1;
+            assert!(status.spreading.iter().all(|s| s.client == 1));
+        }
+    }
+    assert!(both > 0, "both commands of client 1 must spread at once");
+}
+
 #[test]
 fn masked_stepping_replays_windows_batch() {
     let s = scenario(

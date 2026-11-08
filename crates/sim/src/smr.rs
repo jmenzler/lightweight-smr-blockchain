@@ -14,9 +14,10 @@ mod validate;
 pub use crate::runlog::{run_smr_logged, run_smr_recorded};
 pub use engine::engine_rec::boundary_key_counts;
 pub(crate) use engine::pool::EXHAUSTED_MARKER as POOL_EXHAUSTED_MARKER;
-pub use observe::accounting::Accounting;
+pub use observe::accounting::{Accounting, Footprint, NodeBytes, cert_state_bytes, footprint};
 pub use observe::census_count::census_counts;
 pub use observe::detail::RecNodeDetail;
+pub use observe::full_prefix::UnsettledAge;
 pub use observe::log_index::holder_vec_count;
 pub use observe::safety::{EntrySeq, PrefixChecker, prefixes_consistent};
 pub use observe::spill::{Spill, SpillBoundary, SpillHeader, SpillTrailer, read_spill};
@@ -284,6 +285,10 @@ pub struct SmrState {
     pub(crate) drop_settled_spread: bool,
     pub(crate) truncate_history: bool,
     pub(crate) observe_spread: bool,
+    /// Live-only T_E over executed part ++ log (compact, recovery); see `observe_full_prefix`.
+    full_prefix: bool,
+    /// Per round while `full_prefix` is on: the oldest unsettled age, `None` once safety is lost.
+    unsettled_ages: Vec<Option<UnsettledAge>>,
     /// Retire settled commands and fold per-round rows; the run reports a summary only.
     flat: bool,
     retired: summary::CommandFold,
@@ -422,6 +427,8 @@ impl SmrState {
             drop_settled_spread: false,
             truncate_history: false,
             observe_spread: true,
+            full_prefix: false,
+            unsettled_ages: Vec::new(),
             flat: false,
             retired: summary::CommandFold::default(),
             row_fold: summary::RowFold::default(),
@@ -483,6 +490,7 @@ impl SmrState {
                 all_logs_round: None,
                 prefix_fixed_round: None,
                 index_agreed_round: None,
+                full_prefix_fixed_round: None,
                 agreed_index: None,
                 committed_ack_round: None,
                 committed_round: None,
@@ -649,6 +657,12 @@ impl SmrState {
         self.client_order = (0..self.trackers.len()).collect();
         self.client_order.sort_by_key(|&i| self.trackers[i].client);
         Ok(round)
+    }
+
+    /// Each command's wire identity and auto flag, in issue (tracker) order from index `from` on.
+    pub fn issued_from(&self, from: usize) -> impl Iterator<Item = (ClientCommand, bool)> + '_ {
+        self.assert_records_kept("list issued commands");
+        self.trackers[from..].iter().map(|t| (t.cc, t.auto))
     }
 
     /// Every command this session knows, in tracker order, for replay export.
@@ -825,6 +839,26 @@ impl SmrState {
             SmrNodes::Comp(nodes) => nodes.iter().map(CompactNode::log_entries).collect(),
             SmrNodes::Ext(_) | SmrNodes::Rec(_) => Vec::new(),
         }
+    }
+
+    /// Live sessions only: date compact and recovery `prefix_fixed_round` over each server's
+    /// executed part ++ log, and record every round's oldest unsettled age. Batch drivers never
+    /// call it, so their reports stay byte-identical.
+    pub fn observe_full_prefix(&mut self) {
+        assert_eq!(
+            self.round, 0,
+            "the observer has to see every round from the first"
+        );
+        assert!(
+            !self.truncate_history && !self.flat,
+            "lean and flat runs forget the canonical order this observer reads"
+        );
+        self.full_prefix = true;
+    }
+
+    /// The oldest unsettled ages (full and contested) per round while `observe_full_prefix` is on.
+    pub fn unsettled_ages(&self) -> &[Option<UnsettledAge>] {
+        &self.unsettled_ages
     }
 
     /// The report's `safety_ok` no-fork latch without rebuilding the report.

@@ -177,7 +177,7 @@ fn loaded_compact_under_blocking_step_stream_is_stable() {
             ),
         );
     }
-    assert_eq!((holder_entries, h), (30_749, 18_099_349_346_505_310_375));
+    assert_eq!((holder_entries, h), (30_749, 7_488_869_709_967_826_197));
     assert_eq!(
         digest(&state.report()),
         (300, 11_717, 6_258_403_322_804_743_246)
@@ -297,7 +297,7 @@ fn loaded_recovery_through_a_surge_step_stream_is_stable() {
     assert!(executed > 0, "the boundary pass must latch commitments");
     assert_eq!(
         (rollbacks, executed, holder_entries, h),
-        (61, 718, 2_657_913, 18_305_340_862_122_328_681)
+        (61, 718, 2_657_913, 14_643_451_127_489_063_887)
     );
     assert_eq!(digest(&report), (800, 58_920, 16_816_833_026_232_476_530));
 }

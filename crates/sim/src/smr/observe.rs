@@ -15,6 +15,7 @@ pub(super) mod detail;
 pub(super) mod entry_index;
 pub(super) mod exec_dup;
 pub(super) mod fleet_wedge;
+pub(super) mod full_prefix;
 pub(super) mod log_index;
 pub(super) mod round_metrics;
 pub(super) mod safety;

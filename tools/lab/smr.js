@@ -1,17 +1,19 @@
 // SMR view: run form + injections editor, batch render, live loop with
 // interactive injection, audit-drawer command list, spread/position charts,
 // prefix ribbon. Shell: A2 (spec 2026-07-23-lab-gui-revamp-design.md).
-import { S, $, PALETTE, AUTO_CLIENT_BASE } from './state.js';
+import { S, $, PALETTE } from './state.js';
 import { post } from './engine.js';
 import { downloadJson } from './form.js';
 import { createPmfEditor } from './pmf-editor.js';
-import { onCertsSnapshot, onChainSnapshot, freezeChain, useEntrySelect, resetCertsDrawer, onVerifyTallies, markCertsLoading, endCertsLoading } from './smr-certs.js';
+import { onCertsSnapshot, onChainSnapshot, freezeChain, useEntrySelect, resetCertsDrawer, onVerifyTallies, markCertsLoading, endCertsLoading, cmdIndexFor } from './smr-certs.js';
 import { applyReportDelta, EMPTY_REPORT } from './smr-delta.js';
-import { recRows, rStarScan, releaseRound, lastLatched, lawText, programBeta, smrEnd, endText, END_LABEL } from './smr-derive.js';
+import { recRows, rStarScan, releaseRound, lawText, programBeta, smrEnd, endText, END_LABEL, sideTabAfter, spreadingHolders, cmdName, clientModelSpec, poolInFlight, isPool } from './smr-derive.js';
 import { renderViewport, resetViewport } from './smr-viewport.js';
-import { renderDrawer, resetDrawer, blockDrawerOpen, useBlockDrawerOpen } from './smr-drawer.js';
+import { ROUND_CAP, continuePlan, targetEnd } from './continue.js';
+import { bindContinueMenu, continueStatus } from './continue-ui.js';
+import { renderDrawer, resetDrawer, blockDrawerOpen, useBlockDrawerOpen, useSelectCmd } from './smr-drawer.js';
 
-S.smr = { report: null, live: null, scenario: null, ctx: null, pending: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'recovery', speed: 1, handle: false, srvOpen: false, chart: 'spread', program: null, detail: null, pin: null, manualBlocks: new Set(), gridMode: null, gridSort: false, chain: null, ack: true, end: null };
+S.smr = { report: null, live: null, scenario: null, ctx: null, pending: null, nextClient: 1, nextOp: 1, lastStatus: null, sel: null, proto: 'recovery', speed: 1, handle: false, srvOpen: false, chart: 'spread', program: null, detail: null, pin: null, manualBlocks: new Set(), gridMode: null, gridSort: false, chain: null, ack: true, end: null, ages: null };
 
 /* ---------- arrival traffic (engine pmf) ---------- */
 
@@ -46,6 +48,20 @@ $('smrArrRate').addEventListener('change', () => {
 
 $('auditClosedTag').addEventListener('click', () => setAuditOpen(true));
 $('auditCollapse').addEventListener('click', () => setAuditOpen(false));
+// Sidebar tabs: Summary until a command is selected, Audit for every new selection.
+let side = { tab: 'summary', explicit: false };
+function renderSide() {
+  for (const b of document.querySelectorAll('#sideTabs .ct')) b.classList.toggle('on', b.dataset.side === side.tab);
+  $('sideSummary').classList.toggle('hidden', side.tab !== 'summary');
+  $('sideAudit').classList.toggle('hidden', side.tab !== 'audit');
+  $('sideTagLabel').textContent = side.tab === 'summary' ? 'SUMMARY' : 'AUDIT';
+  $('auditCnt').classList.toggle('hidden', side.tab !== 'audit');
+}
+function sideEvent(event) {
+  side = sideTabAfter(side, event);
+  renderSide();
+}
+for (const b of document.querySelectorAll('#sideTabs .ct')) b.addEventListener('click', () => sideEvent({ pick: b.dataset.side }));
 function setAuditOpen(open) {
   $('smrAuditCol').classList.toggle('open', open);
   $('smrAuditCol').classList.toggle('closed', !open);
@@ -93,13 +109,18 @@ function configRows(ctx) {
     ['servers', spec.n], ['seed', spec.seed], ['σ', spec.sigma], ['max rounds', spec.max_rounds],
     ['blocking', blockingText(spec, ctx.sticky, ctx.kind, ctx.program)],
     ['traffic', trafficText(spec.traffic)],
+    ['clients', isPool(spec) ? `pool of ${spec.client_model.clients}` : 'unique'],
     ['injections', spec.injections.length],
   ].filter(Boolean);
 }
 
 function sessionStarted(ctx) {
   S.smr.ctx = ctx;
+  S.smr.ages = null;
+  S.smr.mem = null;
+  S.smr.seqRound = null;
   S.smr.safetyRound = null;
+  sideEvent({ select: S.smr.sel ?? null });
   S.smr.blockSel = null;
   resetViewport();
   resetDrawer();
@@ -190,8 +211,34 @@ export function buildSmrSpec() {
   };
   const traffic = formTrafficSpec();
   if (traffic) spec.traffic = traffic;
+  const clients = clientModelSpec($('smrClientModel').value, $('smrPoolN').value);
+  if (clients) spec.client_model = clients;
   return spec;
 }
+
+// Unique stays the default: the form's arrival rate alone cannot size a pool safely, and an
+// undersized one aborts the run.
+function syncClientModel() {
+  const ext = S.smr.proto === 'extended';
+  const opt = $('smrClientModel').querySelector('option[value="pool"]');
+  opt.disabled = ext;
+  opt.textContent = ext ? 'pool of N (not in extended)' : 'pool of N';
+  if (ext) $('smrClientModel').value = 'unique';
+  $('smrGuardPool').classList.toggle('hidden', !ext);
+  const pool = $('smrClientModel').value === 'pool';
+  $('smrPoolN').classList.toggle('hidden', !pool);
+  const traffic = formTrafficSpec();
+  const T = S.smr.proto === 'recovery' ? +$('smrTw').value : +$('smrT').value;
+  const flight = Math.round(poolInFlight(traffic?.arrivals_pmf ?? null, S.smr.proto, T));
+  const n = clientModelSpec('pool', $('smrPoolN').value).clients;
+  $('smrPoolHint').textContent = !pool ? ''
+    : !traffic ? 'traffic off: the pool serves no arrivals'
+      : `≈ ${flight} commands in flight on average (${S.smr.proto === 'recovery' ? 'rate × 2T' : 'rate × T'}); peaks run to ≈ 2×` +
+        (n < 2 * flight ? ` · a pool of ${n} may exhaust and abort the run` : '') +
+        ' · a blocking surge stops commits while arrivals continue, so a long enough surge exhausts any pool';
+  $('smrPoolHint').classList.toggle('warn', pool && !!traffic && n < 2 * flight);
+}
+for (const ev of ['input', 'change', 'pointerup']) $('smrFormCard').addEventListener(ev, syncClientModel);
 
 for (const btn of $('smrProtoToggle').children) {
   btn.addEventListener('click', () => {
@@ -201,8 +248,10 @@ for (const btn of $('smrProtoToggle').children) {
       el.classList.toggle('hidden', S.smr.proto !== 'compact'));
     document.querySelectorAll('.recoveryOnly').forEach(el =>
       el.classList.toggle('hidden', S.smr.proto !== 'recovery'));
+    syncClientModel();
   });
 }
+syncClientModel();
 
 for (const btn of $('smrAckToggle').children) {
   btn.addEventListener('click', () => {
@@ -317,8 +366,8 @@ function resetFailureOutcome() {
 }
 
 // A spec file runs through the engine's batch path and opens as a finished
-// run: that keeps replay of exports a live session refuses (manual blocks,
-// pool clients) and keeps the batch failure path.
+// run: an export records its per-round schedule and manual blocks, which a
+// live session does not replay, and it keeps the batch failure path.
 export function runSpecBatch(spec) {
   if (S.engine !== 'wasm') { $('smrStatus').textContent = 'engine not ready'; return; }
   resetFailureOutcome();
@@ -374,8 +423,11 @@ export function onSmrFailed(m) {
   S.smr.pin = null;
   S.smr.chain = null;
   S.smr.manualBlocks = new Set();
+  // a live session keeps the ages it streamed up to the failing round
+  const ages = m.mode === 'live' && S.smr.ages ? S.smr.ages.concat(m.ages ?? []) : null;
   resetCertsDrawer();
   sessionStarted(sessionCtx(scenario, m.mode, S.smr.pending?.sticky ?? false));
+  S.smr.ages = ages;
   setEnd(smrEnd(report.terminal, S.smr.pending?.maxRounds ?? scenario.max_rounds));
   const headline = m.failure.phase === 'BoundaryPreflight'
     ? `recovery stopped before mutating boundary ${terminal.attempted_round}.` +
@@ -412,6 +464,8 @@ export function onSmrReady(m) {
   setSlider(ctx.program ? programBeta(ctx.program, 1) ?? 0 : ctx.sticky ? 0 : Math.round((ctx.spec.schedule.fraction ?? 0) * 100));
   S.smr.sel = null;
   sessionStarted(S.smr.pending);
+  S.smr.ages = m.ages;
+  S.smr.mem = m.memory ? [m.memory] : [];
   $('smrStatus').textContent = 'live session — blocking slider, inject commands anytime';
   updateToolbar();
   // a previous session's rule may have fed the other chain feed
@@ -420,13 +474,14 @@ export function onSmrReady(m) {
   renderSmr();
 }
 
-// The forest panel lives in the block drawer, so the engine's certificate and chain feeds are
-// read only while that drawer is open, and once more when it opens. Merge animations after
-// skipped rounds replay just the newest step's merges.
+// The forest panel lives in the block drawer, so the certificate snapshot is read only while
+// that drawer is open, and once more when it opens. A recovery session reads the chain delta
+// every step, a few new entries at most: the block tiles' margins need entry positions. Merge
+// animations after skipped rounds replay just the newest step's merges.
 function feedFlags() {
   const open = blockDrawerOpen();
   const certsFeed = !isRec() || displayCertsRec();
-  return { wantCerts: open && certsFeed, wantChain: open && !certsFeed };
+  return { wantCerts: open && certsFeed, wantChain: isRec() };
 }
 useBlockDrawerOpen(() => {
   if (!S.smr.live && !S.smr.handle) return;
@@ -441,21 +496,28 @@ export function onSmrFeeds(m) {
 
 // The chain panel has three feeds: compact streams the §5 certificate
 // snapshot whole, recovery-with-certificates streams the same shape over the
-// checkpoint forests (RQ11), and plain recovery streams committed-entry
-// deltas that accumulate here.
+// checkpoint forests (RQ11), and plain recovery draws the committed-entry
+// deltas that every recovery session accumulates here.
 function onChainOrCerts(m) {
+  // the round the committed sequence the summary cards read was taken at
+  if (S.smr.report && (isRec() ? m.chain && !m.chain.error : m.certs)) S.smr.seqRound = S.smr.report.metrics.length;
   if (!isRec()) { onCertsSnapshot(m.certs); return; }
+  const chainError = accumulateChain(m.chain);
   if (displayCertsRec()) { onCertsSnapshot(m.certs, true); return; }
-  if (!m.chain) return;
-  if (m.chain.error) { freezeChain(m.chain.error); return; }
+  if (chainError) { freezeChain(chainError); return; }
+  if (S.smr.chain && blockDrawerOpen()) onChainSnapshot(S.smr.chain);
+}
+function accumulateChain(delta) {
+  if (!delta) return null;
+  if (delta.error) return delta.error;
   const prev = S.smr.chain;
   S.smr.chain = {
-    m: m.chain.m,
-    peaks: m.chain.peaks,
-    merges: m.chain.merges,
-    entries: prev ? prev.entries.concat(m.chain.entries) : m.chain.entries,
+    m: delta.m,
+    peaks: delta.peaks,
+    merges: delta.merges,
+    entries: prev ? prev.entries.concat(delta.entries) : delta.entries,
   };
-  onChainSnapshot(S.smr.chain);
+  return null;
 }
 
 // A committed block names a command; pinning it is the same act as clicking
@@ -463,17 +525,15 @@ function onChainOrCerts(m) {
 useEntrySelect(ent => {
   const rep = S.smr.report;
   if (!rep || ent.kind !== 'cmd') return;
-  const i = rep.commands.findIndex(c => c.client === ent.client && c.op === ent.op);
+  const i = cmdIndexFor(ent);
   if (i >= 0) selectCmd(i);
 });
+useSelectCmd(i => selectCmd(i));
 
 // While `S.smr.live` is set the session can step. A stopped live session
 // (End, max rounds, dead, failed) keeps its engine handle in the worker so its
 // export, verify and node-detail calls keep working on the frozen run.
 const MAX_CHUNK = 25;
-// the form's own round limit: the lab keeps every round in page memory
-const ROUND_CAP = 5000;
-const continueTarget = ctx => Math.min(ROUND_CAP, ctx.maxRounds + ctx.spec.max_rounds);
 const lastRound = () => (S.smr.lastStatus ? S.smr.lastStatus.round : 0);
 const speedDelay = () => (S.smr.speed === 'max' ? 0 : 720 / S.smr.speed);
 const speedChunk = () => (S.smr.speed === 'max' ? MAX_CHUNK : 1);
@@ -490,14 +550,14 @@ function updateToolbar() {
   else delete $('smrPlayBtn').dataset.tip;
   if (hasSession) {
     const round = end ? end.round : lastRound();
-    $('smrLiveRound').textContent = `round ${round}/${S.smr.ctx.maxRounds}` + (end ? ' · ' + END_LABEL[end.kind] : '');
+    $('smrLiveRound').textContent = (S.smr.ctx.open && !end ? `round ${round} · until stopped` : `round ${round}/${S.smr.ctx.maxRounds}`) + (end ? ' · ' + END_LABEL[end.kind] : '');
     $('smrLiveRound').classList.toggle('ended', !!end);
   }
   $('smrStimulus').classList.toggle('off', !lv);
   $('smrEndBtn').classList.toggle('hidden', !lv);
   $('smrNewBtn').classList.toggle('hidden', !!lv || !hasSession);
-  $('smrContinueBtn').classList.toggle('hidden', !!lv || !S.smr.resume);
-  if (S.smr.resume) $('smrContinueBtn').dataset.tip = `keep going to round ${continueTarget(S.smr.ctx)}`;
+  $('smrContinuePop').classList.toggle('hidden', !!lv || !S.smr.resume);
+  if (S.smr.resume) refreshContinue();
   $('smrPlayBtn').textContent = lv && lv.playing ? '⏸ Pause' : '⏵ Play';
   for (const b of document.querySelectorAll('#smrSpeed button')) b.classList.toggle('on', b.dataset.speed === String(S.smr.speed));
   for (const b of document.querySelectorAll('.recoveryItem')) b.disabled = !isRec();
@@ -551,7 +611,7 @@ function smrStep(count = 1) {
   const lv = S.smr.live;
   if (!lv || lv.awaiting) return;
   const room = S.smr.ctx.maxRounds - lastRound();
-  if (room <= 0) { finishLive(smrEnd(null, S.smr.ctx.maxRounds)); return; }
+  if (room <= 0) { finishLive(targetEnd(lastRound(), S.smr.ctx.maxRounds)); return; }
   const n = Math.min(count, room);
   const first = lastRound() + 1;
   lv.awaiting = true;
@@ -582,12 +642,18 @@ export function onSmrRound(m) {
     return;
   }
   S.smr.lastStatus = status;
+  S.smr.ages = S.smr.ages.concat(m.ages);
+  if (m.memory) S.smr.mem.push(m.memory);
+  if (S.smr.ctx.proto !== 'extended' && S.smr.ages.length !== S.smr.report.metrics.length) {
+    onSmrAbort({ error: `unsettled ages cover ${S.smr.ages.length} rounds, the report ${S.smr.report.metrics.length}`, page: true });
+    return;
+  }
   // a batched step cannot say which round of the batch flipped the flag
   if (!S.smr.report.safety_ok && S.smr.safetyRound == null && m.steps === undefined) S.smr.safetyRound = status.round;
   const max = S.smr.ctx.maxRounds;
   const stopNote = status.absorbed || status.dead !== null
     ? smrEnd({ Dead: { round: status.dead ?? status.round } }, max)
-    : status.round >= max ? smrEnd({ Ran: { rounds: status.round } }, max) : null;
+    : status.round >= max ? targetEnd(status.round, max) : null;
   if (stopNote) lv.playing = false;
   updateToolbar();
   onChainOrCerts(m);
@@ -646,18 +712,21 @@ $('smrAuditScope').addEventListener('change', () => {
   if (S.smr.report) renderAudit(S.smr.report);
 });
 $('smrEndBtn').addEventListener('click', () => finishLive({ kind: 'ended', round: lastRound(), max: S.smr.ctx.maxRounds }));
-$('smrContinueBtn').addEventListener('click', () => {
+const refreshContinue = bindContinueMenu('smr', { ctx: () => S.smr.ctx, current: lastRound, go: continueRun });
+function continueRun(mode) {
   const lv = S.smr.resume;
-  if (!lv) return;
+  const plan = lv ? continuePlan(lastRound(), mode) : null;
+  if (!plan) return;
   S.smr.resume = null;
-  S.smr.ctx.maxRounds = continueTarget(S.smr.ctx);
+  S.smr.ctx.maxRounds = plan.target;
+  S.smr.ctx.open = plan.open;
   S.smr.end = null;
   S.smr.live = lv;
   lv.playing = true;
-  $('smrStatus').textContent = `continuing to round ${S.smr.ctx.maxRounds}`;
+  $('smrStatus').textContent = continueStatus(plan);
   updateToolbar();
   smrStep(speedChunk());
-});
+}
 $('smrNewBtn').addEventListener('click', () => {
   S.smr.resume = null;
   S.smr.handle = false;
@@ -793,16 +862,6 @@ function renderRecChips(rep) {
   $('smrPhaseChip').textContent = phase === null ? '' : `${phase} · release r${release}`;
   $('smrPhaseChip').className = 'recChip mono' + (phase === 'CONFIRMED' ? ' ok' : phase ? ' warn' : '');
 
-  const forkK = lastLatched(rows, 'cp_fork_k');
-  $('smrForkChip').textContent = forkK > 1 ? `⚠ checkpoint fork k ${forkK}` : `checkpoint fork k ${forkK || '–'}`;
-  $('smrForkChip').className = 'recChip mono' + (forkK > 1 ? ' alarm' : '');
-
-  const settled = rep.commands.filter(c => c.all_logs_round !== null).length;
-  const ckpt = lastLatched(rows, 'max_cp_p_len');
-  const fin = rep.commands.filter(c => c.executed_round != null).length;
-  const rolls = rows.reduce((a, r) => a + r.rollbacks, 0);
-  $('smrLifeChip').textContent = `settled ${settled} → ckpt ${ckpt} → final ${fin} · ⟲ ${rolls}`;
-
   renderLawCard(release, rStar, T);
 }
 
@@ -863,9 +922,7 @@ for (const item of document.querySelectorAll('#smrJumpPop .menuItem')) {
 /* ---------- rendering ---------- */
 
 const cmdColor = i => PALETTE[i % PALETTE.length];
-const cmdLabel = cmd => cmd.auto
-  ? `bg #${cmd.client - AUTO_CLIENT_BASE}`
-  : `c${cmd.client} · op ${cmd.op}`;
+const cmdLabel = cmd => cmdName(cmd, isPool(S.smr.ctx?.spec));
 const BADGE = { Complete: ['badge-ok', 'Complete'], Pending: ['badge-run', 'Pending'], Dead: ['badge-dead', 'Dead'] };
 const OC = {
   Delivered: ['oc-delivered', 'delivered'],
@@ -895,7 +952,18 @@ function selectedCmd(rep) {
 }
 function selectCmd(i) {
   S.smr.sel = i;
+  sideEvent({ select: i });
   renderSmr();
+  revealSelected();
+}
+
+// Scrolls the audit list alone, so a pick made in a drawer does not move the page.
+function revealSelected() {
+  const box = $('smrAudit');
+  const card = box.querySelector('.auditCard.sel');
+  if (!card) return;
+  const at = card.getBoundingClientRect().top - box.getBoundingClientRect().top;
+  if (at < 0 || at + card.offsetHeight > box.clientHeight) box.scrollTop += at - 8;
 }
 
 function prepCanvas(cv) {
@@ -951,9 +1019,7 @@ function gridLook(rep, st, mode) {
   let holders = null;
   const sel = S.smr.sel;
   if (mode === 'watch' && sel !== null) {
-    const cmd = rep.commands[sel];
-    const sp = st.spreading.find(c => c.client === cmd.client);
-    holders = sp ? new Set(sp.holders) : cmd.all_logs_round !== null ? 'all' : new Set();
+    holders = spreadingHolders(rep.commands[sel], st.spreading);
   }
   return st.nodes.map((g, i) => {
     if (g.log_len === null) return { color: '#4b5563', alpha: 1, key: 1e9 };

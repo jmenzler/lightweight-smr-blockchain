@@ -5,6 +5,10 @@
 
 use sim::smr::{SmrScenario, run_smr};
 use sim::spec::SmrScenarioSpec;
+#[path = "common/batch_view.rs"]
+mod batch_view;
+
+use batch_view::live_report_as_batch;
 use sim_wasm::{LiveSmr, run_smr_json};
 
 fn recovery_spec(t_window: u64) -> String {
@@ -26,7 +30,7 @@ fn batch_report(scenario_json: &str) -> serde_json::Value {
 }
 
 fn live_report(live: &LiveSmr) -> serde_json::Value {
-    serde_json::from_str(&live.report_json()).expect("live report json")
+    live_report_as_batch(live)
 }
 
 fn batch(spec_json: &str) -> sim::smr::SmrReport {

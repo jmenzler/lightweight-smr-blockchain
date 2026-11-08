@@ -19,8 +19,8 @@ use crate::helpers::{
     chain_snapshot, check_fraction, error_json, hex, merge_json, peaks_json, recorded_schedule,
 };
 use sim::smr::{
-    CommandReport, ManualBlock, SmrReport, SmrScenario, SmrState, SmrStepStatus, SpreadCurve,
-    run_smr,
+    CommandReport, DeliveryAttempt, ManualBlock, SmrReport, SmrScenario, SmrState, SmrStepStatus,
+    SpreadCurve, SpreadPoint, run_smr,
 };
 use sim::spec::{InjectionSpec, SmrScenarioSpec, TrafficPhaseSpec, TrafficSpec};
 use std::collections::{BTreeMap, HashMap};
@@ -68,7 +68,64 @@ fn assert_full_scope(report: &sim::smr::SmrReport) {
 struct DeltaCursor {
     rounds: usize,
     rec_rows: usize,
-    commands: HashMap<u64, CommandReport>,
+    commands: HashMap<u64, Sent>,
+}
+
+/// A sent command: its scalars, and where each of its two lists ended.
+struct Sent {
+    scalars: CommandReport,
+    spread: Mark<SpreadPoint>,
+    attempts: Mark<DeliveryAttempt>,
+}
+
+/// A list's length and last entry when sent. The engine only appends entries dated with the
+/// current round or empties the list, so a list that still holds the sent last entry at the sent
+/// length still begins with everything that was sent.
+#[derive(PartialEq)]
+struct Mark<T> {
+    len: usize,
+    last: Option<T>,
+}
+
+impl<T: Copy + PartialEq> Mark<T> {
+    fn of(list: &[T]) -> Self {
+        Mark {
+            len: list.len(),
+            last: list.last().copied(),
+        }
+    }
+
+    fn continued_by(&self, list: &[T]) -> bool {
+        list.len() >= self.len
+            && self
+                .len
+                .checked_sub(1)
+                .is_none_or(|i| Some(list[i]) == self.last)
+    }
+}
+
+enum Seen {
+    New,
+    Same,
+    Grew {
+        spread_from: usize,
+        attempts_from: usize,
+    },
+    Changed,
+}
+
+/// Moves the two lists out, leaving the scalars; `join` puts them back.
+fn split(command: &mut CommandReport) -> (Vec<SpreadPoint>, Vec<DeliveryAttempt>) {
+    let spread = match std::mem::replace(&mut command.spread, SpreadCurve::NotObserved) {
+        SpreadCurve::Observed(points) => points,
+        SpreadCurve::NotObserved => panic!("op {}: the lab reads full-scope reports", command.op),
+    };
+    (spread, std::mem::take(&mut command.attempts))
+}
+
+fn join(command: &mut CommandReport, spread: Vec<SpreadPoint>, attempts: Vec<DeliveryAttempt>) {
+    command.spread = SpreadCurve::Observed(spread);
+    command.attempts = attempts;
 }
 
 impl DeltaCursor {
@@ -84,15 +141,18 @@ impl DeltaCursor {
         let mut inserted = Vec::new();
         let mut changed = Vec::new();
         let mut appended = Vec::new();
-        for (index, command) in commands.iter().enumerate() {
-            match self.commands.get(&command.op) {
-                None => inserted.push(index),
-                Some(sent) if sent == command => {}
-                Some(sent) if only_grew(sent, command) => appended.push(index),
-                Some(_) => changed.push(index),
+        for (index, command) in commands.iter_mut().enumerate() {
+            match self.seen(command) {
+                Seen::New => inserted.push(index),
+                Seen::Same => {}
+                Seen::Grew {
+                    spread_from,
+                    attempts_from,
+                } => appended.push((index, spread_from, attempts_from)),
+                Seen::Changed => changed.push(index),
             }
         }
-        let appended_rows = self.appended_rows(&mut commands, &appended);
+        let appended_rows = appended_rows(&mut commands, &appended);
         // Removing the row lists from the serialized remainder keeps a future report field in the summary.
         let mut summary = serde_json::to_value(&report).expect("report serializes");
         let fields = summary.as_object_mut().expect("report is an object");
@@ -117,50 +177,72 @@ impl DeltaCursor {
         self.rounds = metrics.len();
         self.rec_rows = rec_rows.len();
         let mut sent = vec![false; commands.len()];
-        for index in inserted.into_iter().chain(changed).chain(appended) {
+        for index in inserted
+            .into_iter()
+            .chain(changed)
+            .chain(appended.into_iter().map(|(index, _, _)| index))
+        {
             sent[index] = true;
         }
-        for (command, sent) in commands.into_iter().zip(sent) {
+        for (mut command, sent) in commands.into_iter().zip(sent) {
             if sent {
-                self.commands.insert(command.op, command);
+                let (spread, attempts) = split(&mut command);
+                self.commands.insert(
+                    command.op,
+                    Sent {
+                        scalars: command,
+                        spread: Mark::of(&spread),
+                        attempts: Mark::of(&attempts),
+                    },
+                );
             }
         }
         delta
     }
-}
 
-impl DeltaCursor {
-    /// `[[index, command without its curve and attempts, curve length sent, new curve points,
-    /// attempts length sent, new attempts], ...]`. The page overwrites the two lists on the scalars.
-    fn appended_rows(&self, commands: &mut [CommandReport], indices: &[usize]) -> String {
-        let rows: Vec<String> = indices
-            .iter()
-            .map(|&i| {
-                let command = &mut commands[i];
-                let sent = &self.commands[&command.op];
-                let (spread_from, attempts_from) =
-                    (sent.spread.points().len(), sent.attempts.len());
-                let spread = std::mem::replace(&mut command.spread, SpreadCurve::NotObserved);
-                let attempts = std::mem::take(&mut command.attempts);
-                let row = format!(
-                    "[{i},{},{spread_from},{},{attempts_from},{}]",
-                    serde_json::to_string(&*command).expect("serializes"),
-                    serde_json::to_string(&spread.points()[spread_from..]).expect("serializes"),
-                    serde_json::to_string(&attempts[attempts_from..]).expect("serializes"),
-                );
-                command.spread = spread;
-                command.attempts = attempts;
-                row
-            })
-            .collect();
-        format!("[{}]", rows.join(","))
+    /// Decided against what was last sent: only a continued list lets the page append its tail.
+    fn seen(&self, command: &mut CommandReport) -> Seen {
+        let Some(sent) = self.commands.get(&command.op) else {
+            return Seen::New;
+        };
+        let (spread, attempts) = split(command);
+        let seen = if sent.scalars == *command
+            && sent.spread == Mark::of(&spread)
+            && sent.attempts == Mark::of(&attempts)
+        {
+            Seen::Same
+        } else if sent.spread.continued_by(&spread) && sent.attempts.continued_by(&attempts) {
+            Seen::Grew {
+                spread_from: sent.spread.len,
+                attempts_from: sent.attempts.len,
+            }
+        } else {
+            Seen::Changed
+        };
+        join(command, spread, attempts);
+        seen
     }
 }
 
-/// Decided against what was last sent, never assumed: only then can the page append the tails.
-fn only_grew(sent: &CommandReport, now: &CommandReport) -> bool {
-    now.spread.points().starts_with(sent.spread.points())
-        && now.attempts.starts_with(&sent.attempts)
+/// `[[index, command without its curve and attempts, curve length sent, new curve points,
+/// attempts length sent, new attempts], ...]`. The page overwrites the two lists on the scalars.
+fn appended_rows(commands: &mut [CommandReport], rows: &[(usize, usize, usize)]) -> String {
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|&(i, spread_from, attempts_from)| {
+            let command = &mut commands[i];
+            let (spread, attempts) = split(command);
+            let row = format!(
+                "[{i},{},{spread_from},{},{attempts_from},{}]",
+                serde_json::to_string(&*command).expect("serializes"),
+                serde_json::to_string(&spread[spread_from..]).expect("serializes"),
+                serde_json::to_string(&attempts[attempts_from..]).expect("serializes"),
+            );
+            join(command, spread, attempts);
+            row
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
 }
 
 /// `[[index, command], ...]` serialized straight to text, without a `Value` copy of each command.
@@ -193,6 +275,10 @@ pub struct LiveSmr {
     block_events: Vec<ManualBlock>,
     certs: Option<sim::certs::CertHarness>,
     certs_from_checkpoints: bool,
+    /// Pool clients are bounded and reused, so the §5 client protocol runs for them too; unique
+    /// arrivals each issue once and stay out of the certificate panel.
+    certs_for_pool: bool,
+    issued_seen: usize,
     captured: BTreeMap<u32, (u64, protocol::certificates::Certificate)>,
     sent: DeltaCursor,
 }
@@ -209,9 +295,6 @@ impl LiveSmr {
     pub fn new_with_mode(spec_json: &str, sticky: bool) -> Result<LiveSmr, String> {
         let spec: SmrScenarioSpec = serde_json::from_str(spec_json).map_err(|e| e.to_string())?;
         let scenario = lab_scenario(spec.clone())?;
-        if !scenario.client_model.is_unique() {
-            return Err("client_model pool is batch-only: the lab has no pool support".into());
-        }
         if !scenario.manual_blocks.is_empty() {
             return Err("manual_blocks are batch-only: live blocking is set with set_block".into());
         }
@@ -226,7 +309,7 @@ impl LiveSmr {
         };
         let mask = vec![false; scenario.n];
         // certs on here, never in `self.base`, so the exported spec replays gated off
-        let state = SmrState::new_with_certs(
+        let mut state = SmrState::new_with_certs(
             scenario.n,
             scenario.cfg,
             scenario.proto,
@@ -240,6 +323,8 @@ impl LiveSmr {
             scenario.merge_policy,
             scenario.repeated_commit,
         );
+        // live-only: the lifelines view reads T_E and the unsettled age; batch runs never date them
+        state.observe_full_prefix();
         let certs_from_checkpoints = matches!(
             scenario.proto,
             sim::smr::Proto::Recovery {
@@ -271,6 +356,8 @@ impl LiveSmr {
             last_blocked: vec![false; scenario.n],
             certs,
             certs_from_checkpoints,
+            certs_for_pool: scenario.client_model.pool_size().is_some(),
+            issued_seen: 0,
             captured: BTreeMap::new(),
             sent: DeltaCursor::default(),
         })
@@ -306,6 +393,16 @@ impl LiveSmr {
         if !status.failed()
             && let Some(certs) = &mut self.certs
         {
+            if self.certs_for_pool {
+                // A round's arrivals are issued before any ack of theirs can be delivered below.
+                for (cc, auto) in self.state.issued_from(self.issued_seen) {
+                    self.issued_seen += 1;
+                    if auto {
+                        certs.register_client(cc.client);
+                        certs.record_issue(cc.client, cc.sn, cc.op);
+                    }
+                }
+            }
             if self.certs_from_checkpoints {
                 certs.observe_round_rec(&self.state);
             } else {
@@ -410,6 +507,64 @@ impl LiveSmr {
         let report = self.state.report();
         assert_full_scope(&report);
         serde_json::to_string(&report).expect("report serializes")
+    }
+
+    /// Per-round oldest unsettled age (compact, recovery) from round `from + 1` on, as a JSON
+    /// array; `null` marks a round with no log or after prefix consistency was lost.
+    pub fn unsettled_ages_json(&self, from: usize) -> String {
+        let ages = self.state.unsettled_ages();
+        serde_json::to_string(&ages[from.min(ages.len())..]).expect("ages serialize")
+    }
+
+    /// Live-only memory view, read only: per-node standalone bytes over the non-⊥ servers (median,
+    /// max, the median server's categories; see `sim::smr::NodeBytes`), all n servers' standalone
+    /// bytes, the simulator's bytes for the same n servers with shared allocations charged once,
+    /// sharing = the first ÷ the second, and the wasm linear memory (null natively). Compact §5
+    /// state lives in the cert harness and is charged to its server on both sides.
+    pub fn memory_json(&self) -> String {
+        if let Some(error) = self.failed_action("read the memory footprint") {
+            return error;
+        }
+        let (Some(mut per), Some(mut all), Some(mut shared)) = (
+            self.state.node_bytes(),
+            self.state.standalone_bytes(),
+            self.state.simulator_node_bytes(),
+        ) else {
+            return serde_json::json!({ "error": "extended keeps no executed state to account" })
+                .to_string();
+        };
+        if !self.certs_from_checkpoints
+            && let Some(harness) = &self.certs
+        {
+            let clients = self.state.tracked_clients();
+            for (node, certs) in per.iter_mut().zip(harness.servers()) {
+                let bytes = sim::smr::cert_state_bytes(certs, &clients);
+                shared += bytes;
+                all += bytes;
+                if let Some(node) = node {
+                    node.certs = bytes;
+                }
+            }
+        }
+        let n = per.len();
+        let f = sim::smr::footprint(&per);
+        #[cfg(target_arch = "wasm32")]
+        let linear = Some(core::arch::wasm32::memory_size::<0>() as u64 * 65_536);
+        #[cfg(not(target_arch = "wasm32"))]
+        let linear: Option<u64> = None;
+        serde_json::json!({
+            "round": self.state.round(),
+            "n": n,
+            "counted": f.as_ref().map_or(0, |f| f.counted),
+            "median": f.as_ref().map(|f| f.median),
+            "max": f.as_ref().map(|f| f.max),
+            "median_node": f.as_ref().map(|f| f.median_node),
+            "standalone_bytes": all,
+            "simulator_node_bytes": shared,
+            "sharing": all as f64 / shared.max(1) as f64,
+            "linear_bytes": linear,
+        })
+        .to_string()
     }
 
     /// What changed in the report since the previous call (the first call: since nothing), so a
@@ -784,6 +939,184 @@ mod tests {
                     assert_eq!(got, status_value_reference(status, absorbed));
                 }
             }
+        }
+    }
+
+    /// Reference cursor: a full copy of every sent command, compared whole.
+    #[derive(Default)]
+    struct CopyCursor {
+        rounds: usize,
+        rec_rows: usize,
+        commands: HashMap<u64, CommandReport>,
+    }
+
+    impl CopyCursor {
+        fn delta(&mut self, mut report: SmrReport) -> String {
+            let metrics = std::mem::take(&mut report.metrics);
+            let mut commands = std::mem::take(&mut report.commands);
+            let rec_rows = report
+                .recovery
+                .as_mut()
+                .map(|r| std::mem::take(&mut r.rounds))
+                .unwrap_or_default();
+            let (mut inserted, mut changed, mut appended) = (Vec::new(), Vec::new(), Vec::new());
+            for (index, command) in commands.iter().enumerate() {
+                match self.commands.get(&command.op) {
+                    None => inserted.push(index),
+                    Some(sent) if sent == command => {}
+                    Some(sent)
+                        if command.spread.points().starts_with(sent.spread.points())
+                            && command.attempts.starts_with(&sent.attempts) =>
+                    {
+                        appended.push((index, sent.spread.points().len(), sent.attempts.len()))
+                    }
+                    Some(_) => changed.push(index),
+                }
+            }
+            let appended_rows = appended_rows(&mut commands, &appended);
+            let mut summary = serde_json::to_value(&report).expect("report serializes");
+            let fields = summary.as_object_mut().expect("report is an object");
+            fields.remove("metrics");
+            fields.remove("commands");
+            if let Some(recovery) = fields.get_mut("recovery").and_then(|r| r.as_object_mut()) {
+                recovery.remove("rounds");
+            }
+            let delta = format!(
+                r#"{{"rounds_from":{},"metrics":{},"rec_rows_from":{},"rec_rows":{},"summary":{},"len":{},"inserted":{},"changed":{},"appended":{}}}"#,
+                self.rounds,
+                serde_json::to_string(&metrics[self.rounds..]).expect("serializes"),
+                self.rec_rows,
+                serde_json::to_string(&rec_rows[self.rec_rows..]).expect("serializes"),
+                summary,
+                commands.len(),
+                indexed(&commands, &inserted),
+                indexed(&commands, &changed),
+                appended_rows,
+            );
+            self.rounds = metrics.len();
+            self.rec_rows = rec_rows.len();
+            for command in commands {
+                self.commands.insert(command.op, command);
+            }
+            delta
+        }
+    }
+
+    #[test]
+    fn the_marks_send_what_a_full_copy_would() {
+        let mut ended = 0;
+        let mut reused = 0;
+        for proto in [
+            r#"{"kind":"extended"}"#,
+            r#"{"kind":"compact","t_commit_rounds":2}"#,
+            r#"{"kind":"compact","t_commit_rounds":6}"#,
+            r#"{"kind":"recovery","t_window_rounds":4,"resend_until_acked":true}"#,
+            r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":false}"#,
+            r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":true}"#,
+        ] {
+            let pool = !proto.contains("extended");
+            for (seed, sticky, clients) in [
+                (1, false, ""),
+                (7, true, ""),
+                (23, false, ""),
+                (42, true, ""),
+                (5, false, r#","client_model":{"kind":"pool","clients":400}"#),
+                (9, true, r#","client_model":{"kind":"pool","clients":400}"#),
+            ] {
+                if !clients.is_empty() && !pool {
+                    continue;
+                }
+                let spec = SPEC
+                    .replace(
+                        r#"{"kind":"recovery","t_window_rounds":10,"resend_until_acked":true}"#,
+                        proto,
+                    )
+                    .replace(r#""seed":1"#, &format!(r#""seed":{seed}"#))
+                    .replace(
+                        r#""max_rounds":400"#,
+                        &format!(r#""max_rounds":400{clients}"#),
+                    );
+                let mut live = LiveSmr::new_with_mode(&spec, sticky).unwrap();
+                let mut reference = CopyCursor::default();
+                let mut rounds = 0;
+                // irregular gaps, as the worker's batched steps leave them
+                for gap in [1, 1, 3, 1, 5, 2, 1, 8, 1, 1, 4].iter().cycle().take(60) {
+                    for _ in 0..*gap {
+                        rounds += 1;
+                        if rounds % 17 == 0 {
+                            live.inject(1000 + rounds, u64::from(rounds) + 10_000, None);
+                        }
+                        if rounds % 23 == 0 {
+                            live.set_block(rounds % 32, rounds % 2 == 0);
+                        }
+                        if rounds == 50 {
+                            live.set_traffic("[0.1,0.3,0.3,0.3]");
+                        }
+                        // 10 of every 40 rounds block 60%
+                        live.step(if rounds % 40 >= 30 { 0.6 } else { 0.1 });
+                    }
+                    let expected = reference.delta(live.state.report());
+                    assert_eq!(
+                        live.report_delta_json(),
+                        expected,
+                        "{proto} seed {seed} sticky {sticky} round {rounds}"
+                    );
+                }
+                let last = live.last.as_ref().unwrap();
+                ended += usize::from(last.failed() || last.dead.is_some());
+                if !clients.is_empty() {
+                    let report = live.state.report();
+                    let mut seen = std::collections::HashSet::new();
+                    reused += usize::from(
+                        report
+                            .commands
+                            .iter()
+                            .any(|c| c.auto && !seen.insert(c.client)),
+                    );
+                }
+            }
+        }
+        assert!(
+            ended > 0,
+            "no session died or failed: the terminal paths went unchecked"
+        );
+        assert!(reused > 0, "the pool arms never reused a client");
+    }
+
+    #[test]
+    fn a_shrunk_or_regrown_list_goes_out_whole() {
+        let mut live = LiveSmr::new(SPEC).unwrap();
+        for _ in 0..20 {
+            live.step(0.3);
+        }
+        let mut cursor = DeltaCursor::default();
+        let sent = live.state.report();
+        let mut long = sent
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.attempts.len() >= 2)
+            .map(|(i, c)| (i, c.attempts.len()));
+        let ((shrunk, shrunk_len), (regrown, regrown_len)) =
+            (long.next().unwrap(), long.next().unwrap());
+        cursor.delta(sent);
+        for _ in 0..3 {
+            live.step(0.3);
+        }
+        let mut report = live.state.report();
+        report.commands[shrunk].attempts.truncate(shrunk_len - 1);
+        let attempts = &mut report.commands[regrown].attempts;
+        attempts.clear();
+        attempts.extend((0..regrown_len + 1).map(|i| DeliveryAttempt {
+            round: 1000 + i,
+            target: 0,
+            outcome: sim::smr::AttemptOutcome::Ignored,
+        }));
+
+        let delta: serde_json::Value = serde_json::from_str(&cursor.delta(report)).unwrap();
+        for index in [shrunk, regrown] {
+            assert!(indices(&delta, "changed").contains(&(index as u64)));
+            assert!(!indices(&delta, "appended").contains(&(index as u64)));
         }
     }
 

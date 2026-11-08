@@ -4,6 +4,7 @@ use crate::smr::engine::stages::{amplify, apply_all, failed_step, sn_order_failu
 use crate::smr::observe::canon_cursor::{CanonCursor, canon_lookup};
 use crate::smr::observe::canonical::Executed;
 use crate::smr::observe::committed::useful_at_round_end;
+use crate::smr::observe::full_prefix::{full_seqs, observe_full_prefix};
 use crate::smr::observe::log_index::{LogCounts, LogIndex, log_window_pos};
 use crate::smr::observe::round_metrics::smr_round_metrics;
 use crate::smr::tracker::{
@@ -205,6 +206,23 @@ impl SmrState {
         let canon_index = &self.canon_index;
         let canonical = self.checker.canonical();
         let release_line = self.release_line;
+        if self.full_prefix {
+            let age = self
+                .safety_ok
+                .then(|| {
+                    let seqs = full_seqs(&post_logs, &executed_lens);
+                    observe_full_prefix(
+                        round,
+                        canonical,
+                        canon_index,
+                        release_line,
+                        &seqs,
+                        &mut self.trackers,
+                    )
+                })
+                .flatten();
+            self.unsettled_ages.push(age);
+        }
 
         let observe_spread = self.observe_spread;
         let useful_counts = observe_spread.then(|| {

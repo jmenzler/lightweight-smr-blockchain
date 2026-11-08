@@ -120,7 +120,246 @@ fn state_bytes(state: &protocol::compact::SharedState) -> (u64, u64) {
     (executed, sn)
 }
 
+/// One server's bytes as if it owned every structure it references: the simulator shares
+/// allocations between nodes (log chunks, executed chunks, interned checkpoints), a real server
+/// would not, so nothing here is divided by a sharing factor. Structural estimates (element size ×
+/// count, maps at 1.5× their entries), not allocator RSS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NodeBytes {
+    /// L_i: its entries plus the median rule's permutation index.
+    pub log: u64,
+    /// S_i's executed sequence; the simulator represents the state machine by it.
+    pub executed: u64,
+    /// S_i's per-client sequence-number map.
+    pub sn: u64,
+    /// Recovery's C_i: its S (executed sequence and sn map) and P.
+    pub checkpoint: u64,
+    /// §5 certificate state: the Merkle forest's peaks and the last-two windows per client.
+    pub certs: u64,
+}
+
+impl NodeBytes {
+    pub fn total(&self) -> u64 {
+        self.log + self.executed + self.sn + self.checkpoint + self.certs
+    }
+}
+
+/// Per-node bytes over the servers holding a log; `median_node` is the median server's breakdown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Footprint {
+    pub counted: usize,
+    /// Upper median of the per-node totals.
+    pub median: u64,
+    pub max: u64,
+    pub median_node: NodeBytes,
+}
+
+/// `None` entries are ⊥ servers, left out; `None` when every server is ⊥.
+pub fn footprint(per_node: &[Option<NodeBytes>]) -> Option<Footprint> {
+    let mut held: Vec<NodeBytes> = per_node.iter().flatten().copied().collect();
+    if held.is_empty() {
+        return None;
+    }
+    held.sort_by_key(NodeBytes::total);
+    let median_node = held[held.len() / 2];
+    Some(Footprint {
+        counted: held.len(),
+        median: median_node.total(),
+        max: held.last().map_or(0, NodeBytes::total),
+        median_node,
+    })
+}
+
+/// A server's §5 certificate state in full: peaks plus every stored window and its map entry.
+pub fn cert_state_bytes(certs: &ServerCertState, clients: &[u32]) -> u64 {
+    let (forest, windows, _) = cert_bytes(Some(certs), clients);
+    forest + windows
+}
+
+/// One pass over shared allocations: a state, log, chunk or checkpoint is charged on first sight.
+#[derive(Default)]
+struct SharedWalk {
+    bytes: u64,
+    states: std::collections::HashSet<usize>,
+    chunks: std::collections::HashSet<usize>,
+    logs: std::collections::HashSet<usize>,
+    perms: std::collections::HashSet<usize>,
+    cps: std::collections::HashSet<usize>,
+}
+
+impl SharedWalk {
+    fn state(&mut self, state: &protocol::compact::SharedState) {
+        if !self.states.insert(std::ptr::from_ref(state) as usize) {
+            return;
+        }
+        self.bytes += map_bytes::<u32, u64>(state.sn_len());
+        let k = protocol::shared_state::ExecSeq::K;
+        for ptr in state.executed_chunk_ptrs() {
+            if self.chunks.insert(ptr as usize) {
+                self.bytes += (k * size_of::<Entry>()) as u64;
+            }
+        }
+        let tail = state.retained_len() - state.executed_sealed_count() * k;
+        self.bytes += (tail * size_of::<Entry>()) as u64;
+    }
+
+    fn log(&mut self, log: Option<&protocol::log::Log>) {
+        let Some(l) = log else { return };
+        if self.perms.insert(std::sync::Arc::as_ptr(l.perm()) as usize) {
+            self.bytes += (l.perm().len() * size_of::<u32>()) as u64;
+        }
+        let entries = l.entries();
+        if !self.logs.insert(std::sync::Arc::as_ptr(entries) as usize) {
+            return;
+        }
+        let k = protocol::compact::LogSeq::K;
+        for ptr in entries.chunk_ptrs() {
+            if self.chunks.insert(ptr as usize) {
+                self.bytes += (k * size_of::<Timed>()) as u64;
+            }
+        }
+        let tail = entries.retained_len() - entries.sealed_count() * k;
+        self.bytes += (tail * size_of::<Timed>()) as u64;
+    }
+}
+
+// Both walks below count in one set of units, so their ratio is sharing alone: element size ×
+// elements physically held (a chunked sequence's retained length), sn maps and §5 windows as maps.
+fn standalone_state_bytes(state: &protocol::compact::SharedState) -> (u64, u64) {
+    (
+        (state.retained_len() * size_of::<Entry>()) as u64,
+        map_bytes::<u32, u64>(state.sn_len()),
+    )
+}
+
+fn standalone_log_bytes(log: Option<&protocol::log::Log>) -> u64 {
+    log.map_or(0, |l| {
+        (l.entries().retained_len() * size_of::<Timed>() + l.perm().len() * size_of::<u32>()) as u64
+    })
+}
+
+fn pre_bytes(cp: &protocol::recovery::Checkpoint) -> u64 {
+    cp.p.as_ref()
+        .map_or(0, |p| (p.len() * size_of::<Timed>()) as u64)
+}
+
 impl SmrState {
+    /// The clients the run has seen, sorted; the §5 windows are keyed by them.
+    pub fn tracked_clients(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.trackers.iter().map(|t| t.client).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Every server's standalone bytes, ⊥ servers too (log 0; they still hold S_i and C_i), and
+    /// whether it holds a log.
+    fn standalone_all(&self) -> Option<Vec<(NodeBytes, bool)>> {
+        match &self.nodes {
+            SmrNodes::Ext(_) => None,
+            SmrNodes::Comp(nodes) => Some(
+                nodes
+                    .iter()
+                    .map(|nd| {
+                        let (executed, sn) = standalone_state_bytes(nd.shared_state());
+                        let bytes = NodeBytes {
+                            log: standalone_log_bytes(nd.log_perm_arc()),
+                            executed,
+                            sn,
+                            ..Default::default()
+                        };
+                        (bytes, nd.log_perm_arc().is_some())
+                    })
+                    .collect(),
+            ),
+            SmrNodes::Rec(nodes) => {
+                let clients = self.tracked_clients();
+                // interned checkpoints repeat across nodes: walk each allocation once
+                let mut per_cp: std::collections::HashMap<usize, (u64, u64)> =
+                    std::collections::HashMap::new();
+                Some(
+                    nodes
+                        .iter()
+                        .map(|nd| {
+                            let (executed, sn) = standalone_state_bytes(nd.shared_state());
+                            let cp = nd.checkpoint();
+                            let (checkpoint, certs) = *per_cp
+                                .entry(std::ptr::from_ref(cp) as usize)
+                                .or_insert_with(|| {
+                                    let (cp_executed, cp_sn) = standalone_state_bytes(&cp.s);
+                                    let certs = cp
+                                        .certs
+                                        .as_ref()
+                                        .map_or(0, |c| cert_state_bytes(c, &clients));
+                                    (cp_executed + cp_sn + pre_bytes(cp), certs)
+                                });
+                            let bytes = NodeBytes {
+                                log: standalone_log_bytes(nd.log_perm_arc()),
+                                executed,
+                                sn,
+                                checkpoint,
+                                certs,
+                            };
+                            (bytes, nd.log_perm_arc().is_some())
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Per-node standalone bytes (see [`NodeBytes`]), `None` for a ⊥ server; reads only. Compact
+    /// nodes carry no certificate state (the §5 layer lives beside the engine), extended is not
+    /// walked.
+    pub fn node_bytes(&self) -> Option<Vec<Option<NodeBytes>>> {
+        Some(
+            self.standalone_all()?
+                .into_iter()
+                .map(|(bytes, holds_log)| holds_log.then_some(bytes))
+                .collect(),
+        )
+    }
+
+    /// The standalone bytes of all n servers, ⊥ ones included: the population
+    /// [`Self::simulator_node_bytes`] walks, so their ratio is the sharing factor.
+    pub fn standalone_bytes(&self) -> Option<u64> {
+        Some(self.standalone_all()?.iter().map(|(b, _)| b.total()).sum())
+    }
+
+    /// What the simulator itself holds for all n servers' structures (states, logs, checkpoints),
+    /// each shared allocation charged once, in the units of [`NodeBytes`]. A shared chunk counts
+    /// all its K elements once. Compact certificate state lives beside the engine and is not
+    /// included.
+    pub fn simulator_node_bytes(&self) -> Option<u64> {
+        let mut walk = SharedWalk::default();
+        match &self.nodes {
+            SmrNodes::Ext(_) => return None,
+            SmrNodes::Comp(nodes) => {
+                for nd in nodes {
+                    walk.state(nd.shared_state());
+                    walk.log(nd.log_perm_arc());
+                }
+            }
+            SmrNodes::Rec(nodes) => {
+                let clients = self.tracked_clients();
+                for nd in nodes {
+                    walk.state(nd.shared_state());
+                    walk.log(nd.log_perm_arc());
+                    let cp = nd.checkpoint();
+                    if walk.cps.insert(std::ptr::from_ref(cp) as usize) {
+                        walk.state(&cp.s);
+                        walk.bytes += pre_bytes(cp);
+                        walk.bytes += cp
+                            .certs
+                            .as_ref()
+                            .map_or(0, |c| cert_state_bytes(c, &clients));
+                    }
+                }
+            }
+        }
+        Some(walk.bytes)
+    }
+
     /// Observer and tracker rows, every engine but extended.
     fn observer_rows(&self, add: &mut impl FnMut(&'static str, u64)) {
         add("observer.canonical", self.checker.canonical().heap_bytes());
@@ -180,12 +419,7 @@ impl SmrState {
             *acc.rows.entry(key).or_default() += bytes;
         };
 
-        let clients: Vec<u32> = {
-            let mut v: Vec<u32> = self.trackers.iter().map(|t| t.client).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
+        let clients = self.tracked_clients();
         let mut seen_logs = std::collections::HashSet::new();
         let mut seen_chunks = std::collections::HashSet::new();
         // One seen-set per chunk kind: a shared set lets one walk suppress the other's charge.

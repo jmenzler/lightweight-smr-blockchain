@@ -8,6 +8,7 @@ use crate::smr::observe::canonical::{
 use crate::smr::observe::committed::{CommittedOracle, useful_at_round_end};
 use crate::smr::observe::entry_index::EntryIndex;
 use crate::smr::observe::exec_dup::ExecDupOracle;
+use crate::smr::observe::full_prefix::{full_seqs, observe_full_prefix};
 use crate::smr::observe::log_index::{LogCounts, LogIndex, log_window_pos};
 use crate::smr::observe::round_metrics::smr_round_metrics;
 use crate::smr::tracker::{
@@ -593,6 +594,23 @@ impl SmrState {
         rec.canonical_pos
             .extend_first(canonical.start(), canonical.retained());
         let canon_index = &rec.canonical_pos;
+        if self.full_prefix {
+            let age = self
+                .safety_ok
+                .then(|| {
+                    let seqs = full_seqs(&post_logs, &executed_lens);
+                    observe_full_prefix(
+                        round,
+                        canonical,
+                        canon_index,
+                        self.release_line,
+                        &seqs,
+                        &mut self.trackers,
+                    )
+                })
+                .flatten();
+            self.unsettled_ages.push(age);
+        }
 
         let observe_spread = self.observe_spread;
         let useful_counts = observe_spread.then(|| {

@@ -212,6 +212,26 @@ let wasm_bindgen = (function(exports) {
             }
         }
         /**
+         * Live-only memory view, read only: per-node standalone bytes over the non-⊥ servers (median,
+         * max, the median server's categories; see `sim::smr::NodeBytes`), all n servers' standalone
+         * bytes, the simulator's bytes for the same n servers with shared allocations charged once,
+         * sharing = the first ÷ the second, and the wasm linear memory (null natively). Compact §5
+         * state lives in the cert harness and is charged to its server on both sides.
+         * @returns {string}
+         */
+        memory_json() {
+            let deferred1_0;
+            let deferred1_1;
+            try {
+                const ret = wasm.livesmr_memory_json(this.__wbg_ptr);
+                deferred1_0 = ret[0];
+                deferred1_1 = ret[1];
+                return getStringFromWasm0(ret[0], ret[1]);
+            } finally {
+                wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+            }
+        }
+        /**
          * Every node hash of the forest tree covering positions [start, start + 2^height), recomputed
          * from the same committed sequence the drawer's forest is built over (certs: the drawer's best
          * server; otherwise the committed chain). The caller checks the top against the peak root.
@@ -357,6 +377,24 @@ let wasm_bindgen = (function(exports) {
             let deferred1_1;
             try {
                 const ret = wasm.livesmr_step(this.__wbg_ptr, fraction);
+                deferred1_0 = ret[0];
+                deferred1_1 = ret[1];
+                return getStringFromWasm0(ret[0], ret[1]);
+            } finally {
+                wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+            }
+        }
+        /**
+         * Per-round oldest unsettled age (compact, recovery) from round `from + 1` on, as a JSON
+         * array; `null` marks a round with no log or after prefix consistency was lost.
+         * @param {number} from
+         * @returns {string}
+         */
+        unsettled_ages_json(from) {
+            let deferred1_0;
+            let deferred1_1;
+            try {
+                const ret = wasm.livesmr_unsettled_ages_json(this.__wbg_ptr, from);
                 deferred1_0 = ret[0];
                 deferred1_1 = ret[1];
                 return getStringFromWasm0(ret[0], ret[1]);

@@ -37,11 +37,16 @@ pub(super) struct CommandTracker {
     /// running, in which x sat at one index in every non-⊥ end-of-round log.
     pub(super) index_agreed_round: Option<usize>,
     pub(super) agreed_index: Option<usize>,
+    /// Compact and recovery, live sessions only: the same T_E over executed part ++ log. Kept
+    /// apart so `status` and the summary landmarks keep reading the extended field alone.
+    pub(super) full_prefix_fixed_round: Option<usize>,
     pub(super) committed_ack_round: Option<usize>,
     pub(super) committed_round: Option<usize>,
     pub(super) executed_round: Option<usize>,
     /// Asserted never to un-fix (Lemma 3.8); a regression is a driver bug.
     pub(super) fixed_prefix: Option<Vec<Command>>,
+    /// `spread` and `attempts` only take current-round entries at the end or empty whole: a live
+    /// delta sends only their tails, so an interior edit would never reach the page.
     pub(super) spread: Vec<SpreadPoint>,
     /// `inert` reads this, not `spread`, so census scoping cannot move `live_floor`.
     pub(super) spread_points: u32,
@@ -60,7 +65,7 @@ impl CommandTracker {
             injected_round: self.injected_round,
             delivered_round: self.delivered_round,
             all_logs_round: self.all_logs_round,
-            prefix_fixed_round: self.prefix_fixed_round,
+            prefix_fixed_round: self.prefix_fixed_round.or(self.full_prefix_fixed_round),
             index_agreed_round: self.index_agreed_round,
             committed_ack_round: self.committed_ack_round,
             committed_round: self.committed_round,
@@ -337,6 +342,7 @@ pub(super) fn spreading_list(
             );
             SpreadingCommand {
                 client: t.client,
+                op: t.op,
                 holders,
             }
         })
@@ -364,6 +370,7 @@ pub(super) fn trackers_for(injections: &[Injection]) -> (Vec<CommandTracker>, Ve
             all_logs_round: None,
             prefix_fixed_round: None,
             index_agreed_round: None,
+            full_prefix_fixed_round: None,
             agreed_index: None,
             committed_ack_round: None,
             committed_round: None,

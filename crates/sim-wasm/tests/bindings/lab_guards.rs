@@ -1,5 +1,6 @@
 //! Inputs the lab cannot honour are refused loudly instead of being clamped, ignored or trapped.
 
+use crate::batch_view::live_report_as_batch;
 use sim_wasm::{LiveSim, LiveSmr, run_scenario_json, run_smr_json};
 
 fn parse(json: &str) -> serde_json::Value {
@@ -47,7 +48,7 @@ fn live_smr_refuses_a_fraction_outside_the_unit_interval_and_does_not_advance() 
     live.step(0.0);
     let replay = parse(&run_smr_json(&live.export_scenario()));
     assert!(replay["error"].is_null(), "export must replay: {replay}");
-    assert_eq!(replay["report"], parse(&live.report_json()));
+    assert_eq!(replay["report"], live_report_as_batch(&live));
 }
 
 #[test]
@@ -59,7 +60,7 @@ fn a_fraction_that_does_not_survive_json_replays_to_the_same_blocked_count() {
         live.step(2.0 / 13.0);
     }
     let replay = parse(&run_smr_json(&live.export_scenario()));
-    assert_eq!(replay["report"], parse(&live.report_json()));
+    assert_eq!(replay["report"], live_report_as_batch(&live));
 }
 
 #[test]
@@ -84,6 +85,10 @@ fn live_smr_refuses_spec_fields_it_would_otherwise_drop() {
         .err()
         .expect("halt_on_violation refused");
     assert!(err.contains("halt_on_violation"), "{err}");
+    for spec in [blocks, halt] {
+        let out = parse(&run_smr_json(&spec));
+        assert!(out["error"].is_null(), "batch import still runs it: {out}");
+    }
 }
 
 #[test]
@@ -103,7 +108,7 @@ fn a_live_inject_that_would_renumber_a_later_scheduled_command_is_refused() {
         live.step(0.0);
     }
     let replay = parse(&run_smr_json(&live.export_scenario()));
-    assert_eq!(replay["report"], parse(&live.report_json()));
+    assert_eq!(replay["report"], live_report_as_batch(&live));
 }
 
 #[test]

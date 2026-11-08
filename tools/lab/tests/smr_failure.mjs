@@ -129,6 +129,8 @@ function workerApi(owner) {
           },
           certs_json() { counts.certs++; return JSON.stringify(certs()); },
           chain_json() { counts.chain++; return JSON.stringify({ m: 0, entries: [], peaks: [], merges: [] }); },
+          unsettled_ages_json() { return '[]'; },
+          memory_json() { return '{"error":"stub"}'; },
           inject() { counts.mutate++; return '{}'; },
           set_traffic() { counts.mutate++; return '{}'; },
           set_block() { counts.mutate++; return '{}'; },
@@ -232,11 +234,11 @@ async function setup() {
     'smr-certs.js': {
       onCertsSnapshot() {}, onChainSnapshot() {}, freezeChain() {},
       useEntrySelect() {}, resetCertsDrawer() {}, onVerifyTallies() {},
-      markCertsLoading() {}, endCertsLoading() {},
+      markCertsLoading() {}, endCertsLoading() {}, cmdIndexFor: () => -1,
     },
     'smr-viewport.js': { renderViewport() {}, resetViewport() {} },
     'smr-drawer.js': {
-      renderDrawer() {}, resetDrawer() {}, useBlockDrawerOpen() {}, blockDrawerOpen: () => drawer.open, onMerkleTree() {},
+      renderDrawer() {}, resetDrawer() {}, useBlockDrawerOpen() {}, useSelectCmd() {}, blockDrawerOpen: () => drawer.open, onMerkleTree() {},
     },
     'render.js': { update() {}, draw() {}, setView() {} },
     'trace.js': { loadTrace() {} },
@@ -379,7 +381,7 @@ const recoverySpec = (overrides = {}) => batchSpec({ proto: { kind: 'recovery', 
   assert.equal(h.S.smr.live, null, 'failed live session cannot resume');
   assert.equal(JSON.stringify(h.S.smr.scenario.schedule.fractions), '[0.3,0.4]');
   assert.equal(worker.calls.certs, 0, 'a closed drawer reads no certificates');
-  assert.equal(worker.calls.chain, 0, 'a closed drawer reads no chain');
+  assert.equal(worker.calls.chain, 1, 'recovery reads the chain delta every step for the block tiles; the failing step skips it');
   assert.equal(worker.calls.delta, 2, 'the initial report and the first step arrive as deltas');
   assert.equal(worker.calls.report, 1, 'only the failing step builds a full report');
   assert.equal(worker.calls.export, 1, 'failed replay captured exactly once');
@@ -456,12 +458,12 @@ const recoverySpec = (overrides = {}) => batchSpec({ proto: { kind: 'recovery', 
   h.$('smrStepBtn').click();
   await h.flush();
   assert.equal(worker.calls.certs, 2, 'with the block drawer open every step reads the certificates');
-  assert.equal(worker.calls.chain, 0, 'a certificate session has no chain feed');
+  assert.equal(worker.calls.chain, 2, 'a certificate session reads the chain delta too: the block tiles need positions');
   h.$('smrStepBtn').click();
   await h.flush();
   assert.equal(h.S.smr.live, null);
   assert.equal(worker.calls.certs, 2, 'the failing step skips the certificate read');
-  assert.equal(worker.calls.chain, 0, 'the failing step skips the chain read');
+  assert.equal(worker.calls.chain, 2, 'the failing step skips the chain read');
 }
 
 {

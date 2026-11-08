@@ -13,12 +13,13 @@
 // faked (`certsMode`).
 import { $, S, PALETTE, AUTO_CLIENT_BASE } from './state.js';
 import { post } from './engine.js';
+import { snIndex, verifyIndex, certRecord, arrivalIndex, clientName, isPool } from './smr-derive.js';
 
 let snap = null;
 let selPos = null; // selected committed position (from a client cert row)
 let anim = [];
-// on-demand verify-everywhere tallies (button-refreshed, round-stamped):
-// tallies.map[client][sn] = {accepted, covered} | null (no cert constructible)
+// on-demand verify-everywhere tallies (button-refreshed, round-stamped), as a verifyIndex: a row's
+// tally is {accepted, covered} or null (no cert constructible); a missing row is not verified
 let tallies = null;
 // 'compact' = §5 as the paper proves it · 'recovery' = the RQ11 construction
 // over Alg 6 · 'none' = chain structure only, no certificate layer to show
@@ -40,8 +41,9 @@ export function forestView() {
   const srv = best(snap);
   return { m: srv.m, peaks: srv.peaks, entries: snap.committed || null, mode: certsMode };
 }
+// certRecord: null before any Verify, covered false where the Verify has no row for the command.
 export function tallyFor(client, sn) {
-  return tallies ? { round: tallies.round, tally: tallies.map[client]?.[sn] ?? null } : null;
+  return certRecord(tallies, client, sn);
 }
 export function cmdIndexFor(ent) {
   const i = cmdIndexMap().get(ent.client + ':' + ent.sn);
@@ -69,12 +71,7 @@ export function resetCertsDrawer() {
 export function onVerifyTallies(json) {
   const v = JSON.parse(json);
   if (v.error) return;
-  const map = {};
-  for (const c of v.clients) {
-    map[c.client] = {};
-    for (const r of c.rows) map[c.client][r.sn] = r.tally;
-  }
-  tallies = { round: v.round, map };
+  tallies = verifyIndex(v);
   $('certVerStamp').textContent = 'verified @r' + v.round;
   if (snap) renderClients();
 }
@@ -387,7 +384,7 @@ function renderForest(srv, flashEvent) {
   const cert = selPos !== null ? certAt(selPos) : null;
   if (cert) {
     const chipX = Math.min(cx(selPos), (slots + 1) * (BW + GAP) - 70);
-    const label = `c${cert.client} · sn ${cert.sn} · pos ${selPos}` +
+    const label = `${clientName(cert.client)} · sn ${cert.sn} · pos ${selPos}` +
       (cert.chain_len != null ? ` · chain ${cert.chain_len}` : '');
     const tw = label.length * 6.4 + 16;
     const chip = svgEl('g', {});
@@ -423,16 +420,7 @@ const blockPos = r => (r.pos == null ? null : r.pos + 1);
 let idxCache = { cmds: null, map: null };
 function cmdIndexMap() {
   const cmds = (S.smr.report && S.smr.report.commands) || [];
-  if (idxCache.cmds !== cmds) {
-    const map = new Map();
-    const seen = new Map();
-    cmds.forEach((c, i) => {
-      const sn = (seen.get(c.client) || 0) + 1;
-      seen.set(c.client, sn);
-      map.set(c.client + ':' + sn, i);
-    });
-    idxCache = { cmds, map };
-  }
+  if (idxCache.cmds !== cmds) idxCache = { cmds, map: snIndex(cmds) };
   return idxCache.map;
 }
 
@@ -443,10 +431,16 @@ export function entryLabel(ent) {
   const auto = ent.client >= AUTO_CLIENT_BASE;
   const own = ent.op != null ? '·op' + ent.op : '·' + ent.sn;
   const ownFull = ent.op != null ? ' · op ' + ent.op : ' · sn ' + ent.sn;
-  const id = auto ? 'bg' + (ent.client - AUTO_CLIENT_BASE) : 'c' + ent.client + own;
-  const full = auto ? 'bg #' + (ent.client - AUTO_CLIENT_BASE) : 'c' + ent.client + ownFull;
-  if (ent.kind === 'null') return { text: '⊥', color: '#565f6b', title: '⊥ duplicate of ' + full };
   const i = cmdIndexMap().get(ent.client + ':' + ent.sn);
+  // a pool client commits many commands: name the arrival (one per command), not the reused slot
+  const cmd = i === undefined ? null : S.smr.report.commands[i];
+  const pool = isPool(S.smr.ctx?.spec);
+  const bg = cmd ? arrivalIndex(cmd) : pool ? null : ent.client - AUTO_CLIENT_BASE;
+  const id = auto ? (bg === null ? clientName(ent.client) + '·' + ent.sn : 'bg' + bg) : 'c' + ent.client + own;
+  const full = auto
+    ? [bg === null ? null : 'bg #' + bg, pool ? clientName(ent.client) + ' · sn ' + ent.sn : null].filter(Boolean).join(' · ')
+    : 'c' + ent.client + ownFull;
+  if (ent.kind === 'null') return { text: '⊥', color: '#565f6b', title: '⊥ duplicate of ' + full };
   const color = i === undefined ? '#c9d2dd' : PALETTE[i % PALETTE.length];
   return { text: id, color, title: full };
 }
@@ -519,7 +513,7 @@ function renderClients() {
       const chain = r.chain_len == null ? '—' : String(r.chain_len);
       const st = r.committed ? '<span class="cStatus st-com">committed</span>' : '<span class="cStatus st-pend">pending</span>';
       const sel = bp != null && bp === selPos ? ' sel' : '';
-      const t = tallies ? tallies.map[c.client]?.[r.sn] : null;
+      const t = tallyFor(c.client, r.sn)?.tally ?? null;
       return `<div class="certRow${sel}" data-pos="${bp ?? ''}"><span class="cSn">${r.sn}</span><span class="cPos">${pos}</span><span class="cChain">${chain}</span>${st}${tallyCell(t)}</div>`;
     }).join('');
     // frozen §5 staleness demo row: green while the last-two window still
@@ -530,7 +524,7 @@ function renderClients() {
       const st = rejected ? '<span class="cStatus st-rej">REJECTED</span>' : '<span class="cStatus st-cap">captured</span>';
       staleRow = `<div class="certRow staleRow"><span class="cSn">${c.stale.sn}</span><span class="cPos">✱</span><span class="cChain">—</span>${st}${tallyCell(c.stale)}</div>`;
     }
-    return `<div class="clCard"><div class="clHead"><span class="clName">c${c.client}</span><span class="clMeta">next sn ${c.next_sn}</span><button class="capBtn" data-client="${c.client}" title="Freeze this client's current bare-newest certificate (§5 staleness demo): the frozen row stays green until two further commits evict it, then flips REJECTED.">capture</button></div><div class="certHeadRow"><span>sn</span><span>pos</span><span>chain</span><span>status</span><span>verify</span></div>${rows}${staleRow}</div>`;
+    return `<div class="clCard"><div class="clHead"><span class="clName">${clientName(c.client)}</span><span class="clMeta">next sn ${c.next_sn}</span><button class="capBtn" data-client="${c.client}" title="Freeze this client's current bare-newest certificate (§5 staleness demo): the frozen row stays green until two further commits evict it, then flips REJECTED.">capture</button></div><div class="certHeadRow"><span>sn</span><span>pos</span><span>chain</span><span>status</span><span>verify</span></div>${rows}${staleRow}</div>`;
   }).join('');
   for (const row of box.querySelectorAll('.certRow[data-pos]')) {
     row.addEventListener('click', () => {

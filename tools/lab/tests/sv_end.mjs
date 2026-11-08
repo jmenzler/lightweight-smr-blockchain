@@ -30,7 +30,7 @@ async function setup(max = 200) {
     setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
   });
   const stubs = {
-    'state.js': { S, $ },
+    'state.js': { S, $, AUTO_CLIENT_BASE: 2147483648 },
     'engine.js': { post: m => posted.push(m) },
     'render.js': { update() {} },
     'trace.js': { loadTrace(tr) { S.trace = tr; S.series = { values: [], vIndex: {}, comp: [] }; } },

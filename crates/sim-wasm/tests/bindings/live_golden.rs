@@ -1,6 +1,7 @@
 //! Frozen digests of every live-session output, so a speed change to the step path can be shown
 //! to leave each produced value unchanged. Digests hash the parsed, key-sorted form.
 
+use crate::batch_view::without_live_only;
 use serde_json::Value;
 use sim_wasm::LiveSmr;
 
@@ -79,6 +80,10 @@ fn attested(certs: &str) -> bool {
 /// attested a command, so the cert-reuse path is shown to run on changed and unchanged rounds.
 fn run(proto: &str, seed: u64) -> (Digests, bool, bool) {
     let mut live = LiveSmr::new(&spec(proto, seed)).unwrap();
+    let kind = serde_json::from_str::<Value>(proto).unwrap()["kind"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let mut d = Digests::default();
     let mut adopted_mid_window = false;
     let mut any_attested = false;
@@ -97,7 +102,9 @@ fn run(proto: &str, seed: u64) -> (Digests, bool, bool) {
         adopted_mid_window |= mid_window_adoptions(&status);
         d.status.feed(&status);
         d.delta.feed(&live.report_delta_json());
-        d.report.feed(&live.report_json());
+        // the report column stays frozen: everything but the live-only T_E must be unchanged
+        let report = serde_json::from_str::<Value>(&live.report_json()).unwrap();
+        d.report.feed(&without_live_only(report, &kind).to_string());
         let certs = live.certs_json();
         any_attested |= attested(&certs);
         d.certs.feed(&certs);
@@ -109,12 +116,13 @@ fn run(proto: &str, seed: u64) -> (Digests, bool, bool) {
 }
 
 /// (proto, seed) -> [status, delta, report, certs, probes]
+/// Compact and recovery deltas carry the live-only T_E; the report column digests it cleared.
 const GOLDEN: &[(&str, u64, [u64; 5])] = &[
     (
         "extended",
         1,
         [
-            0x2e493b0d5416d4ce,
+            0x4904dd5bba1927de,
             0xa319b8f296c9500e,
             0x3ac6ed8c69cda2fc,
             0x8ca4a4645c95ae45,
@@ -125,7 +133,7 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "extended",
         7,
         [
-            0xa884eb69f18f080d,
+            0xf73cc0b6becf0053,
             0x43be284e233b4fed,
             0xf2f2413d0bd653b5,
             0x8ca4a4645c95ae45,
@@ -136,7 +144,7 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "extended",
         23,
         [
-            0xbb3bfe93cb89ca74,
+            0x0afb0a7bd3b512e5,
             0x8c35465543a1db56,
             0x2d178cb4736cf320,
             0x8ca4a4645c95ae45,
@@ -147,7 +155,7 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "extended",
         42,
         [
-            0x00a04524610a94a8,
+            0x8a1e5fc22ade10ed,
             0xfe6a6a7844e06729,
             0xe75e1107bf3ee41c,
             0x8ca4a4645c95ae45,
@@ -158,8 +166,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "compact",
         1,
         [
-            0x82dd857997a31bad,
-            0xb8fc3a71329186b7,
+            0x0c17711d05639dec,
+            0xe260592b2e66d241,
             0x84c79db8add86474,
             0xfc74bb8b33108760,
             0xcc8e826a8c7e3f74,
@@ -169,8 +177,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "compact",
         7,
         [
-            0xd9d60a799d203c0f,
-            0x88964054ac9090dd,
+            0xb45ff6664d504712,
+            0xf66992f0872fe206,
             0x1bce44e8e6d1ebe9,
             0xd3bcca9957a893d9,
             0xb74054142f1de56f,
@@ -180,8 +188,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "compact",
         23,
         [
-            0xe6981e91eb33d637,
-            0x000fb2ba7d9aa028,
+            0x287cbaae54a86594,
+            0x379316a9535c6533,
             0xcc25fa1a7526affc,
             0xb9d1c935e9a4acd6,
             0xb74054142f1de56f,
@@ -191,8 +199,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "compact",
         42,
         [
-            0x216ca688401b1848,
-            0x80d9d749991c2f4f,
+            0x4b6b44e28f9a7992,
+            0x3dc06969298f1801,
             0xc5bf42a4de134dec,
             0xc9ef767c46514581,
             0xb74054142f1de56f,
@@ -202,8 +210,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery",
         1,
         [
-            0x14b3d863822925f4,
-            0xca4482669d675f6c,
+            0x1441e6a4c6845b20,
+            0x0f0f017e828fe0f5,
             0xd7f566f9d35eae58,
             0xd167173118d12c2d,
             0x5a674aab0c341d33,
@@ -213,8 +221,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery",
         7,
         [
-            0x6325ad9b3d6231e1,
-            0xe54f3f1a242f929a,
+            0xc50e45e877dde28d,
+            0xe631ec8c526f26af,
             0x23523a2b68f8d17c,
             0xd9a891b7675d2a84,
             0xb40ad97bd55a04a3,
@@ -224,8 +232,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery",
         23,
         [
-            0xe5c082732d4933ad,
-            0xb76f781580a59316,
+            0x829025c5205599ed,
+            0x4f0439aea9d0f056,
             0xb15342c671b69c5e,
             0xd9a891b7675d2a84,
             0xb40ad97bd55a04a3,
@@ -235,8 +243,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery",
         42,
         [
-            0xa605e9307cda8bde,
-            0xecb090f4d6b22669,
+            0x191a8e0a7183e26e,
+            0x41ed866c14905c65,
             0x5742ec2932d2d447,
             0xf00eee6eb2bf4c04,
             0xdb64e357be6f4733,
@@ -246,8 +254,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery_certs",
         1,
         [
-            0x799787425b72ab58,
-            0x92eac0393f76d981,
+            0xc11b667856e6faf4,
+            0x5967e42778b155e5,
             0xe6b4bdc35114b43e,
             0xed3a66c42504a977,
             0x6dadcb3cf0ff28f2,
@@ -257,8 +265,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery_certs",
         7,
         [
-            0x48d32c71b371499b,
-            0x8d6f3471699bc7be,
+            0xd6e6b6904e3a39e8,
+            0x032af83fae7dc47d,
             0x5bef3c6443c1766c,
             0xebdc7ecfca0a05cd,
             0x9cd654c6d739db57,
@@ -268,8 +276,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery_certs",
         23,
         [
-            0x5e10af73d507a43b,
-            0x5254e288e18f91ad,
+            0x8834c8d92e7717fe,
+            0xbeb30e33af9af3b0,
             0xc5b5dd1fbbe5d473,
             0x7a748f0a6b732c25,
             0xb4d09eb9dd5d097f,
@@ -279,8 +287,8 @@ const GOLDEN: &[(&str, u64, [u64; 5])] = &[
         "recovery_certs",
         42,
         [
-            0xf857a219437cea26,
-            0x74fa91c096bbaed6,
+            0xc5e90c9e1a91f58e,
+            0xb9a8b3e7080db5f4,
             0xa4a479bdc6119fee,
             0xc84992f6a2bc9145,
             0xa3a1e0182cd3eb64,
@@ -383,10 +391,10 @@ fn run_repeat_client(seed: u64) -> (u64, bool) {
 }
 
 const GOLDEN_REPEAT_CLIENT: [(u64, u64); 4] = [
-    (1, 0x58a8e2c7ecd95027),
-    (7, 0x73cfb47ba6516ace),
-    (23, 0x55902ccf14200e98),
-    (42, 0x55ef4bfc6bcee707),
+    (1, 0x241ffadbf62aabc6),
+    (7, 0xc0aff575674b8695),
+    (23, 0xb72cd1e968b915c7),
+    (42, 0x28e85d5d4b4299ca),
 ];
 
 #[test]

@@ -7,6 +7,7 @@ mod compact_safety_latch;
 #[path = "../fixtures/digest_fields.rs"]
 mod digest_fields;
 mod harness;
+mod live_full_prefix;
 mod merge_policy_spec;
 mod observer_inertness;
 mod partition_determinism;

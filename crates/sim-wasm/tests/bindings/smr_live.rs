@@ -2,6 +2,7 @@
 //! user injections — exports a spec whose batch replay reproduces the live
 //! report byte-identically.
 
+use crate::batch_view::live_report_as_batch;
 use sim::smr::ClientModel;
 use sim_wasm::{LiveSmr, run_smr_json};
 
@@ -23,7 +24,7 @@ fn batch_report(scenario_json: &str) -> serde_json::Value {
 }
 
 fn live_report(live: &LiveSmr) -> serde_json::Value {
-    serde_json::from_str(&live.report_json()).expect("live report json")
+    live_report_as_batch(live)
 }
 
 #[test]
@@ -182,26 +183,6 @@ fn traffic_session_with_midrun_edit_and_inject_replays_as_batch() {
             "proto {proto} sticky {sticky}"
         );
     }
-}
-
-#[test]
-fn a_pool_client_model_is_refused_at_the_live_entry() {
-    // The lab keys spreading commands by client id and never retires one that
-    // misses coverage, so a reused slot would render against its predecessor's
-    // holder set. Batch-only until that wire key changes.
-    let spec = traffic_spec(r#"{"kind":"compact","t_commit_rounds":8}"#).replace(
-        r#""traffic":{"kind":"pmf","arrivals_pmf":[0.0,1.0]}"#,
-        r#""traffic":{"kind":"pmf","arrivals_pmf":[0.0,1.0]},
-            "client_model":{"kind":"pool","clients":64}"#,
-    );
-    let Err(err) = LiveSmr::new(&spec) else {
-        panic!("pool must be refused at the live entry");
-    };
-    assert!(err.contains("pool"), "got: {err}");
-    assert!(
-        LiveSmr::new(&traffic_spec(r#"{"kind":"compact","t_commit_rounds":8}"#)).is_ok(),
-        "the unique model is untouched"
-    );
 }
 
 #[test]

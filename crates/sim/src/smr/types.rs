@@ -629,7 +629,9 @@ pub struct RecStepInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SpreadingCommand {
-    /// Index-free key: report order is canonical, so indices do not survive replay.
     pub client: u32,
+    /// Index-free key (report order is canonical, so indices do not survive replay). The op, not
+    /// the client: a pool client reused after its ack can have two commands spreading at once.
+    pub op: u64,
     pub holders: Vec<u32>,
 }
